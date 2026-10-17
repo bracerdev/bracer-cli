@@ -236,7 +236,7 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 		}
 		return false
 	})
-	hs := pg.ScanHost(r.ctx, r.shell)
+	hs := pg.ScanHost(r.ctx, r.shell, r.tools.GOOS)
 	shown, warns := pg.Discover(r.ctx, containers, pods, hs, r.probe)
 	for _, w := range warns {
 		r.warn("%s", w)

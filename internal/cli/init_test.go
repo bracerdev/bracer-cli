@@ -69,7 +69,7 @@ func containerWorld() *fakeShell {
 		"docker inspect": `[{"Id":"c1","Name":"/shop-db","State":{"Running":true,"Status":"running"},"Config":{"Image":"postgres:17-alpine","Env":["POSTGRES_PASSWORD=pw","POSTGRES_DB=shop"]},"NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"15432"}]},"Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}}]`,
 		"docker top c1":  "UID PID PPID C STIME TTY TIME CMD\n70 1 0 0 x ? 0 postgres\n",
 		"docker image inspect --format {{json .Config.Entrypoint}}\t{{json .Config.Cmd}} postgres:17-alpine": "[\"docker-entrypoint.sh\"]\t[\"postgres\"]\n",
-		"lsof": "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nssh 1 k 5u IPv4 0x1 0t0 TCP *:15432 (LISTEN)\n",
+		"ss -ltnpH": "LISTEN 0 128 *:15432 *:* users:((\"ssh\",pid=1,fd=5))\n",
 		"docker exec shop-db sh -c command -v pg_dump": "/usr/local/bin/pg_dump\n",
 		psql + "select 1":                              "1\n",
 		psql + "show server_version_num":               "170011\n",
@@ -199,7 +199,7 @@ func TestInitHostNeedsPasswordAndSelfManagedSecrets(t *testing.T) {
 	sh := containerWorld()
 	// No container; Postgres on the host at 5433, requires a password.
 	sh.out["docker ps"] = ""
-	sh.out["lsof"] = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\npostgres 9 k 7u IPv4 0x1 0t0 TCP 127.0.0.1:5433 (LISTEN)\n"
+	sh.out["ss -ltnpH"] = "LISTEN 0 244 127.0.0.1:5433 0.0.0.0:* users:((\"postgres\",pid=9,fd=7))\n"
 	hostPsql := "docker run --rm -i --network host postgres:18-alpine psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
 	hostPsql17 := "docker run --rm -i --network host postgres:17-alpine psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
 	authFail := true
@@ -282,7 +282,7 @@ func TestInitWithoutDockerUsesHostBinaries(t *testing.T) {
 	bin := "/usr/lib/postgresql/17/bin/"
 	psql := bin + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
 	sh := &fakeShell{out: map[string]string{
-		"lsof":                           "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\npostgres 9 k 7u IPv4 0x1 0t0 TCP 127.0.0.1:5433 (LISTEN)\n",
+		"ss -ltnpH":                      "LISTEN 0 244 127.0.0.1:5433 0.0.0.0:* users:((\"postgres\",pid=9,fd=7))\n",
 		bin + "pg_dump --version":        "pg_dump (PostgreSQL) 17.11 (Debian 17.11-1.pgdg12+2)\n",
 		psql + "select 1":                "1\n",
 		psql + "show server_version_num": "170011\n",
@@ -340,7 +340,7 @@ func TestInitPodFlow(t *testing.T) {
 		"docker version": "29.0\n",
 		"docker ps":      `{"ID":"k1","Names":"k8s_postgres_postgres-0_attendy-dev_u_0","Image":"attendy-postgres:sha","State":"running","Status":"Up"}` + "\n",
 		"docker inspect": `[{"Id":"k1","Name":"/k8s_postgres_postgres-0_attendy-dev_u_0","State":{"Running":true,"Status":"running"},"Config":{"Image":"attendy-postgres:sha","Env":["POSTGRES_USER=attendy"]},"NetworkSettings":{"Ports":{},"Networks":{}}}]`,
-		"lsof":           "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+		"ss -ltnpH":      "",
 		"kubectl get pods -A -o json": `{"items":[
 		  {"metadata":{"namespace":"attendy-dev","name":"postgres-0"},"spec":{"containers":[{"name":"postgres","image":"attendy-postgres:sha","env":[{"name":"POSTGRES_USER","value":"attendy"},{"name":"POSTGRES_PASSWORD","valueFrom":{"secretKeyRef":{"name":"pg","key":"pw"}}}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"postgres","ready":true}]}},
 		  {"metadata":{"namespace":"attendy-dev","name":"attendy-api-1"},"spec":{"containers":[{"name":"api","image":"attendy-api:sha","env":[{"name":"POSTGRES_SERVICE_HOST","value":"10.43.0.1"}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"api","ready":true}]}},
@@ -395,7 +395,7 @@ func TestInitPodUserFromSecret(t *testing.T) {
 		exec := "kubectl exec -i -n slidemaker postgres-0 -c postgres -- env PGUSER=slidemaker PGDATABASE=postgres PGCONNECT_TIMEOUT=10 "
 		psql := exec + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
 		return &fakeShell{out: map[string]string{
-			"lsof":                        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+			"ss -ltnpH":                   "",
 			"kubectl get pods -A -o json": podJSON,
 			"kubectl exec -n slidemaker postgres-0 -c postgres -- sh -c for f in /proc":     "1\n",
 			"kubectl exec -n slidemaker postgres-0 -c postgres -- sh -c u=":                 resolved,

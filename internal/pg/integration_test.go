@@ -5,6 +5,7 @@ package pg
 import (
 	"context"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -39,7 +40,7 @@ func TestIntegrationContainer(t *testing.T) {
 	if !ct.HasPgProc || len(ct.HostPorts) == 0 {
 		t.Errorf("container: %+v", ct)
 	}
-	hs := ScanHost(ctx, sh)
+	hs := ScanHost(ctx, sh, runtime.GOOS)
 	cands, _ := Discover(ctx, cs, nil, hs, ProbeSSLRequest)
 	for _, c := range cands {
 		t.Log(c.Label())

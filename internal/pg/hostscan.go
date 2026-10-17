@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 )
@@ -23,13 +22,14 @@ type HostScan struct {
 	Warnings  []string
 }
 
-// ScanHost uses ss (Linux) or lsof (macOS) plus a socket glob. Tool failures
-// are not fatal: record a warning, return what is available.
-func ScanHost(ctx context.Context, sh Shell) HostScan {
+// ScanHost uses ss (Linux) or lsof (macOS) plus a socket glob; goos picks the
+// tool (runtime.GOOS in production, fixed in tests). Tool failures are not
+// fatal: record a warning, return what is available.
+func ScanHost(ctx context.Context, sh Shell, goos string) HostScan {
 	hs := HostScan{Sockets: map[int]string{}}
 	var res Result
 	var err error
-	if runtime.GOOS == "linux" {
+	if goos == "linux" {
 		res, err = sh.Run(ctx, Cmd{Name: "ss", Args: []string{"-ltnpH"}})
 		if err == nil {
 			hs.Listeners = parseSS(string(res.Stdout))
