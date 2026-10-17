@@ -1,0 +1,5 @@
+# Build output
+/bracer
+/dist/
+*.test
+.DS_Store

@@ -1,0 +1,48 @@
+# GoReleaser for the bracer CLI. Runs at the root of the public repo
+# (github.com/bracerdev/bracer-cli), where this directory is published.
+version: 2
+project_name: bracer
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: bracer
+    main: .
+    binary: bracer
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs"
+      - "^ci"
+
+release:
+  name_template: "bracer {{ .Tag }}"
+  # draft: read the generated notes, then publish by hand.
+  draft: true
