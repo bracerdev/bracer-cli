@@ -104,9 +104,10 @@ func (r *initRun) run() error {
 	if err := r.loadOrCreate(); err != nil {
 		return err
 	}
-	// 1. Docker: optional (ADR-0009); without it containers are not listed and drill does not run on this machine.
+	// 1. Docker: optional (ADR-0009); without it containers are not listed and
+	// drill needs kubectl reaching a cluster (step 11c) to run on this machine.
 	if !r.tools.DockerOK(r.ctx) {
-		r.warn("Docker is not available (`docker version` failed): Docker containers will not be listed, and `bracer drill` will not run on this machine")
+		r.warn("Docker is not available (`docker version` failed): Docker containers will not be listed; `bracer drill` will run its temporary Postgres as a Kubernetes pod if kubectl reaches a cluster, otherwise not on this machine")
 	}
 	if !r.fresh {
 		r.recheckExisting()
@@ -463,6 +464,8 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 	if err := r.chooseDrillImage(client, &inst, selected); err != nil {
 		return nil, err
 	}
+	// 11c. Drill runtime: a pod through kubectl when this machine has no Docker.
+	r.chooseDrillRuntime(&inst)
 
 	if existing != nil {
 		mergeDatabases(existing, inst)
@@ -946,6 +949,46 @@ func containsStr(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// chooseDrillRuntime writes drill.runtime: kube (spec drill § Data model "Chọn
+// runtime") when Docker is not available but kubectl may create pods and network
+// policies — in the source pod's namespace, else "default" — so drill does not have
+// to detect it again and the user sees the choice in app.yaml. With Docker, or
+// when drill.runtime is already set, nothing changes.
+func (r *initRun) chooseDrillRuntime(inst *config.Instance) {
+	if r.tools.DockerOK(r.ctx) || (r.cfg.Drill != nil && r.cfg.Drill.Runtime != "") {
+		return
+	}
+	kube := r.tools.Kubectl()
+	if kube == nil {
+		return // warned in step 1
+	}
+	ns := config.DefaultDrillNamespace
+	if inst.Pod != "" {
+		if ref, err := pg.ParsePodRef(inst.Pod); err == nil {
+			ns = ref.Namespace
+		}
+	}
+	for _, resource := range []string{"pods", "networkpolicies.networking.k8s.io"} {
+		ok, err := kube.CanI(r.ctx, "create", resource, ns)
+		if err != nil {
+			r.warn("cannot ask the cluster whether drill may create %s in namespace %s (%v); `bracer drill` will check again when it runs", resource, ns, err)
+			return
+		}
+		if !ok {
+			r.warn("this kubeconfig may not create %s in namespace %s, which `bracer drill` needs for its temporary Postgres pod; set drill.runtime: kube and drill.namespace in app.yaml once it can", resource, ns)
+			return
+		}
+	}
+	if r.cfg.Drill == nil {
+		r.cfg.Drill = &config.Drill{}
+	}
+	r.cfg.Drill.Runtime = config.DrillRuntimeKube
+	if ns != config.DefaultDrillNamespace {
+		r.cfg.Drill.Namespace = ns
+	}
+	r.p.printf("drill will run its temporary Postgres as a pod in namespace %s through %s (no Docker on this machine).\n", ns, kube.Describe())
 }
 
 // chooseDrillImage fills drill.image (spec init § Flow 11b) so the user does not

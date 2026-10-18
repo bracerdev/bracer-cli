@@ -1,6 +1,7 @@
 package pg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -324,4 +326,160 @@ func (k Kube) PodImage(ctx context.Context, ref PodRef) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("pod %s has no container %q", ref.Namespace+"/"+ref.Name, ref.Container)
+}
+
+// CanI asks `kubectl auth can-i <verb> <resource> -n <namespace>`: (true, nil)
+// on "yes", (false, nil) on "no" (exit 1 with "no" on stdout), and an error when
+// kubectl could not ask the cluster at all (no kubeconfig, unreachable…).
+func (k Kube) CanI(ctx context.Context, verb, resource, namespace string) (bool, error) {
+	res, err := k.run(ctx, Cmd{Args: []string{"auth", "can-i", verb, resource, "-n", namespace}})
+	answer := strings.TrimSpace(string(res.Stdout))
+	switch {
+	case err == nil && answer == "yes":
+		return true, nil
+	case answer == "no":
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("%s auth can-i: %w", k.Describe(), err)
+	}
+	return false, fmt.Errorf("%s auth can-i: unexpected answer %q", k.Describe(), answer)
+}
+
+// PodStatus is what drill needs to know about its temporary pod while waiting
+// for it (spec drill § Data model): the phase, why it is not scheduled, and the
+// waiting/terminated state of its container.
+type PodStatus struct {
+	Phase             string // Pending, Running, Succeeded, Failed
+	Scheduled         bool
+	SchedulingMessage string // conditions[PodScheduled].message when not scheduled
+	Running           bool   // the (first) container is running
+	WaitingReason     string // containerStatuses[0].state.waiting.reason: ContainerCreating, ErrImagePull…
+	WaitingMessage    string
+	TerminatedReason  string // state.terminated.reason: Error, Completed…
+	TerminatedMessage string
+	TerminatedExit    int
+}
+
+// Describe is a one-line summary for an error message.
+func (s PodStatus) Describe() string {
+	switch {
+	case s.TerminatedReason != "":
+		return fmt.Sprintf("container exited (%s, exit %d): %s", s.TerminatedReason, s.TerminatedExit, orUnknownMsg(s.TerminatedMessage))
+	case s.WaitingReason != "":
+		return fmt.Sprintf("container is %s: %s", s.WaitingReason, orUnknownMsg(s.WaitingMessage))
+	case !s.Scheduled && s.SchedulingMessage != "":
+		return "pod is not scheduled: " + s.SchedulingMessage
+	}
+	return "pod is " + s.Phase
+}
+
+func orUnknownMsg(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(no message)"
+	}
+	return strings.TrimSpace(s)
+}
+
+// ImagePullFailed reports a waiting reason that will not resolve by waiting longer.
+func (s PodStatus) ImagePullFailed() bool {
+	switch s.WaitingReason {
+	case "ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError":
+		return true
+	}
+	return false
+}
+
+// GetPodStatus reads the pod with kubectl get -o json.
+func (k Kube) GetPodStatus(ctx context.Context, namespace, name string) (PodStatus, error) {
+	res, err := k.run(ctx, Cmd{Args: []string{"get", "pod", "-n", namespace, name, "-o", "json"}})
+	if err != nil {
+		return PodStatus{}, err
+	}
+	var pod struct {
+		Status struct {
+			Phase      string `json:"phase"`
+			Conditions []struct {
+				Type    string `json:"type"`
+				Status  string `json:"status"`
+				Message string `json:"message"`
+			} `json:"conditions"`
+			ContainerStatuses []struct {
+				State struct {
+					Running *struct{} `json:"running"`
+					Waiting *struct {
+						Reason  string `json:"reason"`
+						Message string `json:"message"`
+					} `json:"waiting"`
+					Terminated *struct {
+						Reason   string `json:"reason"`
+						Message  string `json:"message"`
+						ExitCode int    `json:"exitCode"`
+					} `json:"terminated"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(res.Stdout, &pod); err != nil {
+		return PodStatus{}, fmt.Errorf("kubectl get pod: parse JSON: %w", err)
+	}
+	st := PodStatus{Phase: pod.Status.Phase}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == "PodScheduled" {
+			st.Scheduled = c.Status == "True"
+			st.SchedulingMessage = c.Message
+		}
+	}
+	if len(pod.Status.ContainerStatuses) > 0 {
+		s := pod.Status.ContainerStatuses[0].State
+		st.Running = s.Running != nil
+		if s.Waiting != nil {
+			st.WaitingReason, st.WaitingMessage = s.Waiting.Reason, s.Waiting.Message
+		}
+		if s.Terminated != nil {
+			st.TerminatedReason, st.TerminatedMessage, st.TerminatedExit = s.Terminated.Reason, s.Terminated.Message, s.Terminated.ExitCode
+		}
+	}
+	return st, nil
+}
+
+// Exec runs `sh -c script` in the pod's (first or named) container and returns its stdout.
+func (k Kube) Exec(ctx context.Context, pod PodRef, script string) (Result, error) {
+	return k.run(ctx, Cmd{Args: k.execArgs(pod, script)})
+}
+
+// Create sends a manifest (JSON or YAML) to `kubectl create -f -`.
+func (k Kube) Create(ctx context.Context, manifest []byte) error {
+	_, err := k.run(ctx, Cmd{Args: []string{"create", "-f", "-"}, Stdin: bytes.NewReader(manifest)})
+	return err
+}
+
+// Delete removes the named resources (pod/x, networkpolicy/x) in the namespace,
+// ignoring ones that are already gone; grace is the pod's termination grace period in seconds.
+func (k Kube) Delete(ctx context.Context, namespace string, grace int, resources ...string) error {
+	args := append([]string{"delete", "-n", namespace, "--ignore-not-found", "--grace-period=" + strconv.Itoa(grace)}, resources...)
+	_, err := k.run(ctx, Cmd{Args: args})
+	return err
+}
+
+// DeleteByLabel removes every pod and networkpolicy in the namespace matching
+// the selector and returns the names deleted (kubectl -o name).
+func (k Kube) DeleteByLabel(ctx context.Context, namespace, selector string) ([]string, error) {
+	res, err := k.run(ctx, Cmd{Args: []string{"delete", "pod,networkpolicy", "-n", namespace, "-l", selector, "--ignore-not-found", "--grace-period=10", "-o", "name"}})
+	if err != nil {
+		return nil, err
+	}
+	// Only kind/name lines: with nothing to delete kubectl prints "No resources found".
+	var names []string
+	for _, f := range strings.Fields(string(res.Stdout)) {
+		if strings.Contains(f, "/") {
+			names = append(names, f)
+		}
+	}
+	return names, nil
+}
+
+// Logs returns the last n lines of the pod's log.
+func (k Kube) Logs(ctx context.Context, namespace, name string, n int) []byte {
+	res, _ := k.run(ctx, Cmd{Args: []string{"logs", "-n", namespace, name, "--tail", strconv.Itoa(n)}})
+	return append(res.Stdout, res.Stderr...)
 }

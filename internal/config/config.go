@@ -78,12 +78,42 @@ var reDockerMem = regexp.MustCompile(`^[0-9]+[bkmgBKMG]?$`)
 
 // Drill is the `bracer drill` configuration (spec drill § Data model). Every field is optional.
 type Drill struct {
-	Image   string  `yaml:"image,omitempty"`   // default postgres:<major from the manifest>-alpine
-	Timeout string  `yaml:"timeout,omitempty"` // per database, time.Duration; default 6h
-	Memory  string  `yaml:"memory,omitempty"`  // docker run --memory, e.g. 2g
-	CPUs    string  `yaml:"cpus,omitempty"`    // docker run --cpus, e.g. "1"
-	Checks  []Check `yaml:"checks,omitempty"`
+	Runtime   string  `yaml:"runtime,omitempty"`   // "", docker, kube: where the temporary Postgres runs; empty picks automatically
+	Namespace string  `yaml:"namespace,omitempty"` // runtime kube: namespace of the temporary pod; default "default"
+	Image     string  `yaml:"image,omitempty"`     // default postgres:<major from the manifest>-alpine
+	Timeout   string  `yaml:"timeout,omitempty"`   // per database, time.Duration; default 6h
+	Memory    string  `yaml:"memory,omitempty"`    // docker run --memory / pod memory limit, e.g. 2g
+	CPUs      string  `yaml:"cpus,omitempty"`      // docker run --cpus / pod cpu limit, e.g. "1"
+	Checks    []Check `yaml:"checks,omitempty"`
 }
+
+// Drill runtimes (drill.runtime).
+const (
+	DrillRuntimeDocker = "docker"
+	DrillRuntimeKube   = "kube"
+)
+
+// DefaultDrillNamespace is the namespace of the temporary pod when drill.namespace is empty.
+const DefaultDrillNamespace = "default"
+
+// DrillNamespace returns drill.namespace with the default applied.
+func (a *App) DrillNamespace() string {
+	if a.Drill == nil || a.Drill.Namespace == "" {
+		return DefaultDrillNamespace
+	}
+	return a.Drill.Namespace
+}
+
+// DrillRuntime returns drill.runtime ("" when it is to be picked automatically).
+func (a *App) DrillRuntime() string {
+	if a.Drill == nil {
+		return ""
+	}
+	return a.Drill.Runtime
+}
+
+// reDNSLabel is a Kubernetes namespace name (RFC 1123 label).
+var reDNSLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
 // Check is one SQL statement run on the restored database; ≥ 1 row is a pass.
 type Check struct {
@@ -528,6 +558,12 @@ func (a *App) Validate() error {
 		}
 	}
 	if dr := a.Drill; dr != nil {
+		if dr.Runtime != "" && dr.Runtime != DrillRuntimeDocker && dr.Runtime != DrillRuntimeKube {
+			add("drill.runtime: must be docker or kube (empty picks automatically)")
+		}
+		if dr.Namespace != "" && (len(dr.Namespace) > 63 || !reDNSLabel.MatchString(dr.Namespace)) {
+			add("drill.namespace: must be a Kubernetes namespace name (lowercase letters, digits and -)")
+		}
 		if IsBitnamiImage(dr.Image) {
 			add("drill.image: %s is not supported as the drill image: Bitnami's entrypoint runs a temporary server that already listens on TCP, so Bracer cannot tell when the real server is up; use the official postgres image or one built on it (postgis/postgis, timescale/timescaledb)", dr.Image)
 		}

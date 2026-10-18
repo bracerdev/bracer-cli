@@ -20,7 +20,7 @@ func cronCfg() *config.App {
 }
 
 func inputs(cfg *config.App) cronInputs {
-	return cronInputs{cfg: cfg, cfgPath: "/srv/shop/app.yaml", binary: "/usr/local/bin/bracer", dockerDir: "/usr/bin", username: "deploy",
+	return cronInputs{cfg: cfg, cfgPath: "/srv/shop/app.yaml", binary: "/usr/local/bin/bracer", toolDirs: []string{"/usr/bin"}, username: "deploy",
 		backupAt: "0 3 * * *", drillAt: "0 4 * * 1", secretsAbs: "/srv/shop/shop.env"}
 }
 
@@ -48,11 +48,11 @@ func TestRenderCron(t *testing.T) {
 	cfg := cronCfg()
 	cfg.SecretsFile, cfg.Hosted = "", nil
 	in := inputs(cfg)
-	in.secretsAbs, in.dockerDir, in.binary = "", "", "bracer"
+	in.secretsAbs, in.toolDirs, in.binary = "", nil, "bracer"
 	out.Reset()
 	renderCron(&out, in)
 	s = out.String()
-	for _, want := range []string{"BRACER_SHOP_MAIN_PASSWORD, BRACER_SHOP_S3_ACCESS_KEY, BRACER_SHOP_S3_SECRET_KEY", "docker was not found in PATH", "temporary path", "not reported anywhere"} {
+	for _, want := range []string{"BRACER_SHOP_MAIN_PASSWORD, BRACER_SHOP_S3_ACCESS_KEY, BRACER_SHOP_S3_SECRET_KEY", "neither docker nor kubectl was found in PATH", "PATH=/usr/local/bin:/usr/bin:/bin", "temporary path", "not reported anywhere"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %q in:\n%s", want, s)
 		}

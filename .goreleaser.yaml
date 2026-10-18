@@ -44,5 +44,8 @@ changelog:
 
 release:
   name_template: "bracer {{ .Tag }}"
-  # draft: read the generated notes, then publish by hand.
-  draft: true
+  # Published as soon as the build succeeds so the archives can be downloaded
+  # without signing in; tags with a pre-release suffix (v1.2.3-rc.1) are marked
+  # pre-release. Notes can still be edited on GitHub afterwards.
+  draft: false
+  prerelease: auto

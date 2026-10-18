@@ -4,7 +4,7 @@ Encrypted Postgres backups that are proven to restore, run on your own server, w
 
 - `bracer init` finds Postgres on the machine (Docker container, Kubernetes pod, host package, or a connection URL), checks permissions, creates a key pair and writes `app.yaml`.
 - `bracer backup` runs `pg_dump` per database, encrypts the stream with [age](https://age-encryption.org), uploads it to any S3-compatible bucket, and writes a plaintext manifest with checksums, table row counts, encoding/locale and extensions. Nothing touches the disk.
-- `bracer drill` restores the latest backup into a throwaway Postgres container with no network, compares tables and row counts with the manifest, runs your SQL checks, and removes the container. A backup that was never restored is a guess.
+- `bracer drill` restores the latest backup into a throwaway Postgres with no network (a Docker container, or a Kubernetes pod when the machine only has `kubectl`), compares tables and row counts with the manifest, runs your SQL checks, and removes it. A backup that was never restored is a guess.
 - `bracer fetch` and `bracer restore` get the data back, into a file or straight into a database that does not exist yet. Restore never drops or alters anything that already exists.
 
 One static binary, no agent, no daemon. Postgres 12 to 18.
@@ -13,7 +13,7 @@ One static binary, no agent, no daemon. Postgres 12 to 18.
 
 - Linux or macOS on the machine where Postgres runs (the backup machine). For a managed or remote Postgres, any machine that can reach it.
 - Postgres tools of the same major version as the server. Bracer uses what already runs Postgres: `docker exec` for a container, `kubectl exec` for a pod, the host `pg_dump` for a host install. If none fits, it runs the official `postgres:N` image through Docker.
-- Docker, for `drill` only. `drill` can run on another machine than `backup`: it needs the bucket, the key file and `app.yaml`, not the database.
+- Docker or `kubectl`, for `drill` only: the temporary Postgres is a Docker container, or a pod in the cluster `kubectl` reaches (a k3s node, for example). `drill` can run on another machine than `backup`: it needs the bucket, the key file and `app.yaml`, not the database.
 - An S3-compatible bucket: AWS S3, Cloudflare R2, Backblaze B2, MinIO, Garage, SeaweedFS, and others. Create a dedicated access key for it.
 
 ## Install
@@ -81,6 +81,8 @@ retention:
   keep: 7                         # dumps kept per database (default 7)
 drill:
   image: postgres:17-alpine       # set by init when the source is a container or pod; optional otherwise
+  runtime: kube                   # docker | kube; set by init on a machine without Docker; otherwise picked at run time
+  namespace: default              # namespace of the temporary pod (runtime kube); init uses the source pod's namespace
   checks:
     - name: orders exist
       sql: select count(*) > 0 from orders
@@ -102,8 +104,8 @@ Bucket layout: `<prefix>/<app>/<instance>/<db>/<ts>.dump.age`, `<prefix>/<app>/<
 ### 3. Prove it restores
 
 ```bash
-bracer drill                # latest backup of every database, in a temporary container
-bracer drill --keep         # keep the container to look inside (it holds your real data)
+bracer drill                # latest backup of every database, in a temporary Postgres
+bracer drill --keep         # keep the container or pod to look inside (it holds your real data)
 ```
 
 Output, one line per database:
@@ -114,7 +116,7 @@ Output, one line per database:
 
 Globals (users) are restored first and only reported when they fail.
 
-The container runs with `--network none` and `--rm`, as the image that the source runs (container or pod), or the official image that carries the source's extensions (PostGIS, TimescaleDB, pgvector), or `postgres:N-alpine`. Before restoring, `drill` creates the database with the source's encoding and locale and verifies that every extension the database uses is available in the image. If one is missing it stops before restoring and tells you which `drill.image` to set.
+With Docker, the container runs with `--network none` and `--rm`. Without Docker, `drill` creates a pod through `kubectl` (`restartPolicy: Never`, data in an `emptyDir`) behind a deny-all NetworkPolicy, and checks from inside the pod that the policy is enforced; if the cluster's CNI ignores NetworkPolicy, it says so. `drill.runtime` and `drill.namespace` override the choice; `drill.memory` and `drill.cpus` cap either kind. The image is the one the source runs (container or pod), or the official image that carries the source's extensions (PostGIS, TimescaleDB, pgvector), or `postgres:N-alpine`. Before restoring, `drill` creates the database with the source's encoding and locale and verifies that every extension the database uses is available in the image. If one is missing it stops before restoring and tells you which `drill.image` to set.
 
 ### 4. Schedule it
 
@@ -123,7 +125,7 @@ bracer cron-example                 # paste into crontab -e
 bracer cron-example --format systemd
 ```
 
-The default schedule is `backup` at 03:00 and `drill` at 04:00, output to syslog under the tag `bracer`. `drill` needs Docker; if the backup machine has none, schedule `drill` on a machine that has it, with the same `app.yaml` and key file.
+The default schedule is `backup` at 03:00 and `drill` at 04:00, output to syslog under the tag `bracer`. `drill` needs Docker or `kubectl`; if the backup machine has neither, schedule `drill` on a machine that has one, with the same `app.yaml` and key file.
 
 ### 5. Get data back
 
@@ -172,7 +174,7 @@ Supported, and tested end to end (backup, drill, restore with intact data):
 |---|---|
 | PostgreSQL 12 to 18 | `pg_dump` of the same major as the server; the manifest records tool version and locale |
 | Docker container: official `postgres`, images built on it (`postgis/postgis`, `timescale/timescaledb`, custom `FROM postgres`), Bitnami | Bitnami needs `password_env` |
-| Kubernetes or k3s pod reached with `kubectl exec` without a password (CloudNativePG, Zalando, a StatefulSet on the official image) | |
+| Kubernetes or k3s pod reached with `kubectl exec` without a password (CloudNativePG, Zalando, a StatefulSet on the official image) | On a node without Docker, `drill` runs its temporary Postgres as a pod |
 | Host package: Unix socket in `/var/run/postgresql` or `/tmp`, or TCP | Needs the client package of the same major, or Docker |
 | Managed or remote Postgres through a connection string (`url_env`) | |
 | Contrib extensions (`uuid-ossp`, `pgcrypto`, `pg_trgm`, …) | Every official image has them |

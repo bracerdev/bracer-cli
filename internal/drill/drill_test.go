@@ -3,6 +3,7 @@ package drill
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -46,6 +47,7 @@ type fakeDocker struct {
 	dfAvailKB   int64             // -1: df fails (cannot measure)
 	createOpts  []string          // what follows TEMPLATE template0 in every CREATE DATABASE, all containers
 	available   map[string]string // pg_available_extensions in the temporary image
+	noDocker    bool              // `docker version` fails
 }
 
 type fakeContainer struct {
@@ -75,6 +77,11 @@ func (f *fakeDocker) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 	}
 	a := c.Args
 	switch a[0] {
+	case "version":
+		if f.noDocker {
+			return pg.Result{}, &pg.ExitError{Cmd: "docker version", Code: 1, Stderr: []byte("Cannot connect to the Docker daemon")}
+		}
+		return pg.Result{Stdout: []byte("29.0\n")}, nil
 	case "ps":
 		return pg.Result{Stdout: []byte(strings.Join(f.orphans, "\n"))}, nil
 	case "rm":
@@ -187,7 +194,11 @@ func (f *fakeDocker) exec(a []string, c pg.Cmd) (pg.Result, error) {
 	if ct == nil {
 		return pg.Result{}, &pg.ExitError{Cmd: "docker exec", Code: 1, Stderr: []byte("Error: No such container: " + name)}
 	}
-	db := envValue(c.Env, "PGDATABASE")
+	return f.tool(ct, tool, args, envValue(c.Env, "PGDATABASE"), c)
+}
+
+// tool emulates pg_isready, psql and pg_restore inside a container; db is PGDATABASE.
+func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db string, c pg.Cmd) (pg.Result, error) {
 	write := func(s string) {
 		if c.Stdout != nil {
 			io.WriteString(c.Stdout, s)
@@ -372,12 +383,27 @@ func baseCfg() *config.App {
 }
 
 func deps(f *fakeDocker, st storage.Store) Deps {
+	return depsFor(f, st)
+}
+
+// depsFor: the fake clock advances 1 s per Now(); no kubectl on PATH unless the shell is a fakeKube.
+func depsFor(sh pg.Shell, st storage.Store) Deps {
 	clock := time.Date(2026, 10, 17, 3, 0, 0, 0, time.UTC)
+	lookPath := func(string) (string, error) { return "", errors.New("not found") }
+	if _, ok := sh.(*fakeKube); ok {
+		lookPath = func(name string) (string, error) {
+			if name == "kubectl" {
+				return "/usr/local/bin/kubectl", nil
+			}
+			return "", errors.New("not found")
+		}
+	}
 	return Deps{
-		Shell: f, Store: st,
-		Now:  func() time.Time { clock = clock.Add(time.Second); return clock },
-		Rand: func(n int) string { return strings.Repeat("a", n*2) },
-		Poll: time.Millisecond,
+		Shell: sh, Store: st,
+		Tools: &pg.Tools{Shell: sh, LookPath: lookPath},
+		Now:   func() time.Time { clock = clock.Add(time.Second); return clock },
+		Rand:  func(n int) string { return strings.Repeat("a", n*2) },
+		Poll:  time.Millisecond,
 	}
 }
 

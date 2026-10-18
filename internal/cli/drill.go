@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,18 +17,19 @@ import (
 )
 
 // runDrill is `bracer drill` (spec backup/drill). Shares deps with backup:
-// drill does not connect to the real instance, it only needs the bucket and docker.
+// drill does not connect to the real instance, it only needs the bucket and
+// Docker or kubectl for the temporary Postgres.
 func runDrill(ctx context.Context, args []string, d backupDeps) int {
 	fs := flag.NewFlagSet("drill", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	cfgPath := fs.String("c", "app.yaml", "path of app.yaml")
 	envFile := fs.String("env-file", "", "dotenv file with secrets (overrides secrets_file, overridden by the environment)")
-	keep := fs.Bool("keep", false, "keep the temporary Postgres container for inspection")
-	skipDisk := fs.Bool("skip-disk-check", false, "run even if the Docker data directory seems to lack free disk space")
+	keep := fs.Bool("keep", false, "keep the temporary Postgres container or pod for inspection")
+	skipDisk := fs.Bool("skip-disk-check", false, "run even if the disk of the temporary Postgres seems short on space")
 	instance := fs.String("instance", "", "drill only this instance")
 	database := fs.String("database", "", "drill only this database")
 	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
-	verbose := fs.Bool("verbose", false, "log every docker command")
+	verbose := fs.Bool("verbose", false, "log every docker and kubectl command")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -61,18 +63,18 @@ func runDrill(ctx context.Context, args []string, d backupDeps) int {
 	if err != nil {
 		return fail(exitUsage, "%v", err)
 	}
-	if err := (pg.Docker{Shell: d.shell}).Version(ctx); err != nil {
-		return fail(exitError, "docker is required to run a temporary Postgres: %v", err)
-	}
-
 	lock, err := backup.AcquireKind(*cfgPath, "drill")
 	if err != nil {
 		return fail(exitError, "%v", err)
 	}
 	defer lock.Release()
 
-	res, err := drill.Run(ctx, cfg, drill.Deps{Shell: d.shell, Store: st, Log: logger, Keep: *keep, Instance: *instance, Database: *database, SkipDiskCheck: *skipDisk})
+	res, err := drill.Run(ctx, cfg, drill.Deps{Shell: d.shell, Tools: d.tools(), Store: st, Log: logger, Keep: *keep, Instance: *instance, Database: *database, SkipDiskCheck: *skipDisk})
 	if err != nil {
+		var ue *drill.UsageError
+		if errors.As(err, &ue) {
+			return fail(exitUsage, "%v", err)
+		}
 		report(ctx, cfg, secrets, d, logger, failureReport("drill", cfg.App, err))
 		return fail(exitError, "%v", err)
 	}
@@ -148,7 +150,11 @@ func printDrillResult(w io.Writer, res *drill.Result) {
 			}
 		}
 		if ir.Container != "" {
-			fmt.Fprintf(w, "kept container %s (holds your real data; remove it when done):\n  docker exec -it %s psql -U postgres\n  docker rm -f %s\n", ir.Container, ir.Container, ir.Container)
+			fmt.Fprintf(w, "kept container %s (holds your real data; remove it when done):\n  docker exec -it %s psql -U postgres\n  docker rm -f -v %s\n", ir.Container, ir.Container, ir.Container)
+		}
+		if ir.Pod != "" {
+			ns, name, _ := strings.Cut(ir.Pod, "/")
+			fmt.Fprintf(w, "kept pod %s (holds your real data; remove it when done):\n  %s exec -it -n %s %s -- psql -U postgres\n  %s delete -n %s pod/%s networkpolicy/%s\n", ir.Pod, ir.Kubectl, ns, name, ir.Kubectl, ns, name, name)
 		}
 	}
 	for _, wmsg := range res.Warnings {

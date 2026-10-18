@@ -386,6 +386,57 @@ func TestInitPodFlow(t *testing.T) {
 	}
 }
 
+// A node without Docker (k3s with containerd): init writes drill.runtime: kube and
+// the pod's namespace once kubectl confirms it may create pods and network policies there.
+func TestInitPodFlowWithoutDockerSetsDrillRuntime(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	exec := "kubectl exec -i -n attendy-dev postgres-0 -c postgres -- env PGUSER=attendy PGDATABASE=postgres PGCONNECT_TIMEOUT=10 "
+	psql := exec + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
+	sh := &fakeShell{out: map[string]string{
+		"ss -ltnpH": "",
+		"kubectl get pods -A -o json": `{"items":[
+		  {"metadata":{"namespace":"attendy-dev","name":"postgres-0"},"spec":{"containers":[{"name":"postgres","image":"postgres:17-alpine","env":[{"name":"POSTGRES_USER","value":"attendy"}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"postgres","ready":true}]}}]}`,
+		"kubectl exec -n attendy-dev postgres-0 -c postgres -- sh -c command -v pg_dump": "/usr/bin/pg_dump\n",
+		"kubectl exec -n attendy-dev postgres-0 -c postgres -- sh -c for f in /proc":     "1\n",
+		"kubectl get pod -n attendy-dev postgres-0 -o json":                              `{"spec":{"containers":[{"name":"postgres","image":"postgres:17-alpine"}]}}`,
+		"kubectl auth can-i create pods -n attendy-dev":                                  "yes\n",
+		"kubectl auth can-i create networkpolicies.networking.k8s.io -n attendy-dev":     "yes\n",
+		psql + "select 1":                "1\n",
+		psql + "show server_version_num": "170011\n",
+		psql + "select version()":        "PostgreSQL 17.11 on x86_64\n",
+		psql + "select datname":          "postgres\nattendy\n",
+		psql + "select current_user":     "attendy\x1ft\x1ft\x1ft\n",
+		strings.Replace(psql, "PGDATABASE=postgres", "PGDATABASE=attendy", 1) + "select n.nspname":      "",
+		strings.Replace(exec, "PGDATABASE=postgres", "PGDATABASE=attendy", 1) + "pg_dump --schema-only": "",
+	}, fail: map[string]string{
+		"docker version":        "Cannot connect to the Docker daemon",
+		psql + "show pool_mode": "ERROR",
+	}}
+	code, out, errOut := runScriptedLook(t, dir, sh, nil, lookIn(map[string]string{"kubectl": "/usr/local/bin/kubectl"}),
+		"shop",
+		"1", // the pod
+		"",  // name postgres-0
+		"2", // database attendy
+		"https://s3.example.com", "backups", "", "", "", "AK", "SK",
+		"n", // no encryption
+		"2", // I manage secrets
+	)
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	if !strings.Contains(errOut, "Docker is not available") || !strings.Contains(out, "drill will run its temporary Postgres as a pod in namespace attendy-dev through kubectl") {
+		t.Errorf("must warn about Docker and announce the pod runtime:\nstdout:\n%s\nstderr:\n%s", out, errOut)
+	}
+	cfg, err := config.Load(filepath.Join(dir, "app.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Drill == nil || cfg.Drill.Runtime != "kube" || cfg.Drill.Namespace != "attendy-dev" || cfg.Drill.Image != "postgres:17-alpine" {
+		t.Errorf("drill: %+v", cfg.Drill)
+	}
+}
+
 // The pod gets POSTGRES_USER via an envFrom Secret: the pod spec has no value. init
 // asks the container; if that fails, the server reports the user does not exist → ask for the user.
 func TestInitPodUserFromSecret(t *testing.T) {

@@ -102,6 +102,8 @@ func TestValidateErrors(t *testing.T) {
 		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nencryption: rot13\n":                                                                                           "must be none | age",
 		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nstorage:\n  bucket: b\n":                                                                                       "storage.endpoint",
 		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  image: bitnamilegacy/postgresql:16\n":                                                                "not supported as the drill image",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  runtime: podman\n":                                                                                   "drill.runtime: must be docker or kube",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  namespace: Bad_NS\n":                                                                                 "drill.namespace: must be a Kubernetes namespace name",
 		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nretention: { keep: 0 }\n":                                                                                      "retention.keep",
 		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n    bogus: 1\n":                                                                                                "bogus",
 		"app: shop\ninstances:\n  - name: a\n    pod: onlyns\n    databases: all\n":                                                                                                               "namespace/pod",

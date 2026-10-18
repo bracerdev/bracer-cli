@@ -1,16 +1,16 @@
-// Package drill restores the latest backup into a temporary Postgres in Docker
-// and compares it against the manifest (spec backup/drill).
+// Package drill restores the latest backup into a temporary Postgres (a Docker
+// container, or a Kubernetes pod through kubectl) and compares it against the
+// manifest (spec backup/drill).
 package drill
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +28,8 @@ import (
 // Deps is everything Run touches outside; tests replace it with fakes.
 type Deps struct {
 	Shell pg.Shell
+	// Tools finds docker and kubectl to pick the runtime; defaults to pg.NewTools(Shell).
+	Tools *pg.Tools
 	Store storage.Store
 	Now   func() time.Time
 	Log   *slog.Logger
@@ -38,6 +40,8 @@ type Deps struct {
 	// ReadyTimeout is how long to wait for pg_isready (default 90 s); Poll is the polling interval (1 s).
 	ReadyTimeout time.Duration
 	Poll         time.Duration
+	// StartTimeout is how long a pod may take to reach Running (default 10 min; image pull on the node).
+	StartTimeout time.Duration
 
 	Keep          bool   // --keep: keep the temporary container
 	Instance      string // --instance: only this instance
@@ -52,6 +56,7 @@ type Result struct {
 	StartedAt  time.Time         `json:"started_at"`
 	FinishedAt time.Time         `json:"finished_at"`
 	OK         bool              `json:"ok"`
+	Runtime    string            `json:"runtime,omitempty"` // docker | kube
 	Instances  []*InstanceResult `json:"instances"`
 	Warnings   []string          `json:"warnings,omitempty"`
 }
@@ -60,8 +65,10 @@ type Result struct {
 type InstanceResult struct {
 	Name      string             `json:"name"`
 	Image     string             `json:"image,omitempty"`
-	Container string             `json:"container,omitempty"` // only with --keep
-	Volumes   []string           `json:"volumes,omitempty"`   // only with --keep
+	Container string             `json:"container,omitempty"` // only with --keep (docker)
+	Volumes   []string           `json:"volumes,omitempty"`   // only with --keep (docker)
+	Pod       string             `json:"pod,omitempty"`       // only with --keep (kube): namespace/name
+	Kubectl   string             `json:"kubectl,omitempty"`   // only with --keep (kube): kubectl or k3s kubectl
 	OK        bool               `json:"ok"`
 	Error     string             `json:"error,omitempty"`
 	Disk      *restore.DiskCheck `json:"disk,omitempty"`
@@ -147,10 +154,17 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 		res.warn("instance %s has no backup yet, skipped", name)
 	}
 
-	if nc, nv, err := cleanupOrphans(ctx, d, cfg.App); err != nil {
-		res.warn("could not remove leftover drill containers/volumes: %v", err)
-	} else if nc+nv > 0 {
-		res.warn("removed %d leftover drill container(s) and %d volume(s) from a previous run", nc, nv)
+	rt, err := pickRuntime(ctx, cfg, d)
+	if err != nil {
+		return nil, err
+	}
+	res.Runtime = rt.kind()
+	d.Log.Info("drill runtime", "runtime", rt.kind())
+
+	if what, err := rt.cleanupOrphans(ctx, cfg.App); err != nil {
+		res.warn("could not remove leftover drill resources: %v", err)
+	} else if what != "" {
+		res.warn("removed %s from a previous run", what)
 	}
 
 	ids := loadIdentities(cfg, manifest, d, res)
@@ -159,7 +173,7 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 	for _, in := range instances {
 		ir := &InstanceResult{Name: in.Name}
 		res.Instances = append(res.Instances, ir)
-		runInstance(ctx, cfg, in, manifest.Instances[in.Name], ids, ir, res, d)
+		runInstance(ctx, rt, cfg, in, manifest.Instances[in.Name], ids, ir, res, d)
 		if !ir.OK {
 			res.OK = false
 		}
@@ -186,6 +200,12 @@ func withDefaults(d Deps) Deps {
 	}
 	if d.Poll == 0 {
 		d.Poll = defaultPoll
+	}
+	if d.StartTimeout == 0 {
+		d.StartTimeout = defaultStartWait
+	}
+	if d.Tools == nil {
+		d.Tools = pg.NewTools(d.Shell, goruntime.GOOS)
 	}
 	return d
 }
@@ -237,96 +257,6 @@ func latest(dumps []*backup.Dump, ts string) *backup.Dump {
 	return nil
 }
 
-// cleanupOrphans removes the app's drill containers and volumes left over from a
-// previous run (same label; named volumes can be cleaned up, unlike anonymous ones).
-func cleanupOrphans(ctx context.Context, d Deps, app string) (containers, volumes int, err error) {
-	out, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"ps", "-aq", "--filter", "label=" + Label + "=" + app, "--filter", "name=" + containerPrefix}})
-	if err != nil {
-		return 0, 0, err
-	}
-	if ids := strings.Fields(string(out.Stdout)); len(ids) > 0 {
-		if _, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: append([]string{"rm", "-f", "-v"}, ids...)}); err != nil {
-			return 0, 0, err
-		}
-		containers = len(ids)
-	}
-	out, err = d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"volume", "ls", "-q", "--filter", "label=" + Label + "=" + app, "--filter", "name=" + containerPrefix}})
-	if err != nil {
-		return containers, 0, err
-	}
-	if names := strings.Fields(string(out.Stdout)); len(names) > 0 {
-		if _, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: append([]string{"volume", "rm"}, names...)}); err != nil {
-			return containers, 0, err
-		}
-		volumes = len(names)
-	}
-	return containers, volumes, nil
-}
-
-// checkDockerDisk measures the free disk where the drill will write (spec drill § Data model):
-// df in a temporary container of the (already pulled) image with the drill volume
-// mounted read-only — the very filesystem the restore will use, even when Docker
-// runs in a VM, and without bind-mounting anything from the host into the image
-// (Docker root holds the data of every other container). If that cannot run → df
-// on the Docker root directly on the host; if both fail → Checked=false.
-func checkDockerDisk(ctx context.Context, d Deps, image, volume string, needBytes int64) restore.DiskCheck {
-	dc := restore.DiskCheck{NeedBytes: needBytes}
-	const mnt = "/mnt/bracer-disk"
-	out, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"run", "--rm", "--network", "none", "-v", volume + ":" + mnt + ":ro", image, "df", "-Pk", mnt}})
-	where := "volume " + volume
-	if err != nil {
-		info, ierr := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"info", "--format", "{{.DockerRootDir}}"}})
-		dir := strings.TrimSpace(string(info.Stdout))
-		if ierr != nil || dir == "" {
-			dc.Error = fmt.Sprintf("could not check free disk space (df in %s: %v; docker info gave no root directory)", image, err)
-			return dc
-		}
-		where = dir
-		out, err = d.Shell.Run(ctx, pg.Cmd{Name: "df", Args: []string{"-Pk", dir}})
-	}
-	dc.DataDirectory = where
-	if err != nil {
-		dc.Error = fmt.Sprintf("could not check free disk space at %s (%v)", where, err)
-		return dc
-	}
-	free, err := pg.ParseDF(out.Stdout)
-	if err != nil {
-		dc.Error = fmt.Sprintf("could not read df output for %s: %v", where, err)
-		return dc
-	}
-	dc.Checked, dc.FreeBytes = true, free
-	return dc
-}
-
-// imageVolumes reads the image's VOLUME paths (pulling it if absent) so that
-// named volumes can be mounted there, avoiding anonymous volumes.
-func imageVolumes(ctx context.Context, d Deps, image string) ([]string, error) {
-	inspect := func() ([]string, error) {
-		out, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{json .Config.Volumes}}", image}})
-		if err != nil {
-			return nil, err
-		}
-		var vols map[string]struct{}
-		if err := json.Unmarshal(bytes.TrimSpace(out.Stdout), &vols); err != nil {
-			return nil, fmt.Errorf("parse image volumes: %w", err)
-		}
-		paths := make([]string, 0, len(vols))
-		for p := range vols {
-			paths = append(paths, p)
-		}
-		sort.Strings(paths)
-		return paths, nil
-	}
-	paths, err := inspect()
-	if err == nil {
-		return paths, nil
-	}
-	if _, perr := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"pull", "-q", image}}); perr != nil {
-		return nil, fmt.Errorf("pull %s: %w", image, perr)
-	}
-	return inspect()
-}
-
 // chooseImage (spec drill § Flow 3a): drill.image → extension mapping of the
 // databases to restore (postgis/timescaledb/vector → the vendor's own image) →
 // postgres:N-alpine, with N = max(major(pg_version), highest tool_version among
@@ -358,24 +288,7 @@ func chooseImage(cfg *config.App, in config.Instance, im *backup.InstanceManifes
 	return pg.ImageForExtensions(n, exts)
 }
 
-// tempPG is the temporary Postgres container; tools run via docker exec, connecting
-// over the socket as user postgres.
-type tempPG struct {
-	sh    pg.Shell
-	name  string
-	image string
-}
-
-func (t *tempPG) runner() pg.Runner { return pg.ExecRunner{Shell: t.sh, Container: t.name} }
-
-func (t *tempPG) conn(db string) pg.Conn { return pg.Conn{User: "postgres", Database: db} }
-
-// client returns a pg.Client connected to database db of the temporary container.
-func (t *tempPG) client(db string) *pg.Client {
-	return &pg.Client{Runner: t.runner(), Conn: t.conn(db)}
-}
-
-func runInstance(ctx context.Context, cfg *config.App, in config.Instance, im *backup.InstanceManifest, ids *restore.Identities, ir *InstanceResult, res *Result, d Deps) {
+func runInstance(ctx context.Context, rt runtime, cfg *config.App, in config.Instance, im *backup.InstanceManifest, ids *restore.Identities, ir *InstanceResult, res *Result, d Deps) {
 	// Which databases to drill: has a latest dump, still in app.yaml, passes --database.
 	var dbs []string
 	for name, dm := range im.Databases {
@@ -403,7 +316,7 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, im *b
 	}
 	ir.Image = image
 
-	// Docker root disk on this machine: real data ≈ DiskFactor × compressed dump.
+	// Disk where the temporary Postgres writes: real data ≈ DiskFactor × compressed dump.
 	var need int64
 	for _, db := range dbs {
 		need += latest(im.Databases[db].Dumps, im.Databases[db].Latest).Bytes
@@ -411,88 +324,19 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, im *b
 	if g := latest(im.Globals.Dumps, im.Globals.Latest); g != nil {
 		need += g.Bytes
 	}
-	// A named + labeled volume for each VOLUME of the image: docker rm -f does not
-	// remove a --rm container's anonymous volumes; each drill would leave a copy of the data behind.
-	paths, err := imageVolumes(ctx, d, image)
+	t, err := rt.start(ctx, cfg, in, image, need*restore.DiskFactor, ir, res, d)
 	if err != nil {
-		ir.Error = fmt.Sprintf("inspect %s: %v", image, err)
-		return
-	}
-	t := &tempPG{sh: d.Shell, name: containerPrefix + cfg.App + "-" + d.Rand(3), image: image}
-	// POSTGRES_PASSWORD is required by the official image; never used (socket connection).
-	runArgs := []string{"run", "-d", "--rm", "--network", "none", "--label", Label + "=" + cfg.App, "--name", t.name, "-e", "POSTGRES_PASSWORD"}
-	var volumes []string
-	// Image declares no VOLUME: still create one volume (not mounted) to measure disk.
-	if len(paths) == 0 {
-		paths = []string{""}
-	}
-	for i, p := range paths {
-		name := t.name
-		if i > 0 {
-			name = fmt.Sprintf("%s-%d", t.name, i)
-		}
-		if _, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"volume", "create", "--label", Label + "=" + cfg.App, name}}); err != nil {
-			ir.Error = fmt.Sprintf("create volume %s: %v", name, err)
-			removeVolumes(ctx, d, volumes, res, in.Name)
-			return
-		}
-		volumes = append(volumes, name)
-		if p != "" {
-			runArgs = append(runArgs, "-v", name+":"+p)
-		}
-	}
-	// Measure disk through the volume just created, before starting the container.
-	dc := checkDockerDisk(ctx, d, image, volumes[0], need*restore.DiskFactor)
-	ir.Disk = &dc
-	switch {
-	case !dc.Checked:
-		res.warn("%s: %s; the drill may fill the disk", in.Name, dc.Error)
-	case !dc.Enough() && !d.SkipDiskCheck:
-		ir.Error = fmt.Sprintf("not enough disk space for a drill: %s free at %s, about %s may be needed; free space or pass --skip-disk-check", humanBytes(dc.FreeBytes), dc.DataDirectory, humanBytes(dc.NeedBytes))
-		removeVolumes(ctx, d, volumes, res, in.Name)
-		return
-	case !dc.Enough():
-		res.warn("%s: only %s free at %s, about %s may be needed (--skip-disk-check)", in.Name, humanBytes(dc.FreeBytes), dc.DataDirectory, humanBytes(dc.NeedBytes))
-	}
-	start := d.Now()
-	if cfg.Drill != nil {
-		if cfg.Drill.Memory != "" {
-			runArgs = append(runArgs, "--memory", cfg.Drill.Memory)
-		}
-		if cfg.Drill.CPUs != "" {
-			runArgs = append(runArgs, "--cpus", cfg.Drill.CPUs)
-		}
-	}
-	runArgs = append(runArgs, image)
-	if _, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: runArgs, Env: []string{"POSTGRES_PASSWORD=" + d.Rand(16)}}); err != nil {
-		ir.Error = fmt.Sprintf("start %s: %v", image, err)
-		removeVolumes(ctx, d, volumes, res, in.Name)
-		return
-	}
-	if took := d.Now().Sub(start); took > slowPull {
-		res.warn("%s: starting %s took %.0f s (image pull?)", in.Name, image, took.Seconds())
-	}
-	d.Log.Info("temp postgres started", "instance", in.Name, "container", t.name, "image", image)
-	defer func() {
-		if d.Keep {
-			ir.Container = t.name
-			ir.Volumes = volumes
-			return
-		}
-		// Ctrl-C/timeout must still clean up: a fresh context, not inheriting the cancelled ctx.
-		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
-		defer cancel()
-		if _, err := d.Shell.Run(rmCtx, pg.Cmd{Name: "docker", Args: []string{"rm", "-f", "-v", t.name}}); err != nil {
-			res.warn("%s: could not remove container %s: %v; run: docker rm -f -v %s", in.Name, t.name, err, t.name)
-			return // the volumes are still attached to the container; remove them along with it
-		}
-		removeVolumes(rmCtx, d, volumes, res, in.Name)
-	}()
-
-	if err := t.waitReady(ctx, d); err != nil {
 		ir.Error = err.Error()
 		return
 	}
+	defer func() {
+		if d.Keep {
+			rt.keep(t, ir)
+			return
+		}
+		rt.remove(ctx, t, res, in.Name)
+	}()
+
 	// Evidence of which extensions the image has (spec drill § Flow 3b); each
 	// database is checked against it before restore.
 	avail, err := t.client("postgres").AvailableExtensions(ctx)
@@ -513,16 +357,6 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, im *b
 		if !dr.OK {
 			ir.OK = false
 		}
-	}
-}
-
-// removeVolumes removes the drill's named volumes; on error it only warns, with the manual cleanup command.
-func removeVolumes(ctx context.Context, d Deps, volumes []string, res *Result, instance string) {
-	if len(volumes) == 0 {
-		return
-	}
-	if _, err := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: append([]string{"volume", "rm"}, volumes...)}); err != nil {
-		res.warn("%s: could not remove volume(s) %s: %v; run: docker volume rm %s", instance, strings.Join(volumes, " "), err, strings.Join(volumes, " "))
 	}
 }
 
@@ -547,26 +381,4 @@ func inList(list []config.Database, name string) bool {
 		}
 	}
 	return false
-}
-
-// waitReady polls pg_isready over TCP loopback inside the container: the entrypoint's
-// temporary server (during initdb) opens only the socket, so TCP being up means the real server runs.
-func (t *tempPG) waitReady(ctx context.Context, d Deps) error {
-	deadline := d.Now().Add(d.ReadyTimeout)
-	for {
-		if err := t.runner().Run(ctx, t.conn("postgres"), "pg_isready", []string{"-h", "127.0.0.1", "-U", "postgres"}, nil, io.Discard); err == nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return fmt.Errorf("interrupted while waiting for Postgres: %v", ctx.Err())
-		}
-		if !d.Now().Before(deadline) {
-			logs, _ := d.Shell.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"logs", "--tail", "20", t.name}})
-			return fmt.Errorf("Postgres in %s not ready after %.0f s; last log lines:\n%s", t.name, d.ReadyTimeout.Seconds(), restore.Tail(append(logs.Stdout, logs.Stderr...), restore.StderrTail))
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(d.Poll):
-		}
-	}
 }

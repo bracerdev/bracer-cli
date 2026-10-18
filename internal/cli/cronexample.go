@@ -19,9 +19,9 @@ import (
 // cronInputs is everything the template needs; separated from os for tests.
 type cronInputs struct {
 	cfg        *config.App
-	cfgPath    string // absolute
-	binary     string // absolute, or "bracer" if not stable
-	dockerDir  string // directory containing docker, "" if not found
+	cfgPath    string   // absolute
+	binary     string   // absolute, or "bracer" if not stable
+	toolDirs   []string // directories containing docker and kubectl/k3s (drill needs one of them), none if not found
 	username   string
 	backupAt   string
 	drillAt    string
@@ -62,9 +62,7 @@ func runCronExample(_ context.Context, args []string, stdout, stderr io.Writer) 
 	in := cronInputs{cfg: cfg, backupAt: *backupAt, drillAt: *drillAt, system: *system}
 	in.cfgPath, _ = filepath.Abs(*cfgPath)
 	in.binary = stableBinaryPath()
-	if p, err := exec.LookPath("docker"); err == nil {
-		in.dockerDir = filepath.Dir(p)
-	}
+	in.toolDirs = toolDirs(exec.LookPath)
 	if u, err := user.Current(); err == nil {
 		in.username = u.Username
 	}
@@ -81,6 +79,29 @@ func runCronExample(_ context.Context, args []string, stdout, stderr io.Writer) 
 		renderCron(stdout, in)
 	}
 	return exitOK
+}
+
+// toolDirs lists the directories of docker, kubectl and k3s that are on PATH,
+// without duplicates, so cron's PATH can find whichever one drill uses.
+func toolDirs(lookPath func(string) (string, error)) []string {
+	var dirs []string
+	seen := map[string]bool{}
+	for _, tool := range []string{"docker", "kubectl", "k3s"} {
+		p, err := lookPath(tool)
+		if err != nil {
+			continue
+		}
+		if dir := filepath.Dir(p); !seen[dir] {
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+// cronPath is the PATH line for cron/systemd: the tool directories first, then the usual ones.
+func (in cronInputs) cronPath() string {
+	return strings.Join(append(append([]string{}, in.toolDirs...), "/usr/local/bin", "/usr/bin", "/bin"), ":")
 }
 
 // stableBinaryPath: path of the running binary, symlinks resolved; a temporary
@@ -167,12 +188,10 @@ func renderCron(w io.Writer, in cronInputs) {
 	}
 	fmt.Fprintln(w, "# Output goes to syslog; check with: journalctl -t bracer  (or /var/log/syslog)")
 	fmt.Fprintln(w)
-	if in.dockerDir != "" {
-		fmt.Fprintf(w, "PATH=%s:/usr/local/bin:/usr/bin:/bin\n", in.dockerDir)
-	} else {
-		fmt.Fprintln(w, "# docker was not found in PATH; set PATH so cron can find it:")
-		fmt.Fprintln(w, "PATH=/usr/local/bin:/usr/bin:/bin")
+	if len(in.toolDirs) == 0 {
+		fmt.Fprintln(w, "# neither docker nor kubectl was found in PATH; drill needs one of them, set PATH so cron can find it:")
 	}
+	fmt.Fprintf(w, "PATH=%s\n", in.cronPath())
 	fmt.Fprintf(w, "%s %s backup -c %s 2>&1 | logger -t bracer\n", in.backupAt, in.binary, in.cfgPath)
 	fmt.Fprintf(w, "%s %s drill  -c %s 2>&1 | logger -t bracer\n", in.drillAt, in.binary, in.cfgPath)
 	fmt.Fprintln(w)
@@ -202,8 +221,8 @@ func renderSystemd(w io.Writer, in cronInputs) {
 		if in.system && in.username != "" {
 			fmt.Fprintf(w, "User=%s\n", in.username)
 		}
-		if in.dockerDir != "" {
-			fmt.Fprintf(w, "Environment=PATH=%s:/usr/local/bin:/usr/bin:/bin\n", in.dockerDir)
+		if len(in.toolDirs) > 0 {
+			fmt.Fprintf(w, "Environment=PATH=%s\n", in.cronPath())
 		}
 		fmt.Fprintf(w, "ExecStart=%s %s -c %s\n", in.binary, job.name, in.cfgPath)
 		fmt.Fprintf(w, "\n# ---- %s.timer ----\n[Unit]\nDescription=Run %s\n\n[Timer]\nOnCalendar=%s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n", unit, unit, cronToOnCalendar(job.at))
