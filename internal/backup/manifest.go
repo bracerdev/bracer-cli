@@ -24,9 +24,18 @@ type Manifest struct {
 
 // InstanceManifest is the part for one instance.
 type InstanceManifest struct {
-	PgVersion string                       `json:"pg_version"`
-	Databases map[string]*DatabaseManifest `json:"databases"`
-	Globals   GlobalsManifest              `json:"globals"`
+	PgVersion string `json:"pg_version"`
+	// Kind is the source kind of the last run: container, local or url. A url
+	// run has no globals: databases only (ADR-0015).
+	Kind string `json:"kind,omitempty"`
+	// Env holds the environment files, one per run (ADR-0015); empty in
+	// manifests written before it, whose runs can only be previewed.
+	Env GlobalsManifest `json:"env"`
+	// SharedPreloadLibraries is the server's shared_preload_libraries; nil when the
+	// backup user could not read it (restore then does not check the target).
+	SharedPreloadLibraries *string                      `json:"shared_preload_libraries,omitempty"`
+	Databases              map[string]*DatabaseManifest `json:"databases"`
+	Globals                GlobalsManifest              `json:"globals"`
 }
 
 // DatabaseManifest holds the list of dumps of one database.
@@ -61,6 +70,13 @@ type Dump struct {
 	// the image from them, drill/restore check the target has them all before restoring.
 	Extensions []pg.Extension `json:"extensions,omitempty"`
 	Tables     []pg.Table     `json:"tables,omitempty"`
+	// SystemID is the system_identifier of the cluster the dump came from (spec
+	// backup § Flow 3a2), so drill and reports never mix two clusters' dumps.
+	SystemID string `json:"system_id,omitempty"`
+	// OutOfScope lists what depends on files or processes outside Postgres
+	// (untrusted languages, C outside $libdir, file_fdw, subscriptions): a
+	// restore cannot guarantee them (ADR-0015).
+	OutOfScope []string `json:"out_of_scope,omitempty"`
 }
 
 const manifestSchema = 1
@@ -89,6 +105,9 @@ func (m *Manifest) Keys() map[string]bool {
 			}
 		}
 		for _, d := range im.Globals.Dumps {
+			keys[d.Key] = true
+		}
+		for _, d := range im.Env.Dumps {
 			keys[d.Key] = true
 		}
 	}

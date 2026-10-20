@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"filippo.io/age"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -48,12 +49,16 @@ type fakeDocker struct {
 	createOpts  []string          // what follows TEMPLATE template0 in every CREATE DATABASE, all containers
 	available   map[string]string // pg_available_extensions in the temporary image
 	noDocker    bool              // `docker version` fails
+	attrSQL     map[string]string // dump content → what pg_restore --create -n … prints
+	attrFail    string            // psql -f - reports an ERROR for statements containing it
 }
 
 type fakeContainer struct {
 	image      string
 	dbs        map[string][]fakeTable
 	createOpts []string // what follows TEMPLATE template0 in each CREATE DATABASE
+	owner      map[string]string
+	settings   map[string][]string // database → "role\x1fname=value"
 }
 
 func newFakeDocker() *fakeDocker {
@@ -65,6 +70,7 @@ func newFakeDocker() *fakeDocker {
 		checks:     map[string]string{},
 		volumes:    map[string]bool{},
 		dfAvailKB:  1 << 30,
+		attrSQL:    map[string]string{"PGDMP-shop": "CREATE DATABASE shop WITH TEMPLATE = template0;\nALTER DATABASE shop OWNER TO postgres;\n"},
 	}
 }
 
@@ -94,6 +100,9 @@ func (f *fakeDocker) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 		}
 		return pg.Result{}, nil
 	case "info":
+		if f.noDocker {
+			return pg.Result{}, &pg.ExitError{Cmd: "docker info", Code: 1, Stderr: []byte("Cannot connect to the Docker daemon")}
+		}
 		return pg.Result{Stdout: []byte("/var/lib/docker\n")}, nil
 	case "image":
 		return pg.Result{Stdout: []byte(`{"/var/lib/postgresql/data":{}}` + "\n")}, nil
@@ -216,6 +225,11 @@ func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db stri
 			data, _ := io.ReadAll(c.Stdin)
 			var stderr bytes.Buffer
 			for _, line := range strings.Split(string(data), "\n") {
+				if f.attrFail != "" && strings.Contains(line, f.attrFail) {
+					stderr.WriteString("psql:<stdin>:2: ERROR:  unrecognized configuration parameter\n")
+					continue
+				}
+				ct.applyAttr(strings.TrimSuffix(line, ";"))
 				if strings.HasPrefix(line, "CREATE ROLE postgres") {
 					stderr.WriteString(`psql:<stdin>:3: ERROR:  role "postgres" already exists` + "\n")
 				}
@@ -243,6 +257,20 @@ func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db stri
 				fmt.Fprintf(&out, "%s\x1f%s\n", n, v)
 			}
 			write(out.String())
+		case sql == "select rolname from pg_roles order by rolname":
+			write("postgres\nshop_app\n")
+		case strings.HasPrefix(sql, "select pg_get_userbyid(datdba) from pg_database where datname = "):
+			name := strings.Trim(strings.TrimPrefix(sql, "select pg_get_userbyid(datdba) from pg_database where datname = "), "'")
+			if o := ct.owner[name]; o != "" {
+				write(o + "\n")
+			} else {
+				write("postgres\n")
+			}
+		case strings.HasPrefix(sql, "select coalesce(r.rolname, ''), c from pg_db_role_setting"):
+			name := sql[strings.LastIndex(sql, "= '")+3 : len(sql)-1]
+			for _, kv := range ct.settings[name] {
+				write(kv + "\n")
+			}
 		case sql == "analyze":
 			for k := range tables {
 				tables[k].analyzed = true
@@ -278,6 +306,15 @@ func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db stri
 		}
 		return pg.Result{}, nil
 	case "pg_restore":
+		if len(args) > 0 && args[0] == "--create" {
+			data, _ := io.ReadAll(c.Stdin)
+			out, ok := f.attrSQL[string(data)]
+			if !ok {
+				return pg.Result{}, &pg.ExitError{Cmd: "pg_restore", Code: 1, Stderr: []byte("pg_restore: error: input file does not appear to be a valid archive")}
+			}
+			write(out)
+			return pg.Result{}, nil
+		}
 		if _, ok := ct.dbs[db]; !ok {
 			return pg.Result{}, &pg.ExitError{Cmd: "pg_restore", Code: 1, Stderr: []byte(`pg_restore: error: connection to server failed: database "` + db + `" does not exist`)}
 		}
@@ -292,6 +329,24 @@ func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db stri
 		return pg.Result{}, nil
 	}
 	return pg.Result{}, fmt.Errorf("fake: unexpected tool %s", tool)
+}
+
+var (
+	reAttrOwner = regexp.MustCompile(`^ALTER DATABASE "([^"]+)" OWNER TO (\S+)$`)
+	reAttrSet   = regexp.MustCompile(`^ALTER DATABASE "([^"]+)" SET (\S+) TO '([^']*)'$`)
+)
+
+// applyAttr stores an owner or a database setting the way the server would.
+func (ct *fakeContainer) applyAttr(stmt string) {
+	if ct.owner == nil {
+		ct.owner, ct.settings = map[string]string{}, map[string][]string{}
+	}
+	if m := reAttrOwner.FindStringSubmatch(stmt); m != nil {
+		ct.owner[m[1]] = m[2]
+	}
+	if m := reAttrSet.FindStringSubmatch(stmt); m != nil {
+		ct.settings[m[1]] = append(ct.settings[m[1]], "\x1f"+strings.Trim(m[2], `"`)+"="+m[3])
+	}
 }
 
 // memStore is an in-memory bucket.
@@ -386,110 +441,15 @@ func deps(f *fakeDocker, st storage.Store) Deps {
 	return depsFor(f, st)
 }
 
-// depsFor: the fake clock advances 1 s per Now(); no kubectl on PATH unless the shell is a fakeKube.
+// depsFor: the fake clock advances 1 s per Now().
 func depsFor(sh pg.Shell, st storage.Store) Deps {
 	clock := time.Date(2026, 10, 17, 3, 0, 0, 0, time.UTC)
-	lookPath := func(string) (string, error) { return "", errors.New("not found") }
-	if _, ok := sh.(*fakeKube); ok {
-		lookPath = func(name string) (string, error) {
-			if name == "kubectl" {
-				return "/usr/local/bin/kubectl", nil
-			}
-			return "", errors.New("not found")
-		}
-	}
 	return Deps{
 		Shell: sh, Store: st,
-		Tools: &pg.Tools{Shell: sh, LookPath: lookPath},
+		Tools: pg.NewTools(sh),
 		Now:   func() time.Time { clock = clock.Add(time.Second); return clock },
 		Rand:  func(n int) string { return strings.Repeat("a", n*2) },
 		Poll:  time.Millisecond,
-	}
-}
-
-func TestDrillPassAndCleanup(t *testing.T) {
-	f := newFakeDocker()
-	f.readyAfter = 2
-	f.orphans = []string{"deadbeef"}
-	f.orphanVols = []string{"oldvol"}
-	f.checks["select 1 from orders limit 1"] = "1\n"
-	st := newMemStore()
-	seed(t, st, "")
-	cfg := baseCfg()
-	cfg.Drill = &config.Drill{Checks: []config.Check{{Name: "orders exist", SQL: "select 1 from orders limit 1"}, {Name: "other db only", SQL: "select 2", Databases: []string{"other"}}}}
-
-	res, err := Run(context.Background(), cfg, deps(f, st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.OK || res.Kind != "drill" || len(res.Instances) != 1 {
-		t.Fatalf("result: %+v", res)
-	}
-	ir := res.Instances[0]
-	if ir.Image != "postgres:17-alpine" || ir.Container != "" {
-		t.Errorf("instance: %+v", ir)
-	}
-	// The database is created with the locale from the manifest.
-	if len(f.createOpts) != 1 || f.createOpts[0] != " encoding 'UTF8' lc_collate 'C.UTF-8' lc_ctype 'C.UTF-8'" {
-		t.Errorf("create database options: %q", f.createOpts)
-	}
-	if ir.Globals == nil || !ir.Globals.OK || ir.Globals.IgnoredErrors != 1 {
-		t.Errorf("globals: %+v", ir.Globals)
-	}
-	if len(ir.Databases) != 1 {
-		t.Fatalf("databases: %+v", ir.Databases)
-	}
-	dr := ir.Databases[0]
-	if !dr.OK || dr.TablesExpected != 3 || dr.TablesFound != 3 || len(dr.RowMismatches) != 0 || dr.Bytes != 10 {
-		t.Errorf("db: %+v", dr)
-	}
-	if len(dr.Checks) != 1 || !dr.Checks[0].OK || dr.Checks[0].Name != "orders exist" {
-		t.Errorf("checks: %+v", dr.Checks)
-	}
-	// Orphans are cleaned up first, the temporary container is removed afterwards.
-	if len(f.removed) != 2 || f.removed[0] != "deadbeef" || !strings.HasPrefix(f.removed[1], "bracer-drill-shop-") {
-		t.Errorf("removed: %v", f.removed)
-	}
-	if len(f.removedVols) != 2 || f.removedVols[0] != "oldvol" || f.removedVols[1] != f.removed[1] || len(f.volumes) != 0 {
-		t.Errorf("volumes removed: %v, left: %v", f.removedVols, f.volumes)
-	}
-	if len(f.containers) != 0 {
-		t.Errorf("containers left: %v", f.containers)
-	}
-	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "leftover") {
-		t.Errorf("warnings: %v", res.Warnings)
-	}
-	// create database from template0, pg_restore via stdin with -d.
-	joined := strings.Join(f.calls, "\n")
-	if !strings.Contains(joined, `create database "shop" template template0`) || !strings.Contains(joined, "pg_restore -d dbname='shop' --no-data-for-failed-tables") {
-		t.Errorf("calls:\n%s", joined)
-	}
-}
-
-func TestDrillRowMismatchAndMissingTable(t *testing.T) {
-	f := newFakeDocker()
-	f.dumps["PGDMP-shop"] = []fakeTable{{"public", "orders", 480, false}, {"public", "events", 60_000, false}}
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), deps(f, st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.OK {
-		t.Fatal("must fail")
-	}
-	dr := res.Instances[0].Databases[0]
-	if dr.OK || dr.TablesFound != 2 || len(dr.MissingTables) != 1 || dr.MissingTables[0] != `"public"."empty"` {
-		t.Errorf("db: %+v", dr)
-	}
-	if len(dr.RowMismatches) != 2 {
-		t.Fatalf("mismatches: %+v", dr.RowMismatches)
-	}
-	if m := dr.RowMismatches[0]; m.Table != `"public"."orders"` || m.Expected != 500 || m.Found != 480 || m.Estimated {
-		t.Errorf("exact mismatch: %+v", m)
-	}
-	if m := dr.RowMismatches[1]; m.Table != `"public"."events"` || !m.Estimated || m.Expected != 83_000 {
-		t.Errorf("estimated mismatch: %+v", m)
 	}
 }
 
@@ -507,118 +467,6 @@ func TestWithinTolerance(t *testing.T) {
 	}
 }
 
-func TestDrillEncrypted(t *testing.T) {
-	kp, err := crypto.Generate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	keyPath := filepath.Join(dir, "shop.key")
-	if err := crypto.WriteIdentityFile(keyPath, kp); err != nil {
-		t.Fatal(err)
-	}
-	st := newMemStore()
-	seed(t, st, kp.Recipient)
-	cfg := baseCfg()
-	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", kp.Recipient, keyPath
-
-	res, err := Run(context.Background(), cfg, deps(newFakeDocker(), st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.OK {
-		b := new(strings.Builder)
-		fmt.Fprintf(b, "%+v", res.Instances[0].Databases[0])
-		t.Fatalf("encrypted drill must pass: %s globals=%+v", b, res.Instances[0].Globals)
-	}
-
-	// Different key → fails naming the recipient.
-	other, _ := crypto.Generate()
-	otherPath := filepath.Join(dir, "other.key")
-	crypto.WriteIdentityFile(otherPath, other)
-	cfg.AgeIdentityFile = otherPath
-	res, err = Run(context.Background(), cfg, deps(newFakeDocker(), st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	dr := res.Instances[0].Databases[0]
-	if res.OK || dr.OK || !strings.Contains(dr.Error, kp.Recipient) || !strings.Contains(dr.Error, "no matching key") {
-		t.Errorf("wrong key: %+v", dr)
-	}
-
-	// Unreadable key file → encrypted database fails, with a warning.
-	cfg.AgeIdentityFile = filepath.Join(dir, "missing.key")
-	res, _ = Run(context.Background(), cfg, deps(newFakeDocker(), st))
-	if res.OK || len(res.Warnings) == 0 || !strings.Contains(res.Warnings[0], "age_identity_file") {
-		t.Errorf("missing key file: ok=%v warnings=%v", res.OK, res.Warnings)
-	}
-	_ = os.Remove(keyPath)
-}
-
-func TestDrillRestoreErrorStillCompares(t *testing.T) {
-	f := newFakeDocker()
-	st := newMemStore()
-	seed(t, st, "")
-	st.objects["bracer/shop/main/shop/2026-10-16T030000Z.dump"] = []byte("garbage")
-	res, err := Run(context.Background(), baseCfg(), deps(f, st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	dr := res.Instances[0].Databases[0]
-	if res.OK || dr.OK || !strings.Contains(dr.Error, "pg_restore: ") || !strings.Contains(dr.Error, "valid archive") {
-		t.Errorf("db: %+v", dr)
-	}
-	if len(dr.MissingTables) != 3 || dr.TablesFound != 0 {
-		t.Errorf("must still report missing tables: %+v", dr)
-	}
-	if len(f.containers) != 0 {
-		t.Error("container must be removed after failure")
-	}
-}
-
-func TestDrillGlobalsOtherErrorDoesNotBlock(t *testing.T) {
-	f := newFakeDocker()
-	st := newMemStore()
-	seed(t, st, "")
-	st.objects["bracer/shop/main/globals/2026-10-16T030000Z.sql"] = []byte("CREATE ROLE postgres;\nBROKEN;\n")
-	res, _ := Run(context.Background(), baseCfg(), deps(f, st))
-	g := res.Instances[0].Globals
-	if g.OK || g.IgnoredErrors != 1 || !strings.Contains(g.Error, "syntax error") {
-		t.Errorf("globals: %+v", g)
-	}
-	if !res.Instances[0].Databases[0].OK || !res.OK {
-		t.Errorf("globals error must not fail the database: %+v", res.Instances[0].Databases[0])
-	}
-}
-
-func TestDrillKeepAndFilters(t *testing.T) {
-	f := newFakeDocker()
-	st := newMemStore()
-	seed(t, st, "")
-	d := deps(f, st)
-	d.Keep = true
-	res, err := Run(context.Background(), baseCfg(), d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Instances[0].Container == "" || len(f.containers) != 1 {
-		t.Errorf("--keep must leave the container: %+v", res.Instances[0])
-	}
-
-	d = deps(newFakeDocker(), st)
-	d.Database = "nope"
-	res, err = Run(context.Background(), baseCfg(), d)
-	if err != nil || res.OK || res.Instances[0].Error != "no database dump to restore" {
-		t.Errorf("--database filter: %v %+v", err, res.Instances[0])
-	}
-
-	d = deps(newFakeDocker(), st)
-	d.Instance = "ghost"
-	if _, err = Run(context.Background(), baseCfg(), d); err == nil || !strings.Contains(err.Error(), "not in app.yaml") {
-		t.Errorf("--instance unknown: %v", err)
-	}
-}
-
 func TestDrillNoBackupYet(t *testing.T) {
 	_, err := Run(context.Background(), baseCfg(), deps(newFakeDocker(), newMemStore()))
 	if err == nil || !strings.Contains(err.Error(), "run bracer backup first") {
@@ -626,213 +474,68 @@ func TestDrillNoBackupYet(t *testing.T) {
 	}
 }
 
-func TestDrillExplicitDatabasesSkipsOthers(t *testing.T) {
+// The `postgres` dump is not restored straight into the existing `postgres` database
+// (the image may have written into it) but into bracer_drill_postgres created from template0.
+// Extensions in the manifest: the image is chosen by the mapping table; missing in
+// the image → the database fails before create database (spec drill § Flow 3a–3b).
+// spec drill AC: drill.runtime: none → UsageError before anything, --runtime docker overrides.
+func TestDrillOff(t *testing.T) {
 	st := newMemStore()
 	seed(t, st, "")
 	cfg := baseCfg()
-	cfg.Instances[0].Databases = config.Databases{List: []config.Database{{Name: "other"}}}
-	res, err := Run(context.Background(), cfg, deps(newFakeDocker(), st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.OK || res.Instances[0].Error == "" || len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "not in app.yaml, skipped") {
-		t.Errorf("res: %+v warnings=%v", res.Instances[0], res.Warnings)
-	}
-}
-
-func TestDrillNotReady(t *testing.T) {
+	cfg.Drill = &config.Drill{Runtime: config.DrillRuntimeNone}
 	f := newFakeDocker()
-	f.readyAfter = 1000
-	st := newMemStore()
-	seed(t, st, "")
+	_, err := Run(context.Background(), cfg, deps(f, st))
+	var ue *UsageError
+	if !errors.As(err, &ue) || !strings.Contains(err.Error(), "drill is off for app shop (drill.runtime: none)") || len(f.calls) != 0 {
+		t.Fatalf("off: err=%v calls=%v", err, f.calls)
+	}
+	if _, err := DryRun(context.Background(), cfg, deps(f, st)); !errors.As(err, &ue) {
+		t.Errorf("dry-run off: %v", err)
+	}
 	d := deps(f, st)
-	d.ReadyTimeout = 5 * time.Second // the fake clock advances 1 s per Now()
-	res, _ := Run(context.Background(), baseCfg(), d)
-	ir := res.Instances[0]
-	if ir.OK || !strings.Contains(ir.Error, "not ready after") || !strings.Contains(ir.Error, "fake log line") {
-		t.Errorf("instance: %+v", ir)
-	}
-	if len(f.containers) != 0 {
-		t.Error("container must be removed")
+	d.ForceDocker = true
+	// The seeded backup predates ADR-0015: drill runs, and says why it cannot drill it.
+	if res, err := Run(context.Background(), cfg, d); err != nil || res.OK || res.Instances[0].Error != "the latest backup has no environment record; run bracer backup with this version first" {
+		t.Errorf("--runtime docker: %v %+v", err, res)
 	}
 }
 
-func TestDrillStartFails(t *testing.T) {
+// spec drill AC: a dump from a newer major than pg_major fails before any container;
+// the result names the system_id of the dumps tried.
+// spec drill AC "--dry-run": no container; no backup yet is not a failure; Docker or key problems fail with a Fix.
+func TestDrillDryRun(t *testing.T) {
 	f := newFakeDocker()
-	f.failRun = true
-	st := newMemStore()
-	seed(t, st, "")
-	res, _ := Run(context.Background(), baseCfg(), deps(f, st))
-	if res.OK || !strings.Contains(res.Instances[0].Error, "start postgres:17-alpine") {
-		t.Errorf("instance: %+v", res.Instances[0])
-	}
-}
-
-func TestChooseImage(t *testing.T) {
-	cfg := baseCfg()
-	in := cfg.Instances[0]
-	if img, _ := chooseImage(cfg, in, &backup.InstanceManifest{PgVersion: "16.4"}, nil); img != "postgres:16-alpine" {
-		t.Error(img)
-	}
-	if img, _ := chooseImage(cfg, in, &backup.InstanceManifest{PgVersion: "16.4", Databases: map[string]*backup.DatabaseManifest{"shop": {Latest: "t1", Dumps: []*backup.Dump{{TS: "t1", ToolVersion: "18.1"}}}}}, []string{"shop"}); img != "postgres:18-alpine" {
-		t.Errorf("tool_version 18 > server 16: image = %q", img)
-	}
-	if img, _ := chooseImage(cfg, in, &backup.InstanceManifest{}, nil); img != "postgres:17-alpine" {
-		t.Error(img)
-	}
-	// Common extension → the vendor's own image at the right version (spec drill § Flow 3a.2).
-	postgis := &backup.InstanceManifest{PgVersion: "16.4", Databases: map[string]*backup.DatabaseManifest{"gis": {Latest: "t1", Dumps: []*backup.Dump{{TS: "t1", Extensions: []pg.Extension{{Name: "postgis", Version: "3.4.2"}, {Name: "uuid-ossp", Version: "1.1"}}}}}}}
-	if img, err := chooseImage(cfg, in, postgis, []string{"gis"}); err != nil || img != "postgis/postgis:16-3.4" {
-		t.Errorf("postgis: %q, %v", img, err)
-	}
-	cfg.Drill = &config.Drill{Image: "supabase/postgres:15"}
-	if img, _ := chooseImage(cfg, in, &backup.InstanceManifest{PgVersion: "16.4"}, nil); img != "supabase/postgres:15" {
-		t.Error(img)
-	}
-	in.PgMajor = 0
-	if _, err := chooseImage(baseCfg(), in, &backup.InstanceManifest{}, nil); err == nil {
-		t.Error("must fail without any version")
-	}
-}
-
-func TestDrillDiskCheckAndLimits(t *testing.T) {
-	// Short on space: fails before docker run.
-	f := newFakeDocker()
-	f.dfAvailKB = 0 // 0 KB free, dump 10 B × 5 = 50 B needed
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), deps(f, st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ir := res.Instances[0]
-	if res.OK || !strings.Contains(ir.Error, "not enough disk space for a drill") || ir.Disk == nil || !ir.Disk.Checked || ir.Disk.FreeBytes != 0 || ir.Disk.NeedBytes != 50 {
-		t.Errorf("disk: ok=%v err=%q disk=%+v", res.OK, ir.Error, ir.Disk)
-	}
-	if len(f.containers) != 0 || len(f.volumes) != 0 || len(f.removedVols) != 1 {
-		t.Errorf("no container and no volume may remain when disk is short: %v %v removed=%v", f.containers, f.volumes, f.removedVols)
-	}
-	if ir.Disk.DataDirectory != "volume "+f.removedVols[0] {
-		t.Errorf("disk must be measured through the drill volume: %+v", ir.Disk)
+	res, err := DryRun(context.Background(), baseCfg(), deps(f, newMemStore()))
+	if err != nil || !res.OK || len(res.Checks) != 2 || res.Checks[1].Detail != "no backup yet" {
+		t.Fatalf("empty bucket: %v %+v", err, res)
 	}
 	for _, c := range f.calls {
-		if strings.HasPrefix(c, "run -d") {
-			t.Errorf("docker run must not happen: %s", c)
+		if !strings.HasPrefix(c, "info") {
+			t.Errorf("dry-run ran %s", c)
 		}
 	}
 
-	// --skip-disk-check: runs, warns; memory/cpus go into docker run.
-	f = newFakeDocker()
-	f.dfAvailKB = 0
+	st := newMemStore()
+	seed(t, st, "")
+	f.noDocker = true
+	res, _ = DryRun(context.Background(), baseCfg(), deps(f, st))
+	if res.OK || res.Checks[0].OK || res.Checks[0].Fix != "bracer check" || !strings.Contains(res.Checks[1].Detail, "shop 2026-10-16T030000Z") {
+		t.Errorf("no docker: %+v", res.Checks)
+	}
+
 	cfg := baseCfg()
-	cfg.Drill = &config.Drill{Memory: "2g", CPUs: "1"}
-	d := deps(f, st)
-	d.SkipDiskCheck = true
-	res, err = Run(context.Background(), cfg, d)
-	if err != nil || !res.OK || !strings.Contains(strings.Join(res.Warnings, "\n"), "--skip-disk-check") {
-		t.Errorf("skip: err=%v ok=%v warnings=%v", err, res.OK, res.Warnings)
-	}
-	joined := strings.Join(f.calls, "\n")
-	if !strings.Contains(joined, "--memory 2g --cpus 1 postgres:17-alpine") {
-		t.Errorf("limits missing in docker run:\n%s", joined)
-	}
-
-	// Cannot measure: warns, still runs.
-	f = newFakeDocker()
-	f.dfAvailKB = -1
-	res, err = Run(context.Background(), baseCfg(), deps(f, st))
-	if err != nil || !res.OK || res.Instances[0].Disk == nil || res.Instances[0].Disk.Checked || !strings.Contains(strings.Join(res.Warnings, "\n"), "may fill the disk") {
-		t.Errorf("unmeasurable: err=%v ok=%v disk=%+v warnings=%v", err, res.OK, res.Instances[0].Disk, res.Warnings)
+	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", "age1other", "/keys/shop.key"
+	d := deps(newFakeDocker(), st)
+	d.ReadIdentities = func(string) ([]age.Identity, []string, error) { return nil, []string{"age1mine"}, nil }
+	res, _ = DryRun(context.Background(), cfg, d)
+	if res.OK || res.Checks[1].Name != "age key" || !strings.Contains(res.Checks[1].Detail, "no key for age_recipient age1other") {
+		t.Errorf("key: %+v", res.Checks)
 	}
 }
 
-// The `postgres` dump is not restored straight into the existing `postgres` database
-// (the image may have written into it) but into bracer_drill_postgres created from template0.
-func TestDrillRestoresPostgresDBIntoFreshDatabase(t *testing.T) {
-	f := newFakeDocker()
-	st := newMemStore()
-	seed(t, st, "")
-	ctx := context.Background()
-	key := "bracer/shop/main/postgres/2026-10-16T030000Z.dump"
-	st.Put(ctx, key, strings.NewReader("PGDMP-shop"), 10)
-	m, err := backup.LoadManifest(ctx, st, "bracer/shop/manifest.json", "shop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.Instances["main"].Databases["postgres"] = &backup.DatabaseManifest{Latest: "2026-10-16T030000Z", Dumps: []*backup.Dump{{
-		TS: "2026-10-16T030000Z", Key: key, Bytes: 10,
-		Tables: []pg.Table{{Schema: "public", Name: "orders", Rows: i64(500)}, {Schema: "public", Name: "events", RowsEst: i64(83_000)}, {Schema: "public", Name: "empty", Rows: i64(0)}},
-	}}}
-	if err := backup.SaveManifest(ctx, st, "bracer/shop/manifest.json", m, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	d := deps(f, st)
-	d.Database = "postgres"
-	res, err := Run(ctx, baseCfg(), d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	joined := strings.Join(f.calls, "\n")
-	if !strings.Contains(joined, `create database "bracer_drill_postgres" template template0`) || !strings.Contains(joined, "pg_restore -d dbname='bracer_drill_postgres'") {
-		t.Fatalf("calls:\n%s", joined)
-	}
-	if strings.Contains(joined, "pg_restore -d dbname='postgres'") {
-		t.Fatalf("must not restore into the image's postgres database:\n%s", joined)
-	}
-	if len(res.Instances) != 1 || len(res.Instances[0].Databases) != 1 {
-		t.Fatalf("result: %+v", res)
-	}
-	dr := res.Instances[0].Databases[0]
-	if dr.DB != "postgres" || dr.RestoredAs != "bracer_drill_postgres" || !dr.OK || dr.TablesFound != 3 {
-		t.Fatalf("result: %+v", dr)
-	}
-}
-
-// Extensions in the manifest: the image is chosen by the mapping table; missing in
-// the image → the database fails before create database (spec drill § Flow 3a–3b).
-func TestDrillChecksExtensionsBeforeRestore(t *testing.T) {
-	st := newMemStore()
-	seed(t, st, "")
-	ctx := context.Background()
-	m, err := backup.LoadManifest(ctx, st, "bracer/shop/manifest.json", "shop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, dp := range m.Instances["main"].Databases["shop"].Dumps {
-		dp.Extensions = []pg.Extension{{Name: "postgis", Version: "3.4.2"}}
-	}
-	if err := backup.SaveManifest(ctx, st, "bracer/shop/manifest.json", m, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-
-	f := newFakeDocker()
-	f.available = map[string]string{"postgis": "3.4.2", "plpgsql": "1.0"}
-	res, err := Run(ctx, baseCfg(), deps(f, st))
-	if err != nil || !res.OK {
-		t.Fatalf("res = %+v, err = %v", res, err)
-	}
-	if res.Instances[0].Image != "postgis/postgis:17-3.4" {
-		t.Errorf("image = %q", res.Instances[0].Image)
-	}
-
-	f = newFakeDocker()
-	f.available = map[string]string{"plpgsql": "1.0"}
-	res, err = Run(ctx, baseCfg(), deps(f, st))
-	if err != nil || res.OK {
-		t.Fatalf("res = %+v, err = %v", res, err)
-	}
-	dr := res.Instances[0].Databases[0]
-	if !strings.Contains(dr.Error, "needs extension postgis 3.4.2") || !strings.Contains(dr.Error, "postgis/postgis:17-3.4 does not have") || !strings.Contains(dr.Error, "drill.image") {
-		t.Errorf("error = %q", dr.Error)
-	}
-	if len(f.createOpts) != 0 {
-		t.Errorf("must not create a database: %q", f.createOpts)
-	}
-
-	f = newFakeDocker()
-	f.available = map[string]string{"postgis": "3.5.0"}
-	res, _ = Run(ctx, baseCfg(), deps(f, st))
-	if !res.OK || len(res.Instances[0].Databases[0].Warnings) != 1 || !strings.Contains(res.Instances[0].Databases[0].Warnings[0], "postgis 3.5.0") {
-		t.Errorf("version differ: %+v", res.Instances[0].Databases[0])
-	}
-}
+// spec fetch-restore AC (drill): the temporary database gets the archive's
+// owner and settings, read back with restore's code; a setting that does not
+// apply fails the database and names it.
+// ADR-0014: the temporary Postgres preloads the libraries of the extensions the
+// databases use (from the manifest), not the source's other libraries.

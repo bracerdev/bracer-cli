@@ -33,6 +33,17 @@ type App struct {
 	Hosted          *Hosted    `yaml:"hosted,omitempty"`
 	Backup          *Backup    `yaml:"backup,omitempty"`
 	Drill           *Drill     `yaml:"drill,omitempty"`
+	Runtime         *Runtime   `yaml:"runtime,omitempty"`
+}
+
+// Runtime is the context init ran in successfully on this machine, so backup,
+// drill, fetch and restore (by hand, timer or cron) call the same docker the
+// same way without reading the shell's variables (spec init § Data model).
+type Runtime struct {
+	User       string `yaml:"user,omitempty"`        // user that ran init; schedule runs jobs as this user
+	Path       string `yaml:"path,omitempty"`        // PATH for child processes (docker credential helpers)
+	Docker     string `yaml:"docker,omitempty"`      // absolute path of the docker CLI
+	DockerHost string `yaml:"docker_host,omitempty"` // resolved endpoint (DOCKER_HOST > DOCKER_CONTEXT > current context)
 }
 
 // Backup is the `bracer backup` configuration (spec backup § Data model). Every field is optional.
@@ -78,42 +89,26 @@ var reDockerMem = regexp.MustCompile(`^[0-9]+[bkmgBKMG]?$`)
 
 // Drill is the `bracer drill` configuration (spec drill § Data model). Every field is optional.
 type Drill struct {
-	Runtime   string  `yaml:"runtime,omitempty"`   // "", docker, kube: where the temporary Postgres runs; empty picks automatically
-	Namespace string  `yaml:"namespace,omitempty"` // runtime kube: namespace of the temporary pod; default "default"
-	Image     string  `yaml:"image,omitempty"`     // default postgres:<major from the manifest>-alpine
-	Timeout   string  `yaml:"timeout,omitempty"`   // per database, time.Duration; default 6h
-	Memory    string  `yaml:"memory,omitempty"`    // docker run --memory / pod memory limit, e.g. 2g
-	CPUs      string  `yaml:"cpus,omitempty"`      // docker run --cpus / pod cpu limit, e.g. "1"
-	Checks    []Check `yaml:"checks,omitempty"`
+	Runtime string  `yaml:"runtime,omitempty"` // "", docker, none: none turns drill off (init --no-drill)
+	Image   string  `yaml:"image,omitempty"`   // default postgres:<major from the manifest>-alpine
+	Timeout string  `yaml:"timeout,omitempty"` // per database, time.Duration; default 6h
+	Memory  string  `yaml:"memory,omitempty"`  // docker run --memory, e.g. 2g
+	CPUs    string  `yaml:"cpus,omitempty"`    // docker run --cpus, e.g. "1"
+	Checks  []Check `yaml:"checks,omitempty"`
+	// Namespace is drill.namespace from before ADR-0013, decoded only to report it clearly.
+	Namespace string `yaml:"namespace,omitempty"`
 }
 
 // Drill runtimes (drill.runtime).
 const (
 	DrillRuntimeDocker = "docker"
-	DrillRuntimeKube   = "kube"
+	DrillRuntimeNone   = "none"
 )
 
-// DefaultDrillNamespace is the namespace of the temporary pod when drill.namespace is empty.
-const DefaultDrillNamespace = "default"
-
-// DrillNamespace returns drill.namespace with the default applied.
-func (a *App) DrillNamespace() string {
-	if a.Drill == nil || a.Drill.Namespace == "" {
-		return DefaultDrillNamespace
-	}
-	return a.Drill.Namespace
+// DrillOff reports drill.runtime: none.
+func (a *App) DrillOff() bool {
+	return a.Drill != nil && a.Drill.Runtime == DrillRuntimeNone
 }
-
-// DrillRuntime returns drill.runtime ("" when it is to be picked automatically).
-func (a *App) DrillRuntime() string {
-	if a.Drill == nil {
-		return ""
-	}
-	return a.Drill.Runtime
-}
-
-// reDNSLabel is a Kubernetes namespace name (RFC 1123 label).
-var reDNSLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
 // Check is one SQL statement run on the restored database; ≥ 1 row is a pass.
 type Check struct {
@@ -176,21 +171,43 @@ func (a *App) ExactMaxRowsOrDefault() int64 {
 }
 
 // Instance is one Postgres server and how to connect to it. Exactly one of
-// Container | Pod | Socket | Host+Port | URLEnv must be set (Port may accompany
-// Socket). → ADR-0009
+// Container | Local | URLEnv must be set. → ADR-0013, ADR-0015
 type Instance struct {
-	Name         string    `yaml:"name"`
-	Container    string    `yaml:"container,omitempty"`
-	Pod          string    `yaml:"pod,omitempty"`    // ns/pod[/container], reached with kubectl exec
-	Socket       string    `yaml:"socket,omitempty"` // directory holding .s.PGSQL.<port> on this machine
-	Host         string    `yaml:"host,omitempty"`
-	Port         int       `yaml:"port,omitempty"`
-	URLEnv       string    `yaml:"url_env,omitempty"`
-	User         string    `yaml:"user,omitempty"`
-	PasswordEnv  string    `yaml:"password_env,omitempty"`
-	PasswordFile string    `yaml:"password_file,omitempty"`
-	PgMajor      int       `yaml:"pg_major,omitempty"`
-	Databases    Databases `yaml:"databases"`
+	Name        string    `yaml:"name"`
+	Container   string    `yaml:"container,omitempty"`
+	Local       *Local    `yaml:"local,omitempty"`
+	URLEnv      string    `yaml:"url_env,omitempty"`
+	User        string    `yaml:"user,omitempty"`         // container and local
+	PasswordEnv string    `yaml:"password_env,omitempty"` // container and local, when the socket asks for a password (Bitnami, pg_hba md5)
+	PgMajor     int       `yaml:"pg_major,omitempty"`
+	SystemID    string    `yaml:"system_id,omitempty"` // system_identifier of the cluster (pg_control_system()), written by init
+	Databases   Databases `yaml:"databases"`
+
+	// Connection fields from before ADR-0013, decoded only so Validate can name
+	// them and init can offer to pick the instance again.
+	Pod          string `yaml:"pod,omitempty"`
+	Socket       string `yaml:"socket,omitempty"`
+	Host         string `yaml:"host,omitempty"`
+	Port         int    `yaml:"port,omitempty"`
+	PasswordFile string `yaml:"password_file,omitempty"`
+}
+
+// Local is Postgres installed on this machine (apt, PGDG), reached over its
+// Unix socket by the tools in a postgres image (ADR-0015).
+type Local struct {
+	Port      int    `yaml:"port"`
+	SocketDir string `yaml:"socket_dir,omitempty"` // default DefaultSocketDir
+}
+
+// DefaultSocketDir is where Debian/Ubuntu packages put the Postgres socket.
+const DefaultSocketDir = "/var/run/postgresql"
+
+// Dir returns socket_dir with the default applied.
+func (l *Local) Dir() string {
+	if l == nil || l.SocketDir == "" {
+		return DefaultSocketDir
+	}
+	return l.SocketDir
 }
 
 // Databases is `all` or a list of databases.
@@ -234,76 +251,67 @@ type Kind int
 const (
 	KindInvalid Kind = iota
 	KindContainer
-	KindPod
-	KindSocket
-	KindHost
 	KindURL
+	KindLocal
 )
 
-// Kind returns the connection method; KindInvalid unless exactly one is set.
+// String is the kind as written in the manifest and the environment file.
+func (k Kind) String() string {
+	switch k {
+	case KindContainer:
+		return "container"
+	case KindLocal:
+		return "local"
+	case KindURL:
+		return "url"
+	}
+	return "invalid"
+}
+
+// Full reports whether bracer backs up the whole instance (databases, globals
+// and environment) for this kind; a URL gives databases only (ADR-0015).
+func (k Kind) Full() bool { return k == KindContainer || k == KindLocal }
+
+// Kind returns the connection method; KindInvalid unless exactly one is set
+// and no field from before ADR-0013 is present.
 func (in Instance) Kind() Kind {
-	n := 0
-	k := KindInvalid
-	if in.Container != "" {
-		n++
-		k = KindContainer
-	}
-	if in.Pod != "" {
-		n++
-		k = KindPod
-	}
-	if in.Socket != "" {
-		n++
-		k = KindSocket
-	}
-	if in.Host != "" || (in.Port != 0 && in.Socket == "") {
-		n++
-		k = KindHost
-	}
-	if in.URLEnv != "" {
-		n++
-		k = KindURL
-	}
-	if n != 1 {
+	if in.Legacy() != "" {
 		return KindInvalid
 	}
-	return k
-}
-
-// PodRef splits `ns/pod[/container]`. ok=false if malformed.
-func (in Instance) PodRef() (namespace, pod, container string, ok bool) {
-	parts := strings.Split(in.Pod, "/")
-	if len(parts) < 2 || len(parts) > 3 {
-		return "", "", "", false
-	}
-	for _, p := range parts {
-		if p == "" {
-			return "", "", "", false
+	n := 0
+	for _, set := range []bool{in.Container != "", in.Local != nil, in.URLEnv != ""} {
+		if set {
+			n++
 		}
 	}
-	if len(parts) == 3 {
-		container = parts[2]
+	switch {
+	case n != 1:
+		return KindInvalid
+	case in.Container != "":
+		return KindContainer
+	case in.Local != nil:
+		return KindLocal
 	}
-	return parts[0], parts[1], container, true
+	return KindURL
 }
 
-// socketFilePrefix is the Postgres socket file name.
-const socketFilePrefix = ".s.PGSQL."
-
-// SocketDir returns the socket directory and port. If `socket:` names the
-// `.s.PGSQL.N` file itself, it is split into directory + N; an empty port is 5432.
-func (in Instance) SocketDir() (dir string, port int) {
-	dir, port = in.Socket, in.Port
-	if base := filepath.Base(dir); strings.HasPrefix(base, socketFilePrefix) {
-		if n, err := strconv.Atoi(strings.TrimPrefix(base, socketFilePrefix)); err == nil {
-			port = n
-		}
-		dir = filepath.Dir(dir)
+// Legacy names the fields from before ADR-0013 that the instance still has
+// (pod, socket, host/port, password_file); "" when there is none.
+func (in Instance) Legacy() string {
+	var f []string
+	if in.Pod != "" {
+		f = append(f, "pod")
 	}
-	if port == 0 {
-		port = 5432
+	if in.Socket != "" {
+		f = append(f, "socket")
 	}
-	return dir, port
+	if in.Host != "" || in.Port != 0 {
+		f = append(f, "host/port")
+	}
+	if in.PasswordFile != "" {
+		f = append(f, "password_file")
+	}
+	return strings.Join(f, ", ")
 }
 
 // databaseEntry accepts both the short form (string) and the full form (map).
@@ -361,12 +369,27 @@ func (ds Databases) MarshalYAML() (interface{}, error) {
 }
 
 // ValidationError collects every error of one file, each with its field path.
+// Fix, when set, is printed as the last line (conventions § error handling).
 type ValidationError struct {
 	Errs []string
+	Fix  string
 }
 
 func (e *ValidationError) Error() string {
-	return "app.yaml: " + strings.Join(e.Errs, "; ")
+	msg := "app.yaml: " + strings.Join(e.Errs, "; ")
+	if e.Fix != "" {
+		msg += "\nFix: " + e.Fix
+	}
+	return msg
+}
+
+func (e *ValidationError) legacy() bool {
+	for _, m := range e.Errs {
+		if strings.Contains(m, "ADR-0013") {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -440,42 +463,29 @@ func (a *App) Validate() error {
 		} else {
 			names[in.Name] = i
 		}
-		switch in.Kind() {
-		case KindInvalid:
-			add("%s: exactly one of container | pod | socket | host+port | url_env is required", p)
-		case KindPod:
-			if _, _, _, ok := in.PodRef(); !ok {
-				add("%s.pod: expected namespace/pod or namespace/pod/container", p)
-			}
-			if in.PasswordEnv != "" || in.PasswordFile != "" {
-				add("%s: a pod is reached with kubectl exec over its Unix socket; passwords cannot be passed, drop password_env/password_file", p)
-			}
-		case KindSocket:
-			if !filepath.IsAbs(in.Socket) {
-				add("%s.socket: must be an absolute path to the socket directory (e.g. /var/run/postgresql)", p)
-			}
-			if base := filepath.Base(in.Socket); strings.HasPrefix(base, socketFilePrefix) && in.Port != 0 {
-				if _, sp := in.SocketDir(); sp != in.Port {
-					add("%s.port: differs from the port in the socket file name", p)
+		if legacy := in.Legacy(); legacy != "" {
+			add("%s: %s %s no longer supported; only container, local or url_env (ADR-0013, ADR-0015); pick this instance again with bracer init", p, legacy, isAre(legacy))
+		} else {
+			switch in.Kind() {
+			case KindInvalid:
+				add("%s: exactly one of container | local | url_env is required", p)
+			case KindURL:
+				if in.PasswordEnv != "" || in.User != "" {
+					add("%s: url_env already carries user/password; drop user/password_env", p)
+				}
+			case KindLocal:
+				if in.Local.Port < 1 || in.Local.Port > 65535 {
+					add("%s.local.port: must be 1–65535", p)
+				}
+				if in.Local.SocketDir != "" && !filepath.IsAbs(in.Local.SocketDir) {
+					add("%s.local.socket_dir: must be an absolute path", p)
 				}
 			}
-			if in.Port != 0 && (in.Port < 1 || in.Port > 65535) {
-				add("%s.port: must be 1–65535", p)
-			}
-		case KindHost:
-			if in.Host == "" {
-				add("%s.host: required when port is set", p)
-			}
-			if in.Port < 1 || in.Port > 65535 {
-				add("%s.port: must be 1–65535", p)
-			}
-		case KindURL:
-			if in.PasswordEnv != "" || in.PasswordFile != "" || in.User != "" {
-				add("%s: url_env already carries user/password; drop user/password_env/password_file", p)
-			}
 		}
-		if in.PasswordEnv != "" && in.PasswordFile != "" {
-			add("%s: only one of password_env | password_file", p)
+		if in.SystemID != "" {
+			if _, err := strconv.ParseUint(in.SystemID, 10, 64); err != nil {
+				add("%s.system_id: expected the decimal system_identifier", p)
+			}
 		}
 		for field, v := range map[string]string{"password_env": in.PasswordEnv, "url_env": in.URLEnv} {
 			if v == "" {
@@ -558,11 +568,15 @@ func (a *App) Validate() error {
 		}
 	}
 	if dr := a.Drill; dr != nil {
-		if dr.Runtime != "" && dr.Runtime != DrillRuntimeDocker && dr.Runtime != DrillRuntimeKube {
-			add("drill.runtime: must be docker or kube (empty picks automatically)")
+		switch dr.Runtime {
+		case "", DrillRuntimeDocker, DrillRuntimeNone:
+		case "kube":
+			add("drill.runtime: kube is no longer supported (ADR-0013); drill runs its temporary Postgres with Docker, or set none to turn drill off")
+		default:
+			add("drill.runtime: must be docker or none")
 		}
-		if dr.Namespace != "" && (len(dr.Namespace) > 63 || !reDNSLabel.MatchString(dr.Namespace)) {
-			add("drill.namespace: must be a Kubernetes namespace name (lowercase letters, digits and -)")
+		if dr.Namespace != "" {
+			add("drill.namespace: no longer used (drill does not run Kubernetes pods since ADR-0013); remove it")
 		}
 		if IsBitnamiImage(dr.Image) {
 			add("drill.image: %s is not supported as the drill image: Bitnami's entrypoint runs a temporary server that already listens on TCP, so Bracer cannot tell when the real server is up; use the official postgres image or one built on it (postgis/postgis, timescale/timescaledb)", dr.Image)
@@ -597,19 +611,83 @@ func (a *App) Validate() error {
 			add("hosted.token_env: required")
 		}
 	}
+	if rt := a.Runtime; rt != nil {
+		if rt.Docker != "" && !filepath.IsAbs(rt.Docker) {
+			add("runtime.docker: must be an absolute path")
+		}
+	}
 	if len(errs) > 0 {
 		return &ValidationError{Errs: errs}
 	}
 	return nil
 }
 
-// Load reads and validates app.yaml from disk.
+func isAre(list string) string {
+	if strings.Contains(list, ",") || strings.Contains(list, "/") {
+		return "are"
+	}
+	return "is"
+}
+
+// Load reads and validates app.yaml from disk. When an instance still uses a
+// connection from before ADR-0013, the error ends with the Fix line naming init
+// on this very file (conventions § error handling).
 func Load(path string) (*App, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return Parse(data)
+	a, err := Parse(data)
+	var ve *ValidationError
+	if errors.As(err, &ve) && ve.legacy() {
+		abs, aerr := filepath.Abs(path)
+		if aerr != nil {
+			abs = path
+		}
+		ve.Fix = "bracer init -c " + abs
+	}
+	return a, err
+}
+
+// LoadForInit reads app.yaml for `bracer init -c`: instances from before
+// ADR-0013 are taken out (returned apart, to be picked again) and the rest is
+// validated as usual.
+func LoadForInit(path string) (*App, []Instance, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := rejectPlaintextSecrets(data); err != nil {
+		return nil, nil, err
+	}
+	var app App
+	if err := yaml.UnmarshalWithOptions(data, &app, yaml.Strict()); err != nil {
+		return nil, nil, fmt.Errorf("app.yaml: %s", yaml.FormatError(err, false, true))
+	}
+	var legacy []Instance
+	kept := app.Instances[:0]
+	for _, in := range app.Instances {
+		if in.Legacy() != "" {
+			legacy = append(legacy, in)
+			continue
+		}
+		kept = append(kept, in)
+	}
+	app.Instances = kept
+	if app.Drill != nil {
+		app.Drill.Namespace = ""
+		if app.Drill.Runtime == "kube" {
+			app.Drill.Runtime = ""
+		}
+	}
+	if len(app.Instances) == 0 {
+		// Validate requires one instance; init adds one before saving.
+		app.Instances = []Instance{{Name: "placeholder", Container: "x", Databases: Databases{All: true}}}
+		err := app.Validate()
+		app.Instances = nil
+		return &app, legacy, err
+	}
+	return &app, legacy, app.Validate()
 }
 
 // Marshal writes App as YAML.

@@ -65,6 +65,8 @@ const psql = "docker exec -i shop-db psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f
 func containerWorld() *fakeShell {
 	return &fakeShell{out: map[string]string{
 		"docker version": "29.0\n",
+		"docker info":    "29.0\n",
+		"docker context inspect --format {{.Endpoints.docker.Host}}": "unix:///var/run/docker.sock\n",
 		"docker ps":      `{"ID":"c1","Names":"shop-db","Image":"postgres:17-alpine","State":"running","Status":"Up"}` + "\n",
 		"docker inspect": `[{"Id":"c1","Name":"/shop-db","State":{"Running":true,"Status":"running"},"Config":{"Image":"postgres:17-alpine","Env":["POSTGRES_PASSWORD=pw","POSTGRES_DB=shop"]},"NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"15432"}]},"Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}}]`,
 		"docker top c1":  "UID PID PPID C STIME TTY TIME CMD\n70 1 0 0 x ? 0 postgres\n",
@@ -74,6 +76,7 @@ func containerWorld() *fakeShell {
 		psql + "select 1":                              "1\n",
 		psql + "show server_version_num":               "170011\n",
 		psql + "select version()":                      "PostgreSQL 17.11 on aarch64\n",
+		psql + "select system_identifier":              "7698217040907026472\n",
 		psql + "select datname":                        "postgres\nshop\n",
 		psql + "select current_user":                   "postgres\x1ft\x1ft\x1ft\n",
 		psql + "select n.nspname":                      "",
@@ -83,77 +86,108 @@ func containerWorld() *fakeShell {
 	}}
 }
 
-// noBinary: the test machine has no kubectl or pg_dump on the host.
-func noBinary(string) (string, error) { return "", errors.New("not found") }
-
-// lookIn fakes a PATH that has only the given commands.
-func lookIn(paths map[string]string) func(string) (string, error) {
-	return func(name string) (string, error) {
-		if p, ok := paths[name]; ok {
-			return p, nil
-		}
-		return "", errors.New("not found")
-	}
+// world is what init sees around it besides the shell.
+type world struct {
+	sh      pg.Shell
+	store   error // the first bucket check fails with it, later ones pass
+	systemd bool
+	selfRun func(args []string) int // nil: every self-check passes
+	selfLog [][]string              // args then env of each self-check
+	tty     []string                // the command run on the terminal
 }
 
 func runScripted(t *testing.T, dir string, sh pg.Shell, storeErr error, answers ...string) (int, string, string) {
-	return runScriptedLook(t, dir, sh, storeErr, noBinary, answers...)
+	return runWorld(t, dir, &world{sh: sh, store: storeErr}, nil, answers...)
 }
 
-func runScriptedLook(t *testing.T, dir string, sh pg.Shell, storeErr error, lookPath func(string) (string, error), answers ...string) (int, string, string) {
+func runWorld(t *testing.T, dir string, w *world, extra []string, answers ...string) (int, string, string) {
 	t.Helper()
+	pg.KubernetesDirs = []string{filepath.Join(dir, "no-k3s")}
 	var out, errb bytes.Buffer
 	in := strings.NewReader(strings.Join(answers, "\n") + "\n")
 	d := initDeps{
-		shell:    sh,
-		probe:    func(context.Context, string, int) (bool, error) { return true, nil },
-		newStore: func(storage.S3Config) (storage.Store, error) { return fakeStore{err: storeErr}, nil },
-		goos:     "linux",
-		lookPath: lookPath,
-		glob:     func(string) ([]string, error) { return nil, nil },
-		stdin:    in, stdout: &out, stderr: &errb,
+		shell: w.sh,
+		probe: func(context.Context, string, int) (bool, error) { return true, nil },
+		newStore: func(storage.S3Config) (storage.Store, error) {
+			err := w.store
+			w.store = nil
+			return fakeStore{err: err}, nil
+		},
+		env: envDeps{
+			lookPath:   func(name string) (string, error) { return "/usr/bin/" + name, nil },
+			getenv:     func(string) string { return "" },
+			userName:   func() string { return "khanh" },
+			hasSystemd: func() bool { return w.systemd },
+		},
+		home: func() (string, error) { return dir, nil },
+		runSelf: func(_ context.Context, args, env []string, _, _ io.Writer) int {
+			w.selfLog = append(w.selfLog, args, env)
+			if w.selfRun != nil {
+				return w.selfRun(args)
+			}
+			return 0
+		},
+		runTTY: func(_ context.Context, name string, args ...string) error {
+			w.tty = append([]string{name}, args...)
+			return nil
+		},
+		stdin: in, stdout: &out, stderr: &errb,
 	}
-	code := runInit(context.Background(), []string{"-c", filepath.Join(dir, "app.yaml")}, d)
+	code := runInit(context.Background(), append([]string{"-c", filepath.Join(dir, "app.yaml")}, extra...), d)
 	return code, out.String(), errb.String()
 }
+
+var s3Answers = []string{"https://s3.example.com", "backups", "", "", "", "AK", "SK"}
 
 func TestInitContainerFullFlow(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	code, out, errOut := runScripted(t, dir, containerWorld(), nil,
-		"shop",                                                      // app name
-		"1",                                                         // pick container
-		"",                                                          // instance name = shop-db
-		"",                                                          // all databases
-		"https://s3.example.com", "backups", "", "", "", "AK", "SK", // bucket
-		"",  // encrypt: yes
-		"",  // generate key
-		"",  // key path
-		"1", // bracer keeps secrets
-		"",  // env path
-	)
+	w := &world{sh: containerWorld()}
+	code, out, errOut := runWorld(t, dir, w, nil, append(append([]string{
+		"shop", // app name
+		"1",    // pick container
+		"",     // instance name = shop-db
+		"",     // all databases
+	}, s3Answers...),
+		"",       // encrypt: yes
+		"",       // generate key
+		"",       // key path
+		"later",  // not "copied": asked again
+		"copied", // key copied off the machine (ADR-0015)
+	)...)
 	if code != 0 {
 		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	if strings.Count(out, "Type copied when done") != 2 {
+		t.Errorf("the key must be confirmed copied:\n%s", out)
 	}
 	cfg, err := config.Load(filepath.Join(dir, "app.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Instances) != 1 || cfg.Instances[0].Container != "shop-db" || cfg.Instances[0].PgMajor != 17 || !cfg.Instances[0].Databases.All || cfg.Instances[0].PasswordEnv != "" {
-		t.Errorf("instance: %+v", cfg.Instances[0])
+	in := cfg.Instances[0]
+	if len(cfg.Instances) != 1 || in.Container != "shop-db" || in.PgMajor != 17 || in.SystemID != "7698217040907026472" || !in.Databases.All || in.PasswordEnv != "" {
+		t.Errorf("instance: %+v", in)
 	}
 	if cfg.Storage == nil || cfg.Storage.AccessKeyEnv != "BRACER_SHOP_S3_ACCESS_KEY" || cfg.Storage.Prefix != "bracer" {
 		t.Errorf("storage: %+v", cfg.Storage)
 	}
-	// 11b: the container image is of the official family → copied into drill.image, the user need not know.
-	if cfg.Drill == nil || cfg.Drill.Image != "postgres:17-alpine" || !strings.Contains(out, "drill will use image postgres:17-alpine") {
+	// 11 (ADR-0015): drill runs the source container's own image from the environment record; drill.image stays unset.
+	if (cfg.Drill != nil && cfg.Drill.Image != "") || !strings.Contains(out, "drill will use the same image as this Postgres (postgres:17-alpine)") {
 		t.Errorf("drill.image: %+v", cfg.Drill)
 	}
-	if cfg.Encryption != "age" || !strings.HasPrefix(cfg.AgeRecipient, "age1") || cfg.AgeIdentityFile != "~/.config/bracer/shop.key" {
+	// Absolute paths: timers have no shell to expand `~`.
+	key := filepath.Join(dir, ".config", "bracer", "shop.key")
+	envPath := filepath.Join(dir, ".config", "bracer", "shop.env")
+	if cfg.Encryption != "age" || !strings.HasPrefix(cfg.AgeRecipient, "age1") || cfg.AgeIdentityFile != key {
 		t.Errorf("encryption: %s %s %s", cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile)
 	}
-	if cfg.SecretsFile != "~/.config/bracer/shop.env" {
+	if cfg.SecretsFile != envPath || !strings.Contains(out, "Secrets saved to "+envPath) {
 		t.Errorf("secrets_file = %q", cfg.SecretsFile)
+	}
+	rt := cfg.Runtime
+	if rt == nil || rt.User != "khanh" || rt.Docker != "/usr/bin/docker" || rt.DockerHost != "unix:///var/run/docker.sock" || rt.Path != "/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin" {
+		t.Errorf("runtime: %+v", rt)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "app.yaml"))
 	for _, secret := range []string{"AK", "SK", "AGE-SECRET-KEY"} {
@@ -161,20 +195,30 @@ func TestInitContainerFullFlow(t *testing.T) {
 			t.Errorf("secret %s leaked into app.yaml:\n%s", secret, raw)
 		}
 	}
-	env, _ := os.ReadFile(filepath.Join(dir, ".config", "bracer", "shop.env"))
+	env, _ := os.ReadFile(envPath)
 	if string(env) != "BRACER_SHOP_S3_ACCESS_KEY=AK\nBRACER_SHOP_S3_SECRET_KEY=SK\n" {
 		t.Errorf("env file:\n%s", env)
 	}
-	st, _ := os.Stat(filepath.Join(dir, ".config", "bracer", "shop.key"))
+	st, _ := os.Stat(key)
 	if st == nil || st.Mode().Perm() != 0o600 {
 		t.Error("key file missing or not 600")
 	}
 	if !strings.Contains(out, "published on localhost:15432") || strings.Contains(out, "15432 (on this host") {
 		t.Errorf("mapped port must merge into the container:\n%s", out)
 	}
-	if !strings.Contains(out, "Shown once") {
-		t.Error("private key must be shown once with a warning")
+	if !strings.Contains(out, "Shown once") || !strings.Contains(out, "✓ docker: docker info answers as khanh") {
+		t.Errorf("key shown once, environment table first:\n%s", out)
 	}
+	// 14: both dry runs, with only HOME and runtime.path; 15: no systemd → crontab hint.
+	abs := filepath.Join(dir, "app.yaml")
+	wantEnv := "HOME=" + dir + " PATH=" + rt.Path
+	if len(w.selfLog) != 4 || strings.Join(w.selfLog[0], " ") != "backup --dry-run -c "+abs || strings.Join(w.selfLog[1], " ") != wantEnv || strings.Join(w.selfLog[2], " ") != "drill --dry-run -c "+abs {
+		t.Errorf("self-check: %q", w.selfLog)
+	}
+	if !strings.Contains(out, "schedule print -c "+abs) {
+		t.Errorf("without systemd init points at schedule print:\n%s", out)
+	}
+
 	// Second run: add databases to the existing instance, do not ask about bucket/key again.
 	code, out, errOut = runScripted(t, dir, containerWorld(), nil,
 		"1", // same container
@@ -193,54 +237,63 @@ func TestInitContainerFullFlow(t *testing.T) {
 	}
 }
 
-func TestInitHostNeedsPasswordAndSelfManagedSecrets(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+// localWorld: no container; Postgres on this machine at 127.0.0.1:5433 that wants a password.
+func localWorld(password string) (*gateShell, *fakeShell) {
 	sh := containerWorld()
-	// No container; Postgres on the host at 5433, requires a password.
 	sh.out["docker ps"] = ""
 	sh.out["ss -ltnpH"] = "LISTEN 0 244 127.0.0.1:5433 0.0.0.0:* users:((\"postgres\",pid=9,fd=7))\n"
 	hostPsql := "docker run --rm -i --network host postgres:18-alpine psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
 	hostPsql17 := "docker run --rm -i --network host postgres:17-alpine psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
-	authFail := true
 	sh.out[hostPsql+"show server_version_num"] = "170011\n"
-	for _, p := range []string{hostPsql17 + "select version()", hostPsql17 + "select datname", hostPsql17 + "select current_user", hostPsql17 + "select n.nspname", hostPsql17 + "select extname", "docker run --rm -i --network host postgres:17-alpine pg_dump --schema-only"} {
-		sh.out[p] = map[string]string{
-			hostPsql17 + "select version()":    "PostgreSQL 17.11\n",
-			hostPsql17 + "select datname":      "app\n",
-			hostPsql17 + "select current_user": "bracer_backup\x1ff\x1ft\x1ft\n",
-			hostPsql17 + "select extname":      "uuid-ossp\x1f1.1\n",
-		}[p]
-	}
+	sh.out[hostPsql17+"select version()"] = "PostgreSQL 17.11\n"
+	sh.out[hostPsql17+"select datname"] = "app\n"
+	sh.out[hostPsql17+"select current_user"] = "bracer_backup\x1ff\x1ft\x1ft\n"
+	sh.out[hostPsql17+"select n.nspname"] = ""
+	sh.out[hostPsql17+"select extname"] = "uuid-ossp\x1f1.1\n"
+	sh.out["docker run --rm -i --network host postgres:17-alpine pg_dump --schema-only"] = ""
+	sh.out["docker pull --quiet postgres:17-alpine"] = ""
 	sh.fail[hostPsql17+"show pool_mode"] = "ERROR"
-	// 11b: uuid-ossp is in the default image → no question about the drill image.
+	sh.fail["docker image inspect --format {{.Id}} postgres:17-alpine"] = "No such image"
+	sh.fail[hostPsql17+"select system_identifier"] = "ERROR:  permission denied for function pg_control_system"
+	// 11: uuid-ossp is in the default image → no question about the drill image.
 	sh.out["docker run --rm --network none postgres:17-alpine sh -c ls"] = "plpgsql.control\nuuid-ossp.control\nuuid-ossp--1.1.sql\n"
-	// select 1: auth error the first time, ok once PGPASSWORD is set.
 	gated := &gateShell{inner: sh, gate: func(c pg.Cmd) (pg.Result, error, bool) {
 		if strings.Contains(strings.Join(c.Args, " "), "select 1") {
-			if authFail && !hasEnv(c.Env, "PGPASSWORD=s3cret") {
-				return pg.Result{}, &pg.ExitError{Code: 2, Stderr: []byte("psql: error: connection to server at \"localhost\" (127.0.0.1), port 5433 failed: fe_sendauth: no password supplied")}, true
+			if !hasEnv(c.Env, "PGPASSWORD="+password) {
+				return pg.Result{}, &pg.ExitError{Cmd: "psql", Code: 2, Stderr: []byte(`psql: error: connection to server at "127.0.0.1", port 5433 failed: FATAL:  password authentication failed for user "bracer_backup"`)}, true
 			}
-			authFail = false
 			if c.Stdout != nil {
 				io.WriteString(c.Stdout, "1\n")
+				return pg.Result{}, nil, true
 			}
 			return pg.Result{Stdout: []byte("1\n")}, nil, true
 		}
 		return pg.Result{}, nil, false
 	}}
-	code, out, errOut := runScripted(t, dir, gated, errors.New("boom"),
+	return gated, sh
+}
+
+// spec init AC: Postgres on this machine → user + password → URL built by init
+// (percent-encoded) in secrets_file, app.yaml has only url_env. → ADR-0013
+func TestInitLocalPostgresBuildsURL(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	gated, sh := localWorld("p@ss:w/rd")
+	answers := []string{
 		"shop",
-		"1",             // local 5433
-		"",              // name local-5433
-		"bracer_backup", // user after auth failure
-		"s3cret",        // password
-		"",              // all databases
-		"https://s3.example.com", "backups", "", "", "", "AK", "SK",
-		"s", // bucket check failed → skip
-		"n", // no encryption
-		"2", // I manage secrets
-	)
+		"1",     // localhost:5433
+		"",      // name local-5433
+		"",      // user bracer_backup
+		"wrong", // password: rejected
+		"",      // user again
+		"p@ss:w/rd",
+		"", // all databases
+	}
+	answers = append(answers, s3Answers...)
+	answers = append(answers, "r") // bucket check failed → retry
+	answers = append(answers, s3Answers...)
+	answers = append(answers, "n") // no encryption
+	code, out, errOut := runWorld(t, dir, &world{sh: gated, store: errors.New("boom")}, nil, answers...)
 	if code != 0 {
 		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
@@ -248,283 +301,192 @@ func TestInitHostNeedsPasswordAndSelfManagedSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cfg.Storage == nil || cfg.Storage.Bucket != "backups" {
+		t.Errorf("storage after retry: %+v", cfg.Storage)
+	}
 	in := cfg.Instances[0]
-	if in.Name != "local-5433" || in.Host != "localhost" || in.Port != 5433 || in.User != "bracer_backup" || in.PasswordEnv != "BRACER_SHOP_LOCAL_5433_PASSWORD" || in.PgMajor != 17 {
+	if in.Name != "local-5433" || in.URLEnv != "BRACER_SHOP_LOCAL_5433_URL" || in.User != "" || in.PasswordEnv != "" || in.PgMajor != 17 || in.SystemID != "" {
 		t.Errorf("instance: %+v", in)
 	}
-	if cfg.Storage != nil || cfg.Encryption != "none" || cfg.SecretsFile != "" {
-		t.Errorf("storage skipped, no encryption, self-managed: %+v %s %s", cfg.Storage, cfg.Encryption, cfg.SecretsFile)
+	env, _ := os.ReadFile(filepath.Join(dir, ".config", "bracer", "shop.env"))
+	if string(env) != "BRACER_SHOP_LOCAL_5433_URL=postgres://bracer_backup:p%40ss%3Aw%2Frd@127.0.0.1:5433/postgres\nBRACER_SHOP_S3_ACCESS_KEY=AK\nBRACER_SHOP_S3_SECRET_KEY=SK\n" {
+		t.Errorf("env file:\n%s", env)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".config", "bracer", "shop.env")); !os.IsNotExist(err) {
-		t.Error("self-managed: no env file must be written")
-	}
-	if !strings.Contains(out, "--env-file") || !strings.Contains(out, "BRACER_SHOP_LOCAL_5433_PASSWORD=...") {
-		t.Errorf("must print both templates:\n%s", out)
+	if !strings.Contains(out, "sudo -u postgres psql -p 5433\n") || !strings.Contains(out, "GRANT pg_read_all_data TO bracer_backup") || !strings.Contains(out, "Pulling postgres:17-alpine") {
+		t.Errorf("must show how to create the user and pull the image:\n%s", out)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "app.yaml"))
-	if strings.Contains(string(raw), "s3cret") {
-		t.Error("password leaked into app.yaml")
+	if strings.Contains(string(raw), "p@ss") || strings.Contains(string(raw), "5433/") || strings.Contains(string(raw), " host:") {
+		t.Errorf("app.yaml must hold only url_env:\n%s", raw)
 	}
 	for _, env := range sh.env {
 		for _, kv := range env {
-			if strings.HasPrefix(kv, "PGPASSWORD=") && kv != "PGPASSWORD=s3cret" {
+			if strings.HasPrefix(kv, "PGPASSWORD=") && kv != "PGPASSWORD=p@ss:w/rd" && kv != "PGPASSWORD=wrong" {
 				t.Errorf("unexpected PGPASSWORD env: %s", kv)
 			}
 		}
 	}
 }
 
-// Without Docker: init warns and still scans the host; Postgres on 5433 uses
-// the host's pg_dump binary (ADR-0009).
-func TestInitWithoutDockerUsesHostBinaries(t *testing.T) {
+// spec init AC step 0: nothing is asked or written when Docker cannot be used;
+// the fixes come in order and the last line is the command typed.
+func TestInitEnvironmentBlocks(t *testing.T) {
+	dir := t.TempDir()
+	sh := &fakeShell{out: map[string]string{
+		"docker context inspect": "unix:///var/run/docker.sock\n",
+	}, fail: map[string]string{
+		"docker info": "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock",
+	}}
+	code, out, _ := runWorld(t, dir, &world{sh: sh}, []string{"--no-drill"})
+	abs := filepath.Join(dir, "app.yaml")
+	if code != exitError || !strings.Contains(out, "✗ docker: khanh may not use Docker") || !strings.Contains(out, "1. sudo usermod -aG docker khanh   # the docker group is equivalent to root") ||
+		!strings.Contains(out, "2. log out and back in") || !strings.Contains(out, "3. bracer init -c "+abs+" --no-drill\n") || strings.Contains(out, "App name") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+	if _, err := os.Stat(abs); !os.IsNotExist(err) {
+		t.Error("nothing must be written")
+	}
+
+	// Rootless Docker without lingering: enable-linger, no logout needed.
+	sh = &fakeShell{out: map[string]string{
+		"docker info":                 "29.0\n",
+		"docker context inspect":      "unix:///run/user/1000/docker.sock\n",
+		"loginctl show-user khanh -p": "Linger=no\n",
+	}}
+	code, out, _ = runWorld(t, dir, &world{sh: sh, systemd: true}, nil)
+	if code != exitError || !strings.Contains(out, "✗ rootless docker") || !strings.Contains(out, "1. sudo loginctl enable-linger khanh\n  2. bracer init -c "+abs) || !strings.Contains(out, "✓ systemd") {
+		t.Errorf("rootless: exit %d:\n%s", code, out)
+	}
+
+	// bracer check: same table, exit 0 when nothing blocks.
+	sh.out["loginctl show-user khanh -p"] = "Linger=yes\n"
+	var buf bytes.Buffer
+	ed := envDeps{shell: sh, lookPath: func(n string) (string, error) { return "/usr/bin/" + n, nil }, getenv: func(string) string { return "" }, userName: func() string { return "khanh" }, hasSystemd: func() bool { return false }}
+	if c := runCheck(context.Background(), nil, ed, &buf, &buf); c != exitOK || !strings.Contains(buf.String(), "✓ rootless docker: lingering is on for khanh") || !strings.Contains(buf.String(), "✗ systemd: not found") {
+		t.Errorf("check: exit %d:\n%s", c, buf.String())
+	}
+}
+
+// --no-drill → drill.runtime: none, no drill.image, the self-check skips drill;
+// with systemd init offers schedule install and runs it on the terminal.
+func TestInitNoDrillAndSchedule(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	bin := "/usr/lib/postgresql/17/bin/"
-	psql := bin + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
-	sh := &fakeShell{out: map[string]string{
-		"ss -ltnpH":                      "LISTEN 0 244 127.0.0.1:5433 0.0.0.0:* users:((\"postgres\",pid=9,fd=7))\n",
-		bin + "pg_dump --version":        "pg_dump (PostgreSQL) 17.11 (Debian 17.11-1.pgdg12+2)\n",
-		psql + "select 1":                "1\n",
-		psql + "show server_version_num": "170011\n",
-		psql + "select version()":        "PostgreSQL 17.11\n",
-		psql + "select datname":          "app\n",
-		psql + "select current_user":     "postgres\x1ft\x1ft\x1ft\n",
-		psql + "select n.nspname":        "",
-		psql + "select extname":          "postgis\x1f3.4.2\n",
-		bin + "pg_dump --schema-only":    "",
-	}, fail: map[string]string{
-		"docker version":        "Cannot connect to the Docker daemon",
-		psql + "show pool_mode": "ERROR",
-	}}
-	code, out, errOut := runScriptedLook(t, dir, sh, nil, lookIn(map[string]string{"pg_dump": bin + "pg_dump"}),
-		"shop",
-		"1", // local 5433
-		"",  // name
-		"",  // all databases
-		"https://s3.example.com", "backups", "", "", "", "AK", "SK",
-		"n", // no encryption
-		"2", // I manage secrets
-	)
+	w := &world{sh: containerWorld(), systemd: true}
+	code, out, errOut := runWorld(t, dir, w, []string{"--no-drill"}, append(append([]string{"shop", "1", "", ""}, s3Answers...), "n", "")...)
 	if code != 0 {
 		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
-	}
-	if !strings.Contains(errOut, "Docker is not available") || !strings.Contains(errOut, "drill") {
-		t.Errorf("must warn about Docker once and go on:\n%s", errOut)
-	}
-	if !strings.Contains(out, "host pg_dump 17.11 (/usr/lib/postgresql/17/bin)") {
-		t.Errorf("runner must be the host binary:\n%s", out)
 	}
 	cfg, err := config.Load(filepath.Join(dir, "app.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if in := cfg.Instances[0]; in.Host != "localhost" || in.Port != 5433 || in.PgMajor != 17 {
-		t.Errorf("instance: %+v", in)
+	abs := filepath.Join(dir, "app.yaml")
+	if !cfg.DrillOff() || cfg.Drill.Image != "" || !strings.Contains(out, "backups on this machine will not be test-restored; every report will say so") {
+		t.Errorf("drill: %+v\n%s", cfg.Drill, out)
 	}
-	for _, env := range sh.env {
-		for _, kv := range env {
-			if strings.HasPrefix(kv, "PGPASSWORD=") {
-				t.Error("no password was given; none must be passed")
-			}
-		}
+	if len(w.selfLog) != 2 || w.selfLog[0][0] != "backup" {
+		t.Errorf("self-check must skip drill: %q", w.selfLog)
+	}
+	if len(w.tty) < 5 || w.tty[0] != "sudo" || strings.Join(w.tty[2:], " ") != "schedule install -c "+abs || !strings.Contains(out, "Install the nightly schedule now? It runs: sudo ") {
+		t.Errorf("schedule: %q\n%s", w.tty, out)
 	}
 }
 
-// Postgres in a k3s pod: discovered via kubectl, connected with kubectl exec, no password.
-func TestInitPodFlow(t *testing.T) {
+// A failed dry run keeps app.yaml, prints the command to run again and exits 1.
+func TestInitSelfCheckFails(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	exec := "kubectl exec -i -n attendy-dev postgres-0 -c postgres -- env PGUSER=attendy PGDATABASE=postgres PGCONNECT_TIMEOUT=10 "
-	psql := exec + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
-	sh := &fakeShell{out: map[string]string{
-		"docker version": "29.0\n",
-		"docker ps":      `{"ID":"k1","Names":"k8s_postgres_postgres-0_attendy-dev_u_0","Image":"attendy-postgres:sha","State":"running","Status":"Up"}` + "\n",
-		"docker inspect": `[{"Id":"k1","Name":"/k8s_postgres_postgres-0_attendy-dev_u_0","State":{"Running":true,"Status":"running"},"Config":{"Image":"attendy-postgres:sha","Env":["POSTGRES_USER=attendy"]},"NetworkSettings":{"Ports":{},"Networks":{}}}]`,
-		"ss -ltnpH":      "",
-		"kubectl get pods -A -o json": `{"items":[
-		  {"metadata":{"namespace":"attendy-dev","name":"postgres-0"},"spec":{"containers":[{"name":"postgres","image":"attendy-postgres:sha","env":[{"name":"POSTGRES_USER","value":"attendy"},{"name":"POSTGRES_PASSWORD","valueFrom":{"secretKeyRef":{"name":"pg","key":"pw"}}}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"postgres","ready":true}]}},
-		  {"metadata":{"namespace":"attendy-dev","name":"attendy-api-1"},"spec":{"containers":[{"name":"api","image":"attendy-api:sha","env":[{"name":"POSTGRES_SERVICE_HOST","value":"10.43.0.1"}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"api","ready":true}]}},
-		  {"metadata":{"namespace":"slidemaker-dev","name":"postgres-backup-1"},"spec":{"containers":[{"name":"dump","image":"postgres:17"}]},"status":{"phase":"Succeeded"}}
-		]}`,
-		"kubectl exec -n attendy-dev postgres-0 -c postgres -- sh -c command -v pg_dump": "/usr/bin/pg_dump\n",
-		"kubectl exec -n attendy-dev postgres-0 -c postgres -- sh -c for f in /proc":     "1\n",
-		psql + "select 1":                "1\n",
-		psql + "show server_version_num": "170011\n",
-		psql + "select version()":        "PostgreSQL 17.11\n",
-		psql + "select datname":          "attendy\npostgres\n",
-		psql + "select current_user":     "attendy\x1ft\x1ft\x1ft\n",
-		strings.Replace(psql, "PGDATABASE=postgres", "PGDATABASE=attendy", 1) + "select n.nspname":      "",
-		strings.Replace(exec, "PGDATABASE=postgres", "PGDATABASE=attendy", 1) + "pg_dump --schema-only": "",
-	}, fail: map[string]string{
-		psql + "show pool_mode": "ERROR",
+	w := &world{sh: containerWorld(), systemd: true, selfRun: func(args []string) int {
+		if args[0] == "drill" {
+			return 1
+		}
+		return 0
 	}}
-	code, out, errOut := runScriptedLook(t, dir, sh, nil, lookIn(map[string]string{"kubectl": "/usr/local/bin/kubectl"}),
-		"shop",
-		"1", // the pod
-		"",  // name postgres-0
-		"1", // database attendy
-		"https://s3.example.com", "backups", "", "", "", "AK", "SK",
-		"n", // no encryption
-		"2", // I manage secrets
+	code, out, _ := runWorld(t, dir, w, nil, append(append([]string{"shop", "1", "", ""}, s3Answers...), "n")...)
+	if code != exitError || !strings.Contains(out, "Self-check failed (exit 1)") || strings.Contains(out, "Install the nightly schedule") || w.tty != nil {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app.yaml")); err != nil {
+		t.Error("app.yaml must be kept")
+	}
+}
+
+// spec init AC: an instance from before ADR-0013 is listed as "needs to be picked
+// again"; the replacement keeps its name and databases; the rest of app.yaml stays.
+func TestInitLegacyInstancePickedAgain(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := filepath.Join(dir, "app.yaml")
+	os.WriteFile(path, []byte(`app: shop
+instances:
+  - name: main
+    pod: attendy-dev/postgres-0
+    databases: [shop]
+  - name: old
+    socket: /var/run/postgresql
+    databases: all
+storage:
+  endpoint: https://s3.example.com
+  bucket: backups
+  prefix: bracer
+  access_key_env: BRACER_SHOP_S3_ACCESS_KEY
+  secret_key_env: BRACER_SHOP_S3_SECRET_KEY
+encryption: none
+drill:
+  runtime: kube
+  namespace: attendy-dev
+`), 0o644)
+	code, out, errOut := runScripted(t, dir, containerWorld(), nil,
+		"1", // the container
+		"1", // it replaces main
 	)
 	if code != 0 {
 		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
-	if !strings.Contains(out, "1) attendy-dev/postgres-0 (pod; attendy-postgres:sha; container postgres)") || strings.Contains(out, "k8s_") || strings.Contains(out, "attendy-api") {
-		t.Errorf("only the Postgres pod must be listed, not the cri-dockerd container or other pods:\n%s", out)
+	if !strings.Contains(out, "main (pod) needs to be picked again") || !strings.Contains(out, "Keeping the databases of main: shop") || !strings.Contains(errOut, "instance old (socket, before ADR-0013) was not picked again") {
+		t.Errorf("stdout:\n%s\nstderr:\n%s", out, errOut)
 	}
-	if !strings.Contains(out, "via kubectl exec attendy-dev/postgres-0/postgres") {
-		t.Errorf("runner must be kubectl exec:\n%s", out)
-	}
-	cfg, err := config.Load(filepath.Join(dir, "app.yaml"))
+	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	in := cfg.Instances[0]
-	if in.Name != "postgres-0" || in.Pod != "attendy-dev/postgres-0/postgres" || in.User != "attendy" || in.PgMajor != 17 || in.PasswordEnv != "" || len(in.Databases.List) != 1 || in.Databases.List[0].Name != "attendy" {
-		t.Errorf("instance: %+v", in)
+	if len(cfg.Instances) != 1 || in.Name != "main" || in.Container != "shop-db" || len(in.Databases.List) != 1 || in.Databases.List[0].Name != "shop" || cfg.Storage.Bucket != "backups" {
+		t.Errorf("app.yaml: %+v", cfg)
 	}
-}
-
-// A node without Docker (k3s with containerd): init writes drill.runtime: kube and
-// the pod's namespace once kubectl confirms it may create pods and network policies there.
-func TestInitPodFlowWithoutDockerSetsDrillRuntime(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	exec := "kubectl exec -i -n attendy-dev postgres-0 -c postgres -- env PGUSER=attendy PGDATABASE=postgres PGCONNECT_TIMEOUT=10 "
-	psql := exec + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
-	sh := &fakeShell{out: map[string]string{
-		"ss -ltnpH": "",
-		"kubectl get pods -A -o json": `{"items":[
-		  {"metadata":{"namespace":"attendy-dev","name":"postgres-0"},"spec":{"containers":[{"name":"postgres","image":"postgres:17-alpine","env":[{"name":"POSTGRES_USER","value":"attendy"}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"postgres","ready":true}]}}]}`,
-		"kubectl exec -n attendy-dev postgres-0 -c postgres -- sh -c command -v pg_dump": "/usr/bin/pg_dump\n",
-		"kubectl exec -n attendy-dev postgres-0 -c postgres -- sh -c for f in /proc":     "1\n",
-		"kubectl get pod -n attendy-dev postgres-0 -o json":                              `{"spec":{"containers":[{"name":"postgres","image":"postgres:17-alpine"}]}}`,
-		"kubectl auth can-i create pods -n attendy-dev":                                  "yes\n",
-		"kubectl auth can-i create networkpolicies.networking.k8s.io -n attendy-dev":     "yes\n",
-		psql + "select 1":                "1\n",
-		psql + "show server_version_num": "170011\n",
-		psql + "select version()":        "PostgreSQL 17.11 on x86_64\n",
-		psql + "select datname":          "postgres\nattendy\n",
-		psql + "select current_user":     "attendy\x1ft\x1ft\x1ft\n",
-		strings.Replace(psql, "PGDATABASE=postgres", "PGDATABASE=attendy", 1) + "select n.nspname":      "",
-		strings.Replace(exec, "PGDATABASE=postgres", "PGDATABASE=attendy", 1) + "pg_dump --schema-only": "",
-	}, fail: map[string]string{
-		"docker version":        "Cannot connect to the Docker daemon",
-		psql + "show pool_mode": "ERROR",
-	}}
-	code, out, errOut := runScriptedLook(t, dir, sh, nil, lookIn(map[string]string{"kubectl": "/usr/local/bin/kubectl"}),
-		"shop",
-		"1", // the pod
-		"",  // name postgres-0
-		"2", // database attendy
-		"https://s3.example.com", "backups", "", "", "", "AK", "SK",
-		"n", // no encryption
-		"2", // I manage secrets
-	)
-	if code != 0 {
-		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
-	}
-	if !strings.Contains(errOut, "Docker is not available") || !strings.Contains(out, "drill will run its temporary Postgres as a pod in namespace attendy-dev through kubectl") {
-		t.Errorf("must warn about Docker and announce the pod runtime:\nstdout:\n%s\nstderr:\n%s", out, errOut)
-	}
-	cfg, err := config.Load(filepath.Join(dir, "app.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Drill == nil || cfg.Drill.Runtime != "kube" || cfg.Drill.Namespace != "attendy-dev" || cfg.Drill.Image != "postgres:17-alpine" {
+	if cfg.Drill.Runtime != "" || cfg.Drill.Namespace != "" {
 		t.Errorf("drill: %+v", cfg.Drill)
 	}
 }
 
-// The pod gets POSTGRES_USER via an envFrom Secret: the pod spec has no value. init
-// asks the container; if that fails, the server reports the user does not exist → ask for the user.
-func TestInitPodUserFromSecret(t *testing.T) {
-	podJSON := `{"items":[{"metadata":{"namespace":"slidemaker","name":"postgres-0"},"spec":{"containers":[{"name":"postgres","image":"postgres:17-alpine","envFrom":[{"secretRef":{"name":"db-credentials"}}],"env":[{"name":"PGDATA","value":"/var/lib/postgresql/data/pgdata"}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"postgres","ready":true}]}},
-	  {"metadata":{"namespace":"jumpsmash","name":"jumpsmash-api-1"},"spec":{"containers":[{"name":"api","image":"jumpsmash-api:8cdf540","env":[{"name":"POSTGRES_USER"},{"name":"POSTGRES_PASSWORD"},{"name":"DATABASE_URL"}]}]},"status":{"phase":"Running","containerStatuses":[{"name":"api","ready":true}]}}]}`
-	world := func(resolved string) *fakeShell {
-		exec := "kubectl exec -i -n slidemaker postgres-0 -c postgres -- env PGUSER=slidemaker PGDATABASE=postgres PGCONNECT_TIMEOUT=10 "
-		psql := exec + "psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c "
-		return &fakeShell{out: map[string]string{
-			"ss -ltnpH":                   "",
-			"kubectl get pods -A -o json": podJSON,
-			"kubectl exec -n slidemaker postgres-0 -c postgres -- sh -c for f in /proc":     "1\n",
-			"kubectl exec -n slidemaker postgres-0 -c postgres -- sh -c u=":                 resolved,
-			"kubectl exec -n slidemaker postgres-0 -c postgres -- sh -c command -v pg_dump": "/usr/bin/pg_dump\n",
-			psql + "select 1":                                  "1\n",
-			psql + "show server_version_num":                   "170011\n",
-			psql + "select version()":                          "PostgreSQL 17.11\n",
-			psql + "select datname":                            "slidemaker\npostgres\n",
-			"kubectl get pod -n slidemaker postgres-0 -o json": `{"spec":{"containers":[{"name":"postgres","image":"postgres:17-alpine"}]}}`,
-			psql + "select current_user":                       "slidemaker\x1ft\x1ft\x1ft\n",
-			strings.Replace(psql, "PGDATABASE=postgres", "PGDATABASE=slidemaker", 1) + "select n.nspname":      "",
-			strings.Replace(exec, "PGDATABASE=postgres", "PGDATABASE=slidemaker", 1) + "pg_dump --schema-only": "",
-		}, fail: map[string]string{
-			"docker version": "Cannot connect to the Docker daemon",
-			// App pod with only env hints and no sh: cannot be checked → not numbered.
-			"kubectl exec -n jumpsmash jumpsmash-api-1 -c api -- sh -c for f in /proc": `exec failed: "sh": executable file not found`,
-			psql + "show pool_mode": "ERROR",
-			// Default postgres: user does not exist.
-			"kubectl exec -i -n slidemaker postgres-0 -c postgres -- env PGUSER=postgres": `psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  role "postgres" does not exist`,
-		}}
+// Kubernetes is never reached; the k8s_ containers seen through Docker become one notice.
+func TestInitKubernetesNotice(t *testing.T) {
+	dir := t.TempDir()
+	sh := containerWorld()
+	sh.out["docker ps"] = `{"ID":"k1","Names":"k8s_postgres_postgres-0_attendy-dev_u_0","Image":"postgres:17","State":"running","Status":"Up"}` + "\n"
+	sh.out["docker inspect"] = `[{"Id":"k1","Name":"/k8s_postgres_postgres-0_attendy-dev_u_0","State":{"Running":true,"Status":"running"},"Config":{"Image":"postgres:17","Env":["POSTGRES_USER=attendy"]},"NetworkSettings":{"Ports":{},"Networks":{}}}]`
+	sh.out["docker top k1"] = "UID PID PPID C STIME TTY TIME CMD\n70 1 0 0 x ? 0 postgres\n"
+	sh.out["ss -ltnpH"] = ""
+	_, out, _ := runScripted(t, dir, sh, nil, "shop")
+	if !strings.Contains(out, "Kubernetes is not supported (seen: 1 Kubernetes container(s) seen through Docker)") || strings.Contains(out, "1) k8s_") || !strings.Contains(out, "No Postgres found.") {
+		t.Errorf("out:\n%s", out)
 	}
-	check := func(t *testing.T, dir string, code int, out, errOut string) {
-		t.Helper()
-		if code != 0 {
-			t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
-		}
-		if strings.Contains(out, "Try again?") {
-			t.Errorf("must not loop on Try again:\n%s", out)
-		}
-		if strings.Contains(out, "2) jumpsmash") || !strings.Contains(out, "1 pod(s) have Postgres-like variables but could not be checked for a postgres process (no shell in the container): jumpsmash/jumpsmash-api-1/api") {
-			t.Errorf("unchecked env-only pod must be a note, not a numbered candidate:\n%s", out)
-		}
-		cfg, err := config.Load(filepath.Join(dir, "app.yaml"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if in := cfg.Instances[0]; in.Pod != "slidemaker/postgres-0/postgres" || in.User != "slidemaker" || in.PasswordEnv != "" {
-			t.Errorf("instance: %+v", in)
-		}
-		if cfg.Drill == nil || cfg.Drill.Image != "postgres:17-alpine" {
-			t.Errorf("drill.image from pod spec: %+v", cfg.Drill)
-		}
-	}
-	look := lookIn(map[string]string{"kubectl": "/usr/local/bin/kubectl"})
-	s3 := []string{"https://s3.example.com", "backups", "", "", "", "AK", "SK", "n", "2"}
+}
 
-	// A. The container answers POSTGRES_USER → connect right away with that user, no questions.
+// spec init AC: the bucket is mandatory; a failing check offers retry or quit,
+// never skip.
+func TestInitBucketFailQuits(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	code, out, errOut := runScriptedLook(t, dir, world("slidemaker"), nil, look, append([]string{"shop", "1", "", "1"}, s3...)...)
-	check(t, dir, code, out, errOut)
-	if strings.Contains(out, "does not exist") {
-		t.Errorf("user must come from the container, no role error expected:\n%s", out)
+	code, out, _ := runWorld(t, dir, &world{sh: containerWorld(), store: errors.New("403 Forbidden")}, nil, append(append([]string{
+		"shop", "1", "", "",
+	}, s3Answers...), "q")...)
+	if code != exitError || !strings.Contains(out, "403 Forbidden") || !strings.Contains(out, "Nothing written") || strings.Contains(out, "skip") {
+		t.Errorf("exit %d\n%s", code, out)
 	}
-
-	// B. The container does not answer → try postgres, the server reports the user does not exist → ask for the user.
-	dir = t.TempDir()
-	t.Setenv("HOME", dir)
-	code, out, errOut = runScriptedLook(t, dir, world(""), nil, look, append([]string{"shop", "1", "", "slidemaker", "1"}, s3...)...)
-	check(t, dir, code, out, errOut)
-	if !strings.Contains(out, `User postgres does not exist on this server`) || !strings.Contains(out, "User [postgres]:") {
-		t.Errorf("must explain and ask for the user:\n%s", out)
-	}
-
-	// C. Manually entered ns/pod/container (unknown image, not listed automatically): still check the process, then connect.
-	dir = t.TempDir()
-	t.Setenv("HOME", dir)
-	code, out, errOut = runScriptedLook(t, dir, world("slidemaker"), nil, look, append([]string{"shop", "m", "slidemaker/postgres-0/postgres", "", "1"}, s3...)...)
-	check(t, dir, code, out, errOut)
-
-	// D. Manually entered pod without a postgres process → rejected.
-	w := world("")
-	w.out["kubectl exec -n slidemaker slidemaker-app-1 -c app -- sh -c for f in /proc"] = "none\n"
-	dir = t.TempDir()
-	t.Setenv("HOME", dir)
-	code, out, _ = runScriptedLook(t, dir, w, nil, look, "shop", "m", "slidemaker/slidemaker-app-1/app")
-	if code == 0 || !strings.Contains(out, "no postgres process is running in slidemaker/slidemaker-app-1/app") {
-		t.Errorf("exit %d, out:\n%s", code, out)
+	if _, err := os.Stat(filepath.Join(dir, "app.yaml")); !os.IsNotExist(err) {
+		t.Error("nothing must be written without a bucket")
 	}
 }
 
@@ -559,4 +521,32 @@ func hasEnv(env []string, kv string) bool {
 		}
 	}
 	return false
+}
+
+// spec init § Edge cases: pg_hba.conf has no host line → the line to add,
+// where the file is (psql -p for a cluster not on 5432), [r] retries.
+func TestInitLocalPostgresHbaHint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	inner, _ := localWorld("pw")
+	refused := true
+	gated := &gateShell{inner: inner, gate: func(c pg.Cmd) (pg.Result, error, bool) {
+		if refused && strings.Contains(strings.Join(c.Args, " "), "select 1") {
+			refused = false
+			return pg.Result{}, &pg.ExitError{Cmd: "psql", Code: 2, Stderr: []byte(`psql: error: connection to server at "127.0.0.1", port 5433 failed: FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "bracer_backup", database "postgres", no encryption`)}, true
+		}
+		return pg.Result{}, nil, false
+	}}
+	answers := []string{"shop", "1", "", "", "pw", "r", ""}
+	answers = append(answers, s3Answers...)
+	answers = append(answers, "n")
+	code, out, errOut := runWorld(t, dir, &world{sh: gated}, nil, answers...)
+	if code != 0 {
+		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
+	}
+	for _, want := range []string{"pg_hba.conf has no line for 127.0.0.1", "host all bracer_backup 127.0.0.1/32 scram-sha-256", "sudo -u postgres psql -p 5433 -Atc 'show hba_file'"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
 }

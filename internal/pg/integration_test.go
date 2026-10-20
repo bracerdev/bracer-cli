@@ -5,7 +5,6 @@ package pg
 import (
 	"context"
 	"os"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -40,9 +39,8 @@ func TestIntegrationContainer(t *testing.T) {
 	if !ct.HasPgProc || len(ct.HostPorts) == 0 {
 		t.Errorf("container: %+v", ct)
 	}
-	hs := ScanHost(ctx, sh, runtime.GOOS)
-	cands, _ := Discover(ctx, cs, nil, hs, ProbeSSLRequest)
-	for _, c := range cands {
+	hs := ScanHost(ctx, sh)
+	for _, c := range Discover(ctx, cs, hs, ProbeSSLRequest).Candidates {
 		t.Log(c.Label())
 		if c.Container == nil && c.Port == ct.HostPorts[0] {
 			t.Error("a mapped port must merge into the container, not become its own instance")
@@ -83,8 +81,8 @@ func TestIntegrationContainer(t *testing.T) {
 		t.Error("network container:", m2, err)
 	}
 
-	// Runner 3: through the mapped port on the host (macOS: host.docker.internal) → needs a password.
-	host := NewHostRunner(sh, ImageForMajor(major))
+	// Runner 3: through the mapped port on the host network → needs a password.
+	host := NewURLRunner(sh, ImageForMajor(major))
 	cl3 := &Client{Runner: host, Conn: Conn{Host: "localhost", Port: ct.HostPorts[0], User: ct.DefaultUser(), Database: "postgres"}}
 	err = cl3.Ping(ctx)
 	if !IsAuthError(err) {

@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,12 +22,13 @@ type Deps struct {
 	Shell   pg.Shell
 	Store   storage.Store
 	Secrets *config.Secrets
-	GOOS    string
-	Tools   *pg.Tools // nil: built from Shell and GOOS
+	Tools   *pg.Tools // nil: built from Shell
 	Now     func() time.Time
 	Log     *slog.Logger
 	// Connect can be replaced in tests; defaults to the package's Connect.
 	Connect ConnectFunc
+	// ConfigPath is the absolute path of app.yaml, named in `Fix: bracer init -c …`.
+	ConfigPath string
 }
 
 // Result is the outcome of one run, printed to the console and --json, sent to /report.
@@ -43,16 +45,29 @@ type Result struct {
 
 // InstanceResult is the outcome of one instance.
 type InstanceResult struct {
-	Name        string            `json:"name"`
-	Runner      string            `json:"runner,omitempty"`
-	PgVersion   string            `json:"pg_version,omitempty"`
-	ToolVersion string            `json:"tool_version,omitempty"` // the pg_dump --version used
-	OK          bool              `json:"ok"`
-	Error       string            `json:"error,omitempty"`
-	Databases   []*DatabaseResult `json:"databases"`
-	Added       []string          `json:"added,omitempty"`
-	Removed     []string          `json:"removed,omitempty"`
-	Globals     *GlobalsResult    `json:"globals,omitempty"`
+	Name      string `json:"name"`
+	Runner    string `json:"runner,omitempty"`
+	PgVersion string `json:"pg_version,omitempty"`
+	SystemID  string `json:"system_id,omitempty"`
+	// IdentityChanged: the server is another cluster than the one init recorded;
+	// dumps are taken but retention keeps every old one (spec backup § Flow 3a2).
+	IdentityChanged bool              `json:"identity_changed,omitempty"`
+	ToolVersion     string            `json:"tool_version,omitempty"` // the pg_dump --version used
+	OK              bool              `json:"ok"`
+	Error           string            `json:"error,omitempty"`
+	Databases       []*DatabaseResult `json:"databases"`
+	Added           []string          `json:"added,omitempty"`
+	Removed         []string          `json:"removed,omitempty"`
+	Globals         *GlobalsResult    `json:"globals,omitempty"`
+	Env             *EnvResult        `json:"env,omitempty"`
+	Kind            string            `json:"source_kind,omitempty"` // container, local, url
+}
+
+// EnvResult is the outcome of writing the environment file (ADR-0015).
+type EnvResult struct {
+	OK    bool   `json:"ok"`
+	Bytes int64  `json:"bytes,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // DatabaseResult is the outcome of one database.
@@ -95,7 +110,7 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 		d.Connect = Connect
 	}
 	if d.Tools == nil {
-		d.Tools = pg.NewTools(d.Shell, d.GOOS)
+		d.Tools = pg.NewTools(d.Shell)
 	}
 	res := &Result{Kind: "backup", App: cfg.App, StartedAt: d.Now().UTC()}
 	if cfg.Storage == nil {
@@ -135,7 +150,7 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 	for _, in := range cfg.Instances {
 		ir := &InstanceResult{Name: in.Name}
 		res.Instances = append(res.Instances, ir)
-		runInstance(ctx, cfg, in, manifest, ir, recipient, added, d)
+		runInstance(ctx, cfg, in, manifest, ir, recipient, added, res, d)
 	}
 
 	// Write the manifest first, retention afterwards (AC retention). Retention: drop
@@ -148,7 +163,7 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 		skipRetention = true
 	}
 	if !skipRetention {
-		toDelete := applyRetention(cfg, manifest, added, res)
+		toDelete := applyRetention(cfg, manifest, added, identityChanged(res), res)
 		if len(toDelete) > 0 {
 			if err := SaveManifest(ctx, d.Store, manifestKey, manifest, d.Now()); err != nil {
 				res.warn("manifest.json could not be rewritten after retention: %v; nothing deleted", err)
@@ -164,6 +179,7 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 		}
 	}
 	if !skipSave {
+		saveAppYAML(ctx, cfg, recipient, res, d)
 		reportOrphans(ctx, cfg, manifestKey, manifest, res, d)
 	}
 	if recipient != "" {
@@ -179,13 +195,71 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 	return res, nil
 }
 
-func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Manifest, ir *InstanceResult, recipient string, added map[string]bool, d Deps) {
+// identityChanged lists the instances whose retention is held this run.
+func identityChanged(res *Result) map[string]bool {
+	out := map[string]bool{}
+	for _, ir := range res.Instances {
+		if ir.IdentityChanged {
+			out[ir.Name] = true
+		}
+	}
+	return out
+}
+
+// fixInit is the Fix line pointing at init on this app.yaml.
+func fixInit(d Deps) string {
+	path := d.ConfigPath
+	if path == "" {
+		path = "<app.yaml>"
+	}
+	return "Fix: bracer init -c " + path
+}
+
+// checkIdentity is spec backup § Flow 3a2: compare the server with what init
+// recorded. A different cluster is still dumped, but retention is held; a
+// different major only warns. Never stops a backup because something changed.
+func checkIdentity(ctx context.Context, client *pg.Client, in config.Instance, ver string, ir *InstanceResult, res *Result, d Deps) {
+	if major := pg.MajorOf(ver); in.PgMajor != 0 && major != 0 && major != in.PgMajor {
+		res.warn("Postgres on %s is now %d (app.yaml says %d)\n  drill picks its image from pg_major\n  %s", in.Name, major, in.PgMajor, fixInit(d))
+	}
+	id, err := client.SystemIdentifier(ctx)
+	if err != nil {
+		if in.SystemID != "" {
+			res.warn("%s: could not read system_identifier (%v); not checking whether it is still the same Postgres cluster", in.Name, firstLine(err.Error()))
+		}
+		return
+	}
+	ir.SystemID = id
+	if in.SystemID == "" || id == in.SystemID {
+		return
+	}
+	ir.IdentityChanged = true
+	when := "at an unknown time"
+	if t := pg.InitdbTime(id); !t.IsZero() {
+		when = t.Format("2006-01-02 15:04 UTC")
+	}
+	res.warn("%s is a different Postgres cluster than before (initialized %s); old backups are kept\n  system_identifier is %s, app.yaml says %s; retention is held for this instance until init confirms the new cluster\n  %s", in.Name, when, id, in.SystemID, fixInit(d))
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Manifest, ir *InstanceResult, recipient string, added map[string]bool, res *Result, d Deps) {
+	// One ts for the whole run: every database, the globals and the
+	// environment file, so restore and drill take one run whole (ADR-0015).
+	ts := d.Now().UTC().Format(tsLayout)
+	kind := in.Kind()
 	conn, runner, err := d.Connect(ctx, d.Tools, in, d.Secrets)
 	if err != nil {
 		ir.Error = err.Error()
 		return
 	}
 	ir.Runner = runner.Describe()
+	ir.Kind = kind.String()
 	client := &pg.Client{Runner: runner, Conn: conn}
 	if err := client.Ping(ctx); err != nil {
 		ir.Error = fmt.Sprintf("connect: %v", err)
@@ -197,14 +271,24 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Ma
 		return
 	}
 	ir.PgVersion = ver
+	checkIdentity(ctx, client, in, ver, ir, res, d)
 	im := m.instance(in.Name)
 	im.PgVersion = ver
+	im.Kind = kind.String()
+	if libs, err := client.PreloadLibraries(ctx); err != nil {
+		im.SharedPreloadLibraries = nil
+	} else {
+		im.SharedPreloadLibraries = &libs
+	}
 	toolVer, _, err := client.ToolVersion(ctx)
 	if err != nil {
 		ir.Error = err.Error()
 		return
 	}
 	ir.ToolVersion = toolVer
+	if !kind.Full() {
+		res.warn("%s: databases only (URL source): users and privileges are not backed up", in.Name)
+	}
 
 	var dbs []string
 	if in.Databases.All {
@@ -217,6 +301,14 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Ma
 		if len(known) > 0 {
 			ir.Added = diff(dbs, known)
 			ir.Removed = diff(known, dbs)
+		}
+		// template1 is copied into every new database: keep it when someone put objects there.
+		if kind.Full() {
+			if used, err := templateInUse(ctx, client.WithDB("template1")); err != nil {
+				res.warn("%s: could not check template1 for objects: %v", in.Name, firstLine(err.Error()))
+			} else if used {
+				dbs = append(dbs, "template1")
+			}
 		}
 	} else {
 		for _, db := range in.Databases.List {
@@ -231,28 +323,39 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Ma
 	}
 
 	ir.OK = true
+	extNames := map[string]bool{}
 	for _, db := range dbs {
-		dr := &DatabaseResult{Name: db, Encrypted: recipient != ""}
+		dr := &DatabaseResult{Name: db, Encrypted: recipient != "", TS: ts}
 		ir.Databases = append(ir.Databases, dr)
 		start := d.Now()
-		ts := start.UTC().Format(tsLayout)
-		dr.TS = ts
+		fail := func(format string, args ...interface{}) {
+			dr.Error = fmt.Sprintf(format, args...)
+			ir.OK = false
+			d.Log.Error("dump failed", "instance", in.Name, "db", db, "err", dr.Error)
+		}
 		// Encoding/locale so restore can recreate the database identically (spec backup § Flow 3c);
 		// if it cannot be read, the dump cannot be recreated identically → this database fails.
 		loc, err := client.DatabaseLocale(ctx, db, pg.MajorOf(ver))
 		if err != nil {
-			dr.Error = fmt.Sprintf("read encoding/locale of %s: %v", db, err)
-			ir.OK = false
-			d.Log.Error("dump failed", "instance", in.Name, "db", db, "err", dr.Error)
+			fail("read encoding/locale of %s: %v", db, err)
 			continue
 		}
 		c := client.WithDB(db)
 		exts, err := c.Extensions(ctx)
 		if err != nil {
-			dr.Error = fmt.Sprintf("read extensions of %s: %v", db, err)
-			ir.OK = false
-			d.Log.Error("dump failed", "instance", in.Name, "db", db, "err", dr.Error)
+			fail("read extensions of %s: %v", db, err)
 			continue
+		}
+		for _, e := range exts {
+			extNames[e.Name] = true
+		}
+		oos, err := c.OutOfScope(ctx)
+		if err != nil {
+			fail("read %s for what a restore cannot carry: %v", db, err)
+			continue
+		}
+		if len(oos) > 0 {
+			res.warn("%s/%s: restore cannot guarantee: %s", in.Name, db, strings.Join(oos, ", "))
 		}
 		// One deadline per database: count + dump + upload (spec backup § Edge cases).
 		dbctx, cancel := context.WithTimeout(ctx, cfg.BackupTimeout())
@@ -263,19 +366,47 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Ma
 			if errors.Is(dbctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 				err = fmt.Errorf("timed out after %s (backup.timeout); the connection was closed, PostgreSQL 14+ stops the server-side work within 10 s: %w", cfg.BackupTimeout(), err)
 			}
-			dr.Error = err.Error()
-			ir.OK = false
-			d.Log.Error("dump failed", "instance", in.Name, "db", db, "err", err)
+			fail("%s", err.Error())
 			continue
 		}
 		dr.Tables = len(tables)
 		dr.OK, dr.Bytes = true, n
 		added[key] = true
-		im.database(db).addDump(&Dump{TS: ts, Key: key, ToolVersion: toolVer, Locale: loc, Extensions: exts, Bytes: n, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), UploadedAt: d.Now().UTC(), Tables: tables})
+		im.database(db).addDump(&Dump{TS: ts, Key: key, ToolVersion: toolVer, Locale: loc, Extensions: exts, OutOfScope: oos, Bytes: n, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), UploadedAt: d.Now().UTC(), Tables: tables, SystemID: ir.SystemID})
 		d.Log.Info("dumped", "instance", in.Name, "db", db, "bytes", n, "seconds", fmt.Sprintf("%.1f", dr.Seconds))
 	}
 
-	// Globals: once per instance. → ADR-0006
+	// The environment of this run (ADR-0015 § 2).
+	er := &EnvResult{}
+	ir.Env = er
+	env, err := collectEnv(ctx, in, client, kind, dbs, extNames, pg.MajorOf(ver), res, d)
+	if err == nil {
+		env.TS = ts
+		var data []byte
+		data, err = json.MarshalIndent(env, "", "  ")
+		if err == nil {
+			key := storage.Join(cfg.Storage.Prefix, cfg.App, in.Name, "env", ts+ext(".json", recipient))
+			var n int64
+			var sha string
+			n, sha, err = putBytes(ctx, d.Store, key, data, recipient)
+			if err == nil {
+				er.OK, er.Bytes = true, n
+				added[key] = true
+				im.Env.Dumps = append(im.Env.Dumps, &Dump{TS: ts, Key: key, SystemID: ir.SystemID, Bytes: n, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), UploadedAt: d.Now().UTC()})
+				sortDumps(im.Env.Dumps)
+				im.Env.Latest = ts
+			}
+		}
+	}
+	if err != nil {
+		er.Error = err.Error()
+		ir.OK = false
+	}
+
+	if !kind.Full() {
+		return
+	}
+	// Globals: once per instance, full sources only. → ADR-0006, ADR-0015
 	gr := &GlobalsResult{HasPasswords: priv.Superuser || priv.ReadAllData}
 	ir.Globals = gr
 	args := []string{"--globals-only"}
@@ -283,7 +414,6 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Ma
 		args = append(args, "--no-role-passwords")
 	}
 	args = append(args, lockWaitArg(cfg))
-	ts := d.Now().UTC().Format(tsLayout)
 	key := storage.Join(cfg.Storage.Prefix, cfg.App, in.Name, "globals", ts+ext(".sql", recipient))
 	gctx, cancel := context.WithTimeout(ctx, cfg.BackupTimeout())
 	n, sha, err := streamToStore(gctx, runner, conn, "pg_dumpall", args, d.Store, key, recipient)
@@ -295,16 +425,67 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, m *Ma
 	}
 	gr.OK, gr.Bytes = true, n
 	added[key] = true
-	im.Globals.Dumps = append(im.Globals.Dumps, &Dump{TS: ts, Key: key, ToolVersion: toolVer, Bytes: n, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), UploadedAt: d.Now().UTC()})
+	im.Globals.Dumps = append(im.Globals.Dumps, &Dump{TS: ts, Key: key, ToolVersion: toolVer, SystemID: ir.SystemID, Bytes: n, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), UploadedAt: d.Now().UTC()})
 	sortDumps(im.Globals.Dumps)
 	im.Globals.Latest = ts
 	im.Globals.HasPasswords = gr.HasPasswords
 }
 
+// templateInUse: template1 holds objects of a user or an extension besides plpgsql.
+func templateInUse(ctx context.Context, c *pg.Client) (bool, error) {
+	n, err := c.UserObjects(ctx)
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	exts, err := c.Extensions(ctx)
+	if err != nil {
+		return false, err
+	}
+	return len(exts) > 0, nil
+}
+
+// collectEnv reads the environment file of this run. A required part that
+// cannot be read fails the instance; optional parts (packages) only warn.
+func collectEnv(ctx context.Context, in config.Instance, client *pg.Client, kind config.Kind, dbs []string, exts map[string]bool, major int, res *Result, d Deps) (*pg.Env, error) {
+	src := pg.EnvSource{Kind: kind.String(), Shell: d.Shell}
+	switch kind {
+	case config.KindContainer:
+		src.Container = in.Container
+	case config.KindLocal:
+		src.Local = &pg.Local{Dir: in.Local.Dir(), Port: in.Local.Port}
+	}
+	env, warns, err := pg.CollectEnv(ctx, client, src, dbs)
+	if err != nil {
+		return nil, fmt.Errorf("read the environment: %w", err)
+	}
+	if kind.Full() && !env.HasFileSettings {
+		return nil, fmt.Errorf("read the environment: pg_file_settings is not readable; a full backup needs a superuser")
+	}
+	for _, w := range warns {
+		res.warn("%s: %s", in.Name, w)
+	}
+	if kind == config.KindLocal && len(exts) > 0 {
+		names := make([]string, 0, len(exts))
+		for n := range exts {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		pkgs, err := pg.ExtensionPackages(ctx, d.Shell, major, names)
+		env.Local.Packages = pkgs
+		if err != nil {
+			res.warn("%s: could not find the package of every extension (%v); drill builds its image from them", in.Name, firstLine(err.Error()))
+		}
+	}
+	return env, nil
+}
+
 // applyRetention drops from the manifest the dumps beyond `keep` per database
 // (in uploaded_at order) and returns the keys to delete. It never deletes dumps
 // created this run (added) even with clock skew, and only deletes keys under <prefix>/<app>/.
-func applyRetention(cfg *config.App, m *Manifest, added map[string]bool, res *Result) []string {
+func applyRetention(cfg *config.App, m *Manifest, added, held map[string]bool, res *Result) []string {
 	defKeep := 7
 	if cfg.Retention != nil {
 		defKeep = cfg.Retention.Keep
@@ -313,7 +494,7 @@ func applyRetention(cfg *config.App, m *Manifest, added map[string]bool, res *Re
 	var toDelete []string
 	for _, in := range cfg.Instances {
 		im := m.Instances[in.Name]
-		if im == nil {
+		if im == nil || held[in.Name] {
 			continue
 		}
 		names := make([]string, 0, len(im.Databases))
@@ -336,11 +517,42 @@ func applyRetention(cfg *config.App, m *Manifest, added map[string]bool, res *Re
 				dm.Latest = dm.Dumps[len(dm.Dumps)-1].TS
 			}
 		}
+		// Globals and environment files belong to runs: keep each one while a
+		// database dump of its run is kept (ADR-0015), otherwise by keep.
+		used := map[string]bool{}
+		for _, dm := range im.Databases {
+			for _, d := range dm.Dumps {
+				used[d.TS] = true
+			}
+		}
 		var del []string
-		im.Globals.Dumps, del = prune(im.Globals.Dumps, defKeep, added, root, res)
+		im.Globals.Dumps, del = pruneRuns(im.Globals.Dumps, defKeep, used, added, root, res)
+		toDelete = append(toDelete, del...)
+		im.Env.Dumps, del = pruneRuns(im.Env.Dumps, defKeep, used, added, root, res)
 		toDelete = append(toDelete, del...)
 	}
 	return toDelete
+}
+
+// pruneRuns is prune for per-run objects: one whose run still has a database
+// dump is never deleted; the others go once more than keep remain.
+func pruneRuns(dumps []*Dump, keep int, used, added map[string]bool, root string, res *Result) ([]*Dump, []string) {
+	var held, rest []*Dump
+	for _, d := range dumps {
+		if used[d.TS] {
+			held = append(held, d)
+		} else {
+			rest = append(rest, d)
+		}
+	}
+	k := keep - len(held)
+	if k < 0 {
+		k = 0
+	}
+	rest, del := prune(rest, k, added, root, res)
+	out := append(held, rest...)
+	sortDumps(out)
+	return out, del
 }
 
 // prune drops the oldest dumps until `keep` remain; a dump created this run is kept
@@ -349,7 +561,7 @@ func prune(dumps []*Dump, keep int, added map[string]bool, root string, res *Res
 	sortDumps(dumps)
 	var del []string
 	var kept []*Dump
-	for len(dumps)+len(kept) > keep {
+	for len(dumps) > 0 && len(dumps)+len(kept) > keep {
 		old := dumps[0]
 		if added[old.Key] {
 			break
@@ -368,6 +580,42 @@ func prune(dumps []*Dump, keep int, added map[string]bool, root string, res *Res
 	return append(kept, dumps...), del
 }
 
+// appYAMLKey is where the copy of app.yaml lives (without .age).
+func appYAMLKey(cfg *config.App) string {
+	return storage.Join(cfg.Storage.Prefix, cfg.App, "app.yaml")
+}
+
+// AppYAMLKey is the key of the app.yaml copy for an app, encrypted or not.
+func AppYAMLKey(prefix, app string, encrypted bool) string {
+	k := storage.Join(prefix, app, "app.yaml")
+	if encrypted {
+		k += ".age"
+	}
+	return k
+}
+
+// saveAppYAML writes the app.yaml in use (it holds no secret) next to the
+// manifest, so restore works on a machine without it (ADR-0015). A failure
+// only warns. The other form (plain or .age) is removed so one copy remains.
+func saveAppYAML(ctx context.Context, cfg *config.App, recipient string, res *Result, d Deps) {
+	data, err := config.Marshal(cfg)
+	if err == nil {
+		_, _, err = putBytes(ctx, d.Store, AppYAMLKey(cfg.Storage.Prefix, cfg.App, recipient != ""), data, recipient)
+	}
+	if err != nil {
+		res.warn("could not copy app.yaml to the bucket: %v; restore on another machine will need app.yaml", err)
+		return
+	}
+	other := AppYAMLKey(cfg.Storage.Prefix, cfg.App, recipient == "")
+	if objs, err := d.Store.List(ctx, other); err == nil {
+		for _, o := range objs {
+			if o.Key == other {
+				_ = d.Store.Delete(ctx, other)
+			}
+		}
+	}
+}
+
 // reportOrphans lists objects under <prefix>/<app>/ that the manifest does not
 // point to: a sign of two machines writing the same app or of an overwritten manifest.
 func reportOrphans(ctx context.Context, cfg *config.App, manifestKey string, m *Manifest, res *Result, d Deps) {
@@ -379,7 +627,7 @@ func reportOrphans(ctx context.Context, cfg *config.App, manifestKey string, m *
 	keys := m.Keys()
 	var orphans []string
 	for _, o := range objs {
-		if o.Key == manifestKey || strings.HasPrefix(o.Key, manifestKey+".corrupt-") || keys[o.Key] {
+		if o.Key == manifestKey || strings.HasPrefix(o.Key, manifestKey+".corrupt-") || keys[o.Key] || o.Key == appYAMLKey(cfg) || o.Key == appYAMLKey(cfg)+".age" {
 			continue
 		}
 		orphans = append(orphans, o.Key)
@@ -482,4 +730,12 @@ func shouldCount(t pg.Table, mode string, maxRows int64) bool {
 	default:
 		return t.RowsEst == nil || *t.RowsEst < maxRows
 	}
+}
+
+// orUser names the backup user in a hint, or a placeholder when app.yaml leaves it to the default.
+func orUser(u string) string {
+	if u == "" {
+		return "<backup user>"
+	}
+	return pg.QuoteIdent(u)
 }

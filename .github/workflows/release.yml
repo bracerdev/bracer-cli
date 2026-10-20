@@ -1,4 +1,4 @@
-# Release: push tag v* → test → GoReleaser build, đóng gói, tạo GitHub Release (draft).
+# Release: push a v* tag → test → GoReleaser builds, packages and creates a draft GitHub Release.
 name: release
 on:
   push:

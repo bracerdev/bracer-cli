@@ -1,6 +1,5 @@
 // Package drill restores the latest backup into a temporary Postgres (a Docker
-// container, or a Kubernetes pod through kubectl) and compares it against the
-// manifest (spec backup/drill).
+// container) and compares it against the manifest (spec backup/drill).
 package drill
 
 import (
@@ -10,8 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	goruntime "runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -28,7 +25,7 @@ import (
 // Deps is everything Run touches outside; tests replace it with fakes.
 type Deps struct {
 	Shell pg.Shell
-	// Tools finds docker and kubectl to pick the runtime; defaults to pg.NewTools(Shell).
+	// Tools checks Docker; defaults to pg.NewTools(Shell).
 	Tools *pg.Tools
 	Store storage.Store
 	Now   func() time.Time
@@ -40,10 +37,11 @@ type Deps struct {
 	// ReadyTimeout is how long to wait for pg_isready (default 90 s); Poll is the polling interval (1 s).
 	ReadyTimeout time.Duration
 	Poll         time.Duration
-	// StartTimeout is how long a pod may take to reach Running (default 10 min; image pull on the node).
-	StartTimeout time.Duration
+	// ConfigPath is the absolute path of app.yaml, named in `Fix: bracer init -c …`.
+	ConfigPath string
 
 	Keep          bool   // --keep: keep the temporary container
+	ForceDocker   bool   // --runtime docker: run even with drill.runtime: none
 	Instance      string // --instance: only this instance
 	Database      string // --database: only this database
 	SkipDiskCheck bool   // --skip-disk-check: run even if Docker root seems short on space
@@ -56,33 +54,36 @@ type Result struct {
 	StartedAt  time.Time         `json:"started_at"`
 	FinishedAt time.Time         `json:"finished_at"`
 	OK         bool              `json:"ok"`
-	Runtime    string            `json:"runtime,omitempty"` // docker | kube
+	Runtime    string            `json:"runtime,omitempty"` // docker
 	Instances  []*InstanceResult `json:"instances"`
 	Warnings   []string          `json:"warnings,omitempty"`
 }
 
 // InstanceResult is the outcome of one instance (one temporary container).
 type InstanceResult struct {
-	Name      string             `json:"name"`
-	Image     string             `json:"image,omitempty"`
-	Container string             `json:"container,omitempty"` // only with --keep (docker)
-	Volumes   []string           `json:"volumes,omitempty"`   // only with --keep (docker)
-	Pod       string             `json:"pod,omitempty"`       // only with --keep (kube): namespace/name
-	Kubectl   string             `json:"kubectl,omitempty"`   // only with --keep (kube): kubectl or k3s kubectl
+	Name      string   `json:"name"`
+	Image     string   `json:"image,omitempty"`
+	Container string   `json:"container,omitempty"` // only with --keep (docker)
+	Volumes   []string `json:"volumes,omitempty"`   // only with --keep (docker)
+	User      string   `json:"user,omitempty"`      // only with --keep: the superuser to connect as
+	// SystemID is the system_identifier of the cluster the restored dumps came from.
+	SystemID  string             `json:"system_id,omitempty"`
+	TS        string             `json:"ts,omitempty"`     // the run drilled
+	Source    string             `json:"source,omitempty"` // container | local | url
+	Mode      string             `json:"mode,omitempty"`   // full | data
 	OK        bool               `json:"ok"`
 	Error     string             `json:"error,omitempty"`
+	Checks    []restore.Check    `json:"checks,omitempty"` // the comparison lines that failed
+	Notes     []string           `json:"notes,omitempty"`
 	Disk      *restore.DiskCheck `json:"disk,omitempty"`
-	Globals   *GlobalsResult     `json:"globals,omitempty"`
 	Databases []*DatabaseResult  `json:"databases"`
 }
-
-// GlobalsResult is the outcome of restoring globals (shared with restore).
-type GlobalsResult = restore.GlobalsResult
 
 // DatabaseResult is the outcome of restoring + comparing one database.
 type DatabaseResult struct {
 	DB             string        `json:"db"`
 	TS             string        `json:"ts"`
+	SystemID       string        `json:"system_id,omitempty"` // cluster the dump came from (spec backup § Flow 3a2)
 	OK             bool          `json:"ok"`
 	Bytes          int64         `json:"bytes"`
 	RestoreSeconds float64       `json:"restore_seconds"`
@@ -99,12 +100,8 @@ type DatabaseResult struct {
 // RowMismatch is a table whose row count differs from the manifest (shared with restore).
 type RowMismatch = restore.RowMismatch
 
-// CheckResult is the outcome of one drill.checks entry.
-type CheckResult struct {
-	Name  string `json:"name"`
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
-}
+// CheckResult is the outcome of one drill.checks entry (shared with restore).
+type CheckResult = restore.CheckResult
 
 // Label marks temporary containers so orphans can be cleaned up.
 const Label = "dev.bracer.app"
@@ -124,6 +121,9 @@ func (r *Result) warn(format string, args ...interface{}) {
 // live in Result; an error is returned only when the run cannot start.
 func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 	d = withDefaults(d)
+	if cfg.DrillOff() && !d.ForceDocker {
+		return nil, OffError(cfg.App)
+	}
 	res := &Result{Kind: "drill", App: cfg.App, StartedAt: d.Now().UTC()}
 
 	manifestKey := storage.Join(cfg.Storage.Prefix, cfg.App, "manifest.json")
@@ -158,8 +158,7 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	res.Runtime = rt.kind()
-	d.Log.Info("drill runtime", "runtime", rt.kind())
+	res.Runtime = config.DrillRuntimeDocker
 
 	if what, err := rt.cleanupOrphans(ctx, cfg.App); err != nil {
 		res.warn("could not remove leftover drill resources: %v", err)
@@ -167,13 +166,11 @@ func Run(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 		res.warn("removed %s from a previous run", what)
 	}
 
-	ids := loadIdentities(cfg, manifest, d, res)
-
 	res.OK = true
 	for _, in := range instances {
 		ir := &InstanceResult{Name: in.Name}
 		res.Instances = append(res.Instances, ir)
-		runInstance(ctx, rt, cfg, in, manifest.Instances[in.Name], ids, ir, res, d)
+		runInstance(ctx, rt, cfg, in, manifest.Instances[in.Name], ir, res, d)
 		if !ir.OK {
 			res.OK = false
 		}
@@ -201,11 +198,8 @@ func withDefaults(d Deps) Deps {
 	if d.Poll == 0 {
 		d.Poll = defaultPoll
 	}
-	if d.StartTimeout == 0 {
-		d.StartTimeout = defaultStartWait
-	}
 	if d.Tools == nil {
-		d.Tools = pg.NewTools(d.Shell, goruntime.GOOS)
+		d.Tools = pg.NewTools(d.Shell)
 	}
 	return d
 }
@@ -218,35 +212,6 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// loadIdentities reads age_identity_file only when the manifest has encrypted dumps.
-func loadIdentities(cfg *config.App, m *backup.Manifest, d Deps, res *Result) *restore.Identities {
-	needed := false
-	for _, im := range m.Instances {
-		if latest(im.Globals.Dumps, im.Globals.Latest) != nil && latest(im.Globals.Dumps, im.Globals.Latest).Encrypted {
-			needed = true
-		}
-		for _, dm := range im.Databases {
-			if dp := latest(dm.Dumps, dm.Latest); dp != nil && dp.Encrypted {
-				needed = true
-			}
-		}
-	}
-	if !needed {
-		return &restore.Identities{}
-	}
-	path, err := config.ExpandHome(cfg.AgeIdentityFile)
-	var ids *restore.Identities
-	if err != nil {
-		ids = &restore.Identities{Err: err}
-	} else {
-		ids = restore.ReadIdentities(path, d.ReadIdentities)
-	}
-	if ids.Err != nil {
-		res.warn("age_identity_file: %v; encrypted dumps cannot be verified", ids.Err)
-	}
-	return ids
-}
-
 // latest finds the dump with TS = ts.
 func latest(dumps []*backup.Dump, ts string) *backup.Dump {
 	for _, dp := range dumps {
@@ -255,109 +220,6 @@ func latest(dumps []*backup.Dump, ts string) *backup.Dump {
 		}
 	}
 	return nil
-}
-
-// chooseImage (spec drill § Flow 3a): drill.image → extension mapping of the
-// databases to restore (postgis/timescaledb/vector → the vendor's own image) →
-// postgres:N-alpine, with N = max(major(pg_version), highest tool_version among
-// the dumps) → the instance's pg_major. pg_restore in the image must not be older
-// than the pg_dump that made the dump.
-func chooseImage(cfg *config.App, in config.Instance, im *backup.InstanceManifest, dbs []string) (string, error) {
-	if cfg.Drill != nil && cfg.Drill.Image != "" {
-		return cfg.Drill.Image, nil
-	}
-	tool := 0
-	var exts []pg.Extension
-	for _, db := range dbs {
-		dm := im.Databases[db]
-		if dp := latest(dm.Dumps, dm.Latest); dp != nil {
-			tool = max(tool, pg.MajorOf(dp.ToolVersion))
-			exts = append(exts, dp.Extensions...)
-		}
-	}
-	if g := latest(im.Globals.Dumps, im.Globals.Latest); g != nil {
-		tool = max(tool, pg.MajorOf(g.ToolVersion))
-	}
-	n := max(pg.MajorOf(im.PgVersion), tool)
-	if n == 0 {
-		n = in.PgMajor
-	}
-	if n == 0 {
-		return "", fmt.Errorf("cannot pick a Postgres image: manifest has no pg_version and instance has no pg_major; set drill.image in app.yaml")
-	}
-	return pg.ImageForExtensions(n, exts)
-}
-
-func runInstance(ctx context.Context, rt runtime, cfg *config.App, in config.Instance, im *backup.InstanceManifest, ids *restore.Identities, ir *InstanceResult, res *Result, d Deps) {
-	// Which databases to drill: has a latest dump, still in app.yaml, passes --database.
-	var dbs []string
-	for name, dm := range im.Databases {
-		if dm.Latest == "" || latest(dm.Dumps, dm.Latest) == nil {
-			continue
-		}
-		if !in.Databases.All && !inList(in.Databases.List, name) {
-			res.warn("%s/%s: in the bucket but not in app.yaml, skipped", in.Name, name)
-			continue
-		}
-		if d.Database != "" && name != d.Database {
-			continue
-		}
-		dbs = append(dbs, name)
-	}
-	sort.Strings(dbs)
-	if len(dbs) == 0 {
-		ir.Error = "no database dump to restore"
-		return
-	}
-	image, err := chooseImage(cfg, in, im, dbs)
-	if err != nil {
-		ir.Error = err.Error()
-		return
-	}
-	ir.Image = image
-
-	// Disk where the temporary Postgres writes: real data ≈ DiskFactor × compressed dump.
-	var need int64
-	for _, db := range dbs {
-		need += latest(im.Databases[db].Dumps, im.Databases[db].Latest).Bytes
-	}
-	if g := latest(im.Globals.Dumps, im.Globals.Latest); g != nil {
-		need += g.Bytes
-	}
-	t, err := rt.start(ctx, cfg, in, image, need*restore.DiskFactor, ir, res, d)
-	if err != nil {
-		ir.Error = err.Error()
-		return
-	}
-	defer func() {
-		if d.Keep {
-			rt.keep(t, ir)
-			return
-		}
-		rt.remove(ctx, t, res, in.Name)
-	}()
-
-	// Evidence of which extensions the image has (spec drill § Flow 3b); each
-	// database is checked against it before restore.
-	avail, err := t.client("postgres").AvailableExtensions(ctx)
-	if err != nil {
-		ir.Error = fmt.Sprintf("list extensions available in %s: %v", image, err)
-		return
-	}
-
-	if g := latest(im.Globals.Dumps, im.Globals.Latest); g != nil {
-		ir.Globals = restoreGlobals(ctx, t, g, ids, d)
-	}
-
-	ir.OK = true
-	for _, db := range dbs {
-		dm := im.Databases[db]
-		dr := restoreDatabase(ctx, cfg, t, db, latest(dm.Dumps, dm.Latest), avail, ids, d)
-		ir.Databases = append(ir.Databases, dr)
-		if !dr.OK {
-			ir.OK = false
-		}
-	}
 }
 
 // humanBytes as in the CLI, for disk messages.

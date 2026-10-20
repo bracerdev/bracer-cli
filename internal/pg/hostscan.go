@@ -22,28 +22,16 @@ type HostScan struct {
 	Warnings  []string
 }
 
-// ScanHost uses ss (Linux) or lsof (macOS) plus a socket glob; goos picks the
-// tool (runtime.GOOS in production, fixed in tests). Tool failures are not
-// fatal: record a warning, return what is available.
-func ScanHost(ctx context.Context, sh Shell, goos string) HostScan {
+// ScanHost uses `ss -ltnp` plus a socket glob. Tool failures are not fatal:
+// record a warning, return what is available.
+func ScanHost(ctx context.Context, sh Shell) HostScan {
 	hs := HostScan{Sockets: map[int]string{}}
-	var res Result
-	var err error
-	if goos == "linux" {
-		res, err = sh.Run(ctx, Cmd{Name: "ss", Args: []string{"-ltnpH"}})
-		if err == nil {
-			hs.Listeners = parseSS(string(res.Stdout))
-		}
-	} else {
-		res, err = sh.Run(ctx, Cmd{Name: "lsof", Args: []string{"-nP", "-iTCP", "-sTCP:LISTEN"}})
-		if err == nil {
-			hs.Listeners = parseLsof(string(res.Stdout))
-		}
+	res, err := sh.Run(ctx, Cmd{Name: "ss", Args: []string{"-ltnpH"}})
+	if err == nil {
+		hs.Listeners = parseSS(string(res.Stdout))
 	}
 	if err != nil {
 		hs.Warnings = append(hs.Warnings, fmt.Sprintf("could not list listening ports (%v); instances running as another user may be missing", err))
-	} else if missingProcess(hs.Listeners) {
-		hs.Warnings = append(hs.Warnings, "could not see the process behind some ports (permission denied); instances running as another user may be missing")
 	}
 	for _, dir := range []string{"/var/run/postgresql", "/tmp"} {
 		matches, _ := filepath.Glob(filepath.Join(dir, ".s.PGSQL.*"))
@@ -59,15 +47,6 @@ func ScanHost(ctx context.Context, sh Shell, goos string) HostScan {
 		}
 	}
 	return hs
-}
-
-func missingProcess(ls []Listener) bool {
-	for _, l := range ls {
-		if l.Process == "" {
-			return true
-		}
-	}
-	return false
 }
 
 // parseSS parses `ss -ltnpH`: LISTEN 0 244 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=1,fd=7))
@@ -90,23 +69,6 @@ func parseSS(out string) []Listener {
 			}
 		}
 		ls = append(ls, Listener{Addr: addr, Port: port, Process: proc})
-	}
-	return ls
-}
-
-// parseLsof parses `lsof -nP -iTCP -sTCP:LISTEN`: postgres 123 u 7u IPv4 … TCP 127.0.0.1:5432 (LISTEN)
-func parseLsof(out string) []Listener {
-	var ls []Listener
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 9 || f[0] == "COMMAND" {
-			continue
-		}
-		addr, port, ok := splitHostPort(f[8])
-		if !ok {
-			continue
-		}
-		ls = append(ls, Listener{Addr: addr, Port: port, Process: f[0]})
 	}
 	return ls
 }

@@ -18,19 +18,25 @@ import (
 
 // runDrill is `bracer drill` (spec backup/drill). Shares deps with backup:
 // drill does not connect to the real instance, it only needs the bucket and
-// Docker or kubectl for the temporary Postgres.
+// Docker for the temporary Postgres.
 func runDrill(ctx context.Context, args []string, d backupDeps) int {
 	fs := flag.NewFlagSet("drill", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	cfgPath := fs.String("c", "app.yaml", "path of app.yaml")
 	envFile := fs.String("env-file", "", "dotenv file with secrets (overrides secrets_file, overridden by the environment)")
-	keep := fs.Bool("keep", false, "keep the temporary Postgres container or pod for inspection")
+	keep := fs.Bool("keep", false, "keep the temporary Postgres container for inspection")
+	dryRun := fs.Bool("dry-run", false, "check Docker, the age key and the bucket; create nothing")
+	rtName := fs.String("runtime", "", "docker: run even when app.yaml says drill.runtime: none")
 	skipDisk := fs.Bool("skip-disk-check", false, "run even if the disk of the temporary Postgres seems short on space")
 	instance := fs.String("instance", "", "drill only this instance")
 	database := fs.String("database", "", "drill only this database")
 	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
-	verbose := fs.Bool("verbose", false, "log every docker and kubectl command")
+	verbose := fs.Bool("verbose", false, "log every docker command")
 	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *rtName != "" && *rtName != config.DrillRuntimeDocker {
+		fmt.Fprintf(d.stderr, "bracer drill: --runtime must be docker (ADR-0013)\n")
 		return exitUsage
 	}
 	level := slog.LevelInfo
@@ -52,6 +58,10 @@ func runDrill(ctx context.Context, args []string, d backupDeps) int {
 	if err != nil {
 		return fail(exitUsage, "%v", err)
 	}
+	d = d.withRuntime(cfg)
+	if cfg.DrillOff() && *rtName == "" {
+		return fail(exitUsage, "%v", drill.OffError(cfg.App))
+	}
 	secrets, warns, err := config.LoadSecrets(cfg, *envFile)
 	if err != nil {
 		return fail(exitUsage, "%v", err)
@@ -63,13 +73,17 @@ func runDrill(ctx context.Context, args []string, d backupDeps) int {
 	if err != nil {
 		return fail(exitUsage, "%v", err)
 	}
+	deps := drill.Deps{Shell: d.shell, Tools: d.tools(), Store: st, Log: logger, ConfigPath: absPath(*cfgPath), Keep: *keep, ForceDocker: *rtName != "", Instance: *instance, Database: *database, SkipDiskCheck: *skipDisk}
+	if *dryRun {
+		return dryRunDrill(ctx, cfg, deps, d, *asJSON, *cfgPath)
+	}
 	lock, err := backup.AcquireKind(*cfgPath, "drill")
 	if err != nil {
 		return fail(exitError, "%v", err)
 	}
 	defer lock.Release()
 
-	res, err := drill.Run(ctx, cfg, drill.Deps{Shell: d.shell, Tools: d.tools(), Store: st, Log: logger, Keep: *keep, Instance: *instance, Database: *database, SkipDiskCheck: *skipDisk})
+	res, err := drill.Run(ctx, cfg, deps)
 	if err != nil {
 		var ue *drill.UsageError
 		if errors.As(err, &ue) {
@@ -92,15 +106,51 @@ func runDrill(ctx context.Context, args []string, d backupDeps) int {
 	return exitOK
 }
 
+// dryRunDrill is `drill --dry-run` (spec drill AC): one line per check, the Fix
+// line under each failed one, exit 1 when any failed.
+func dryRunDrill(ctx context.Context, cfg *config.App, deps drill.Deps, d backupDeps, asJSON bool, cfgPath string) int {
+	res, err := drill.DryRun(ctx, cfg, deps)
+	if err != nil {
+		var ue *drill.UsageError
+		if errors.As(err, &ue) {
+			fmt.Fprintf(d.stderr, "bracer drill: %v\n", err)
+			return exitUsage
+		}
+		fmt.Fprintf(d.stderr, "bracer drill: %v\n", err)
+		return exitError
+	}
+	if asJSON {
+		enc := json.NewEncoder(d.stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(res)
+	} else {
+		fmt.Fprintf(d.stdout, "app %s (%s)\n", cfg.App, cfgPath)
+		for _, c := range res.Checks {
+			if c.OK {
+				fmt.Fprintf(d.stdout, "  ✓ %s: %s\n", c.Name, c.Detail)
+				continue
+			}
+			fmt.Fprintf(d.stdout, "  ✗ %s: %s\n", c.Name, c.Detail)
+			if c.Fix != "" {
+				fmt.Fprintf(d.stdout, "    Fix: %s\n", c.Fix)
+			}
+		}
+		fmt.Fprintf(d.stdout, "\nDry run: no container was created.\n")
+	}
+	if !res.OK {
+		return exitError
+	}
+	return exitOK
+}
+
 // printDrillResult prints one line per database (NFR observability).
 func printDrillResult(w io.Writer, res *drill.Result) {
 	for _, ir := range res.Instances {
 		if ir.Error != "" {
 			fmt.Fprintf(w, "✗ %s: %s\n", ir.Name, ir.Error)
-			continue
 		}
-		if g := ir.Globals; g != nil && !g.OK {
-			fmt.Fprintf(w, "! %s/globals: %s\n", ir.Name, firstLine(g.Error))
+		for _, n := range ir.Notes {
+			fmt.Fprintf(w, "  note: %s: %s\n", ir.Name, n)
 		}
 		for _, dr := range ir.Databases {
 			checks := ""
@@ -119,7 +169,7 @@ func printDrillResult(w io.Writer, res *drill.Result) {
 			}
 			fmt.Fprintf(w, "%s %s/%s: restored %s in %.1f s, %d/%d tables%s\n", mark, ir.Name, dr.DB, humanBytes(dr.Bytes), dr.RestoreSeconds, dr.TablesFound, dr.TablesExpected, checks)
 			for _, warn := range dr.Warnings {
-				fmt.Fprintf(w, "    warning: %s\n", warn)
+				fmt.Fprintf(w, "    warning: %s\n", strings.ReplaceAll(warn, "\n", "\n    "))
 			}
 			if dr.Error != "" {
 				fmt.Fprintf(w, "    %s\n", strings.ReplaceAll(dr.Error, "\n", "\n    "))
@@ -150,11 +200,7 @@ func printDrillResult(w io.Writer, res *drill.Result) {
 			}
 		}
 		if ir.Container != "" {
-			fmt.Fprintf(w, "kept container %s (holds your real data; remove it when done):\n  docker exec -it %s psql -U postgres\n  docker rm -f -v %s\n", ir.Container, ir.Container, ir.Container)
-		}
-		if ir.Pod != "" {
-			ns, name, _ := strings.Cut(ir.Pod, "/")
-			fmt.Fprintf(w, "kept pod %s (holds your real data; remove it when done):\n  %s exec -it -n %s %s -- psql -U postgres\n  %s delete -n %s pod/%s networkpolicy/%s\n", ir.Pod, ir.Kubectl, ns, name, ir.Kubectl, ns, name, name)
+			fmt.Fprintf(w, "kept container %s (holds your real data; remove it when done):\n  docker exec -it %s psql -U %s\n  docker rm -f -v %s\n", ir.Container, ir.Container, ir.User, ir.Container)
 		}
 	}
 	for _, wmsg := range res.Warnings {

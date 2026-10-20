@@ -3,55 +3,30 @@ package pg
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
-// Where is where Postgres runs. Exactly one field is set; all three empty means
-// Postgres is reached over TCP (host:port on this machine, or a connection string).
+// Where is where Postgres runs: a Docker container on this machine, a cluster
+// installed on this machine reached over its socket, or (empty) anything
+// reached over TCP with a connection string. → ADR-0013, ADR-0015
 type Where struct {
 	Container string
-	Pod       PodRef
-	SocketDir string
+	Local     *Local
 }
 
-// Tools is the tooling available in the environment (docker, kubectl, the
-// host's Postgres binaries) and the runner selection table per ADR-0009. Detection
-// results are cached for one CLI run. LookPath/Glob can be swapped in tests.
+// Tools is the runner selection table of ADR-0013 over one Shell. Detection
+// results are cached for one CLI run.
 type Tools struct {
-	Shell    Shell
-	GOOS     string
-	LookPath func(string) (string, error)
-	Glob     func(string) ([]string, error)
+	Shell Shell
+	// SocketOwner reads the owner of a local socket; nil: the file's owner on disk.
+	SocketOwner func(Local) (uid, gid int, err error)
 
-	local     *LocalTools
-	localDone bool
-	kube      *Kube
-	kubeDone  bool
-	dockerOK  *bool
-	hasTool   map[string]bool
+	dockerOK *bool
+	hasTool  map[string]bool
 }
 
-// NewTools uses the real lookups.
-func NewTools(sh Shell, goos string) *Tools {
-	return &Tools{Shell: sh, GOOS: goos}
-}
-
-// Local is the host's Postgres tool set; nil if there is none.
-func (t *Tools) Local(ctx context.Context) *LocalTools {
-	if !t.localDone {
-		t.local, _ = LocalFinder{Shell: t.Shell, LookPath: t.LookPath, Glob: t.Glob}.Find(ctx)
-		t.localDone = true
-	}
-	return t.local
-}
-
-// Kubectl is kubectl or k3s kubectl; nil if there is none.
-func (t *Tools) Kubectl() *Kube {
-	if !t.kubeDone {
-		t.kube, _ = FindKubectl(t.Shell, t.LookPath)
-		t.kubeDone = true
-	}
-	return t.kube
+// NewTools uses the given shell.
+func NewTools(sh Shell) *Tools {
+	return &Tools{Shell: sh}
 }
 
 // Docker is the Docker CLI through the same Shell.
@@ -78,76 +53,48 @@ func (t *Tools) cachedHasTool(key string, probe func() bool) bool {
 	return v
 }
 
-// localSearched is where pg_dump was looked for, for error messages.
-const localSearched = "PATH, /usr/lib/postgresql/*/bin, /usr/pgsql-*/bin, /opt/homebrew/opt/postgresql@*/bin"
-
-// Pick chooses a runner per the ADR-0009 table. major is the server's major (0
-// when unknown): host binaries older than the server are rejected.
+// Pick chooses a runner per ADR-0013. major is the server's major (0 when
+// unknown: the client image is used, whose psql reads older servers).
+//   - container → docker exec; no pg_dump inside → postgres:<major> on the container's network
+//   - local → docker run postgres:<major> --network none, socket mounted, as the socket's owner
+//   - URL → docker run postgres:<major> --network host
 func (t *Tools) Pick(ctx context.Context, w Where, major int) (Runner, error) {
 	image := ClientImage
 	if major > 0 {
 		image = ImageForMajor(major)
 	}
-	switch {
-	case w.Container != "":
+	if !t.DockerOK(ctx) {
+		return nil, fmt.Errorf("Docker is not available (`docker version` failed); bracer runs every Postgres tool through Docker")
+	}
+	if w.Local != nil {
+		owner := t.SocketOwner
+		if owner == nil {
+			owner = SocketOwner
+		}
+		uid, gid, err := owner(*w.Local)
+		if err != nil {
+			return nil, err
+		}
+		return SocketRunner{Shell: t.Shell, Image: image, Local: *w.Local, UID: uid, GID: gid}, nil
+	}
+	if w.Container != "" {
 		if t.cachedHasTool("container:"+w.Container, func() bool { return t.Docker().HasTool(ctx, w.Container, "pg_dump") }) {
 			return ExecRunner{Shell: t.Shell, Container: w.Container}, nil
 		}
+		// docker exec also fails when the container is stopped: say that rather
+		// than the image runner's "cannot join network namespace".
+		if st, err := t.Docker().ContainerState(ctx, w.Container); err != nil {
+			return nil, err
+		} else if st != "running" {
+			return nil, fmt.Errorf("container %s is not running (%s)\nFix: docker start %s", w.Container, st, w.Container)
+		}
 		return ImageRunner{Shell: t.Shell, Image: image, Network: "container:" + w.Container}, nil
-	case w.Pod.Name != "":
-		kube := t.Kubectl()
-		if kube == nil {
-			return nil, fmt.Errorf("kubectl not found (looked for kubectl and k3s on PATH); it is needed to reach pod %s", w.Pod)
-		}
-		if !t.cachedHasTool("pod:"+w.Pod.String(), func() bool { return kube.HasTool(ctx, w.Pod, "pg_dump") }) {
-			return nil, fmt.Errorf("pod %s has no pg_dump; use an image that ships the PostgreSQL client tools, or point bracer at the service with a postgres:// URL", w.Pod)
-		}
-		return KubeExecRunner{Kube: *kube, Pod: w.Pod}, nil
-	case w.SocketDir != "":
-		local := t.Local(ctx)
-		if local == nil {
-			return nil, fmt.Errorf("no pg_dump on this host (looked in %s); Postgres at %s is only reachable over its Unix socket. Install the PostgreSQL client package%s, or enable TCP and use host/port", localSearched, w.SocketDir, forMajor(major))
-		}
-		if major > 0 && local.Major < major {
-			return nil, fmt.Errorf("pg_dump %s in %s is older than PostgreSQL %d and cannot dump it; install the PostgreSQL %d client package", local.Version, local.Dir, major, major)
-		}
-		return LocalRunner{Shell: t.Shell, Tools: *local}, nil
-	default:
-		// Prefer the same major (ADR-0009 § Amendments): a pg_dump newer than the server
-		// produces an archive that a pg_restore of the server's major cannot read, and
-		// emits SET for parameters the old server does not know. Major unknown: ask via the host binary.
-		local := t.Local(ctx)
-		if local != nil && (major == 0 || local.Major == major) {
-			return LocalRunner{Shell: t.Shell, Tools: *local}, nil
-		}
-		if t.DockerOK(ctx) {
-			return NewHostRunnerFor(t.Shell, image, t.GOOS), nil
-		}
-		if local != nil && local.Major > major {
-			// No Docker: a newer binary still dumps correctly; the manifest records
-			// tool_version so drill/restore can pick a new enough pg_restore.
-			return LocalRunner{Shell: t.Shell, Tools: *local}, nil
-		}
-		var why []string
-		if local == nil {
-			why = append(why, "no pg_dump on this host (looked in "+localSearched+")")
-		} else {
-			why = append(why, fmt.Sprintf("pg_dump %s in %s is older than PostgreSQL %d", local.Version, local.Dir, major))
-		}
-		why = append(why, "Docker is not available (`docker version` failed)")
-		return nil, fmt.Errorf("%s; install the PostgreSQL client package%s or Docker", strings.Join(why, " and "), forMajor(major))
 	}
-}
-
-func forMajor(major int) string {
-	if major > 0 {
-		return fmt.Sprintf(" for PostgreSQL %d", major)
-	}
-	return ""
+	return NewURLRunner(t.Shell, image), nil
 }
 
 // Resolve picks a runner, asks the server for its version if unknown, then picks
-// again for the right major (host binary too old → Docker image). Returns the runner and major.
+// again for the right major. Returns the runner and major.
 func (t *Tools) Resolve(ctx context.Context, w Where, conn Conn, major int) (Runner, int, error) {
 	r, err := t.Pick(ctx, w, major)
 	if err != nil {

@@ -18,6 +18,9 @@ type Locale struct {
 	// Locale is ICU_LOCALE (icu) or BUILTIN_LOCALE (builtin).
 	Locale   string `json:"locale,omitempty"`
 	ICURules string `json:"icu_rules,omitempty"` // ICU_RULES, PG16+
+	// CollVersion is datcollversion (PG15+): the collation library's version.
+	// Another one on the target only changes sort order, so it is a warning.
+	CollVersion string `json:"collversion,omitempty"`
 }
 
 // providerNames maps the pg_database.datlocprovider letter to the name used in CREATE DATABASE.
@@ -30,23 +33,26 @@ func (c *Client) DatabaseLocale(ctx context.Context, db string, major int) (*Loc
 	cols := "pg_encoding_to_char(encoding), datcollate, datctype"
 	switch {
 	case major >= 17:
-		cols += ", datlocprovider::text, coalesce(datlocale, ''), coalesce(daticurules, '')"
+		cols += ", datlocprovider::text, coalesce(datlocale, ''), coalesce(daticurules, ''), coalesce(datcollversion, '')"
 	case major == 16:
-		cols += ", datlocprovider::text, coalesce(daticulocale, ''), coalesce(daticurules, '')"
+		cols += ", datlocprovider::text, coalesce(daticulocale, ''), coalesce(daticurules, ''), coalesce(datcollversion, '')"
 	case major == 15:
-		cols += ", datlocprovider::text, coalesce(daticulocale, ''), ''"
+		cols += ", datlocprovider::text, coalesce(daticulocale, ''), '', coalesce(datcollversion, '')"
 	default:
-		cols += ", 'c', '', ''"
+		cols += ", 'c', '', '', ''"
 	}
 	rows, err := c.Query(ctx, "select "+cols+" from pg_database where datname = "+QuoteLiteral(db))
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) != 1 || len(rows[0]) != 6 {
+	if len(rows) != 1 || len(rows[0]) < 6 {
 		return nil, fmt.Errorf("unexpected pg_database row for %s: %q", db, rows)
 	}
 	r := rows[0]
 	l := &Locale{Encoding: r[0], Collate: r[1], Ctype: r[2], Locale: r[4], ICURules: r[5]}
+	if len(r) > 6 {
+		l.CollVersion = r[6]
+	}
 	if r[0] == "" || r[1] == "" || r[2] == "" {
 		return nil, fmt.Errorf("pg_database has no encoding/locale for %s: %q", db, r)
 	}

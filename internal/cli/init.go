@@ -2,18 +2,21 @@ package cli
 
 import (
 	"context"
-
-	"bracer.dev/bracer/internal/backup"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"slices"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
+	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
 	"bracer.dev/bracer/internal/crypto"
 	"bracer.dev/bracer/internal/pg"
@@ -26,12 +29,15 @@ type initDeps struct {
 	shell    pg.Shell
 	probe    pg.Prober
 	newStore func(storage.S3Config) (storage.Store, error)
-	goos     string
-	lookPath func(string) (string, error) // nil: exec.LookPath; tests block kubectl/host binaries
-	glob     func(string) ([]string, error)
-	stdin    io.Reader
-	stdout   io.Writer
-	stderr   io.Writer
+	env      envDeps // step 0; its shell is replaced by shell
+	home     func() (string, error)
+	// runSelf runs this binary with args and exactly env (step 14); returns the exit code.
+	runSelf func(ctx context.Context, args, env []string, stdout, stderr io.Writer) int
+	// runTTY runs a command attached to the terminal (step 15: sudo bracer schedule install).
+	runTTY func(ctx context.Context, name string, args ...string) error
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
 }
 
 // initRun holds the state of one init run.
@@ -42,13 +48,18 @@ type initRun struct {
 	tools   *pg.Tools
 	docker  pg.Docker
 	cfg     *config.App
-	path    string
-	fresh   bool              // app.yaml does not exist yet
+	path    string // as given with -c
+	abs     string // absolute path of app.yaml
+	again   string // the command line typed, printed last when init stops for a fix
+	fresh   bool   // app.yaml does not exist yet
+	noDrill bool
+	// legacy are instances from before ADR-0013, to be picked again (spec init AC).
+	legacy []config.Instance
+	// loaded are the secrets of the existing app.yaml, to recognise an instance picked again.
+	loaded  *config.Secrets
 	secrets map[string]string // variable name → collected value, not written anywhere yet
-	verbose bool
-	// srcImage/srcKind: image of the chosen container or pod, used to fill drill.image (step 11b).
+	// srcImage: image of the chosen container, used to fill drill.image (step 11).
 	srcImage string
-	srcKind  string
 }
 
 // runInit is `bracer init` (spec backup/init § Flow).
@@ -56,7 +67,8 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	path := fs.String("c", "app.yaml", "path of app.yaml to create or extend")
-	verbose := fs.Bool("verbose", false, "print every docker, kubectl and pg_* command")
+	noDrill := fs.Bool("no-drill", false, "do not test-restore backups on this machine (drill.runtime: none)")
+	verbose := fs.Bool("verbose", false, "print every docker and pg_* command")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -64,13 +76,19 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 		sh.Verbose = *verbose
 		d.shell = sh
 	}
-	r := &initRun{initDeps: d, ctx: ctx, p: newPrompter(d.stdin, d.stdout), path: *path, verbose: *verbose,
-		docker: pg.Docker{Shell: d.shell}, secrets: map[string]string{}}
-	r.tools = &pg.Tools{Shell: d.shell, GOOS: d.goos, LookPath: d.lookPath, Glob: d.glob}
+	d.env.shell = d.shell
+	r := &initRun{initDeps: d, ctx: ctx, p: newPrompter(d.stdin, d.stdout), path: *path, abs: absPath(*path),
+		again: commandLine("init", args), noDrill: *noDrill, docker: pg.Docker{Shell: d.shell}, secrets: map[string]string{}}
+	r.tools = pg.NewTools(d.shell)
 	err := r.run()
 	switch {
 	case err == nil:
 		return exitOK
+	case errors.Is(err, errEnvBlocked), errors.Is(err, errSelfCheck):
+		return exitError
+	case errors.Is(err, errQuit):
+		fmt.Fprintf(d.stdout, "\nNothing written. Run again when ready:\n  %s\n", r.again)
+		return exitError
 	case errors.Is(err, ErrNoInput), errors.As(err, new(*usageError)):
 		fmt.Fprintln(d.stderr, "bracer init:", err)
 		return exitUsage
@@ -83,7 +101,7 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	}
 }
 
-// usageError is a usage error (exit 2): missing Docker, broken app.yaml…
+// usageError is a usage error (exit 2): broken app.yaml…
 type usageError struct{ err error }
 
 func (e *usageError) Error() string { return e.err.Error() }
@@ -93,71 +111,107 @@ func usageErrorf(format string, args ...interface{}) error {
 	return &usageError{err: fmt.Errorf(format, args...)}
 }
 
+var (
+	// errQuit: the user chose [q]; what to run is already printed.
+	errQuit = errors.New("quit")
+	// errSelfCheck: step 14 failed; the child's own error is already printed.
+	errSelfCheck = errors.New("self-check failed")
+)
+
 func (r *initRun) warn(format string, args ...interface{}) {
 	fmt.Fprintf(r.stderr, "warning: "+format+"\n", args...)
 }
 
 func (r *initRun) run() error {
-	if os.Geteuid() == 0 && os.Getenv("SUDO_USER") != "" {
-		r.warn("running under sudo: key and env files will belong to root; a cron job running as %s will not be able to read them", os.Getenv("SUDO_USER"))
+	// 0. Environment, before any question (same function as `bracer check`).
+	r.p.printf("Checking this machine:\n")
+	rep := checkEnv(r.ctx, r.env)
+	printEnv(r.stdout, rep, r.again)
+	if rep.Blocked() {
+		r.p.printf("\nNothing written.\n")
+		return errEnvBlocked
+	}
+	if rep.Runtime.User == "root" {
+		r.p.printf("Running as root: the key and env files go to root's home and the jobs will run as root.\n")
 	}
 	if err := r.loadOrCreate(); err != nil {
 		return err
 	}
-	// 1. Docker: optional (ADR-0009); without it containers are not listed and
-	// drill needs kubectl reaching a cluster (step 11c) to run on this machine.
-	if !r.tools.DockerOK(r.ctx) {
-		r.warn("Docker is not available (`docker version` failed): Docker containers will not be listed; `bracer drill` will run its temporary Postgres as a Kubernetes pod if kubectl reaches a cluster, otherwise not on this machine")
-	}
+	r.cfg.Runtime = rep.Runtime
 	if !r.fresh {
 		r.recheckExisting()
 	}
-	// 2–8. Instance
+	// 1–7. Instance
 	inst, err := r.pickInstance()
 	if err != nil {
 		return err
 	}
 	if inst != nil {
-		r.addInstance(*inst)
+		r.cfg.Instances = append(r.cfg.Instances, *inst)
 	}
-	// 9. Bucket
+	for _, in := range r.legacy {
+		r.warn("instance %s (%s, before ADR-0013) was not picked again and is left out of %s", in.Name, in.Legacy(), r.path)
+	}
+	// 8. Bucket
 	if r.cfg.Storage == nil {
 		if err := r.setupStorage(); err != nil {
 			return err
 		}
 	}
-	// 10. Encryption
+	// 9. Encryption
 	if r.cfg.Encryption == "" {
 		if err := r.setupEncryption(); err != nil {
 			return err
 		}
 	}
-	// 11. Secrets
+	// 12. Drill runtime
+	if r.noDrill {
+		if r.cfg.Drill == nil {
+			r.cfg.Drill = &config.Drill{}
+		}
+		r.cfg.Drill.Runtime = config.DrillRuntimeNone
+		r.cfg.Drill.Image = ""
+		r.p.printf("drill.runtime: none — backups on this machine will not be test-restored; every report will say so.\n")
+	}
+	// 10. Secrets
 	if err := r.storeSecrets(); err != nil {
 		return err
 	}
-	// 12. Write
+	// 13. Write
 	if err := config.Save(r.path, r.cfg); err != nil {
 		return err
 	}
-	r.p.printf("\nWrote %s.\n\nNext steps:\n  bracer backup --dry-run -c %s\n  bracer cron-example -c %s\n", r.path, r.path, r.path)
-	return nil
+	r.p.printf("\nWrote %s.\n", r.abs)
+	// 14–15.
+	if err := r.selfCheck(); err != nil {
+		return err
+	}
+	return r.offerSchedule()
 }
 
 // loadOrCreate reads an existing app.yaml (merge) or asks for the app name.
 func (r *initRun) loadOrCreate() error {
-	cfg, err := config.Load(r.path)
+	cfg, legacy, err := config.LoadForInit(r.path)
 	switch {
 	case err == nil:
-		r.cfg = cfg
-		r.p.printf("Found %s (app %q, %d instance(s)); new choices will be added to it.\n", r.path, cfg.App, len(cfg.Instances))
+		r.cfg, r.legacy = cfg, legacy
+		r.p.printf("\nFound %s (app %q, %d instance(s)); new choices will be added to it.\n", r.path, cfg.App, len(cfg.Instances))
+		for _, in := range legacy {
+			r.p.printf("  -  %s (%s) needs to be picked again: bracer no longer reaches Postgres that way (ADR-0013)\n", in.Name, in.Legacy())
+		}
+		if s, warns, err := config.LoadSecrets(cfg, ""); err == nil {
+			r.loaded = s
+			for _, w := range warns {
+				r.warn("%s", w)
+			}
+		}
 		return nil
 	case os.IsNotExist(err):
 		r.fresh = true
 		wd, _ := os.Getwd()
 		def := sanitizeName(filepath.Base(wd))
 		for {
-			name, err := r.p.ask("App name (lowercase, used in bucket paths and variable names)", def)
+			name, err := r.p.ask("\nApp name (lowercase, used in bucket paths and variable names)", def)
 			if err != nil {
 				return err
 			}
@@ -175,16 +229,11 @@ func (r *initRun) loadOrCreate() error {
 
 // recheckExisting re-tests the connection to every existing instance and reports the broken ones (last AC).
 func (r *initRun) recheckExisting() {
-	secrets, warns, err := config.LoadSecrets(r.cfg, "")
-	for _, w := range warns {
-		r.warn("%s", w)
-	}
-	if err != nil {
-		r.warn("could not load secrets to re-test existing instances: %v", err)
+	if r.loaded == nil || len(r.cfg.Instances) == 0 {
 		return
 	}
 	for _, in := range r.cfg.Instances {
-		conn, runner, err := backup.Connect(r.ctx, r.tools, in, secrets)
+		conn, runner, err := backup.Connect(r.ctx, r.tools, in, r.loaded)
 		if err == nil {
 			err = (&pg.Client{Runner: runner, Conn: conn}).Ping(r.ctx)
 		}
@@ -196,66 +245,86 @@ func (r *initRun) recheckExisting() {
 	}
 }
 
-// pickInstance is steps 2–8: discover, pick, connect, version, databases, permissions, pooler.
+// target is how the picked instance is reached while init talks to it.
+type target struct {
+	where pg.Where
+	conn  pg.Conn
+	// host:port of Postgres on this machine (or typed by hand): init asks a user
+	// and password and builds the URL itself (spec init § Flow 4).
+	hostPort string
+	// fromURL: the user pasted a URL.
+	fromURL bool
+}
+
+// sudoPsql is the command that opens psql as the postgres OS user on this
+// machine; a cluster on another port (apt numbers a second one 5433) needs -p.
+func sudoPsql(hostPort string) string {
+	if _, port, err := net.SplitHostPort(hostPort); err == nil && port != "5432" {
+		return "sudo -u postgres psql -p " + port
+	}
+	return "sudo -u postgres psql"
+}
+
+func (t target) isURL() bool { return t.hostPort != "" || t.fromURL }
+
+// useLocal points the instance at the local cluster's socket: user postgres, peer.
+func (r *initRun) useLocal(inst *config.Instance, t *target, l pg.Local) {
+	inst.Local = &config.Local{Port: l.Port}
+	if l.Dir != config.DefaultSocketDir {
+		inst.Local.SocketDir = l.Dir
+	}
+	inst.User = "postgres"
+	t.conn.User = "postgres"
+	t.where = pg.Where{Local: &l}
+}
+
+// localSocket: the typed address is this machine and a socket has its port.
+func (r *initRun) localSocket(hs pg.HostScan, t target) (int, string) {
+	hp := t.hostPort
+	if t.fromURL {
+		hp = net.JoinHostPort(t.conn.Host, strconv.Itoa(t.conn.Port))
+	}
+	host, ps, err := net.SplitHostPort(hp)
+	if err != nil {
+		return 0, ""
+	}
+	switch host {
+	case "127.0.0.1", "localhost", "::1", "":
+	default:
+		return 0, ""
+	}
+	port, _ := strconv.Atoi(ps)
+	return port, hs.Sockets[port]
+}
+
+// pickInstance is steps 1–7: discover, pick, connect, version, databases, permissions, pooler.
 // Returns nil if the user skips this instance.
 func (r *initRun) pickInstance() (*config.Instance, error) {
-	r.p.printf("\nLooking for Postgres (Docker containers, Kubernetes pods, local ports, sockets)...\n")
-	var containers []*pg.Container
-	if r.tools.DockerOK(r.ctx) {
-		var err error
-		containers, err = r.docker.ListPostgresContainers(r.ctx)
-		if err != nil {
-			return nil, err
-		}
+	r.p.printf("\nLooking for Postgres (Docker containers, sockets and TCP ports on this machine)...\n")
+	containers, err := r.docker.ListPostgresContainers(r.ctx)
+	if err != nil {
+		return nil, err
 	}
-	k8s := 0
-	for _, c := range containers {
-		if c.Kubernetes {
-			k8s++
-		}
-	}
-	var pods []*pg.Pod
-	kube := r.tools.Kubectl()
-	if kube != nil {
-		var err error
-		pods, err = kube.ListPostgresPods(r.ctx)
-		if err != nil {
-			if hint := pg.KubeHint(err); hint != "" {
-				r.warn("could not list Kubernetes pods: %v\n  %s", err, hint)
-			} else {
-				r.warn("could not list Kubernetes pods: %v", err)
-			}
-		}
-	}
-	// A pod with only env hints (app pods connecting to a DB have them too) whose
-	// process could not be checked: no conclusion → not listed, only noted in one line.
-	var unchecked []string
-	pods = slices.DeleteFunc(pods, func(p *pg.Pod) bool {
-		if p.Unverified && p.EnvOnly {
-			unchecked = append(unchecked, p.Ref.String())
-			return true
-		}
-		return false
-	})
-	hs := pg.ScanHost(r.ctx, r.shell, r.tools.GOOS)
-	shown, warns := pg.Discover(r.ctx, containers, pods, hs, r.probe)
-	for _, w := range warns {
+	hs := pg.ScanHost(r.ctx, r.shell)
+	disc := pg.Discover(r.ctx, containers, hs, r.probe)
+	disc.Kubernetes = append(disc.Kubernetes, pg.KubernetesSigns()...)
+	for _, w := range disc.Warnings {
 		r.warn("%s", w)
 	}
+	shown := disc.Candidates
 	r.p.printf("\n")
 	for i, c := range shown {
 		r.p.printf("  %d) %s\n", i+1, c.Label())
 	}
-	if k8s > 0 && kube == nil {
-		r.p.printf("  -  %d Kubernetes container(s) seen through Docker; install kubectl (or run on a node that has k3s) so bracer can list the pods\n", k8s)
-	}
-	if len(unchecked) > 0 {
-		r.p.printf("  -  %d pod(s) have Postgres-like variables but could not be checked for a postgres process (no shell in the container): %s; if one of them is your server, enter it as namespace/pod/container\n", len(unchecked), strings.Join(unchecked, ", "))
+	if len(disc.Kubernetes) > 0 {
+		r.p.printf("  -  Kubernetes is not supported (seen: %s).\n"+
+			"     bracer does not reach pods. Run Postgres in Docker on this machine, or enter a\n"+
+			"     postgres:// URL to a Service or NodePort this machine can reach (m).\n", strings.Join(disc.Kubernetes, ", "))
 	}
 	if len(shown) == 0 {
 		r.p.printf("  No Postgres found.\n")
 	}
-	r.p.printf("  m) enter host:port, a postgres:// URL, or namespace/pod[/container] manually\n")
+	r.p.printf("  m) enter host:port or a postgres:// URL manually\n")
 	var cand *pg.Candidate
 	idx, key, err := r.p.choose("Pick an instance (number or m)", len(shown), "m")
 	if err != nil {
@@ -266,8 +335,7 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 	}
 
 	inst := config.Instance{}
-	conn := pg.Conn{Database: "postgres"}
-	var where pg.Where
+	t := target{conn: pg.Conn{Database: "postgres"}}
 	switch {
 	case cand != nil && cand.Container != nil:
 		ct := cand.Container
@@ -276,92 +344,66 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 			return nil, nil
 		}
 		inst.Container = ct.Name
-		r.srcImage, r.srcKind = ct.Image, "container"
+		r.srcImage = ct.Image
 		inst.User = ct.DefaultUser()
-		conn.User = inst.User
-		where = pg.Where{Container: ct.Name}
-	case cand != nil && cand.Pod != nil:
-		p := cand.Pod
-		if !p.Ready {
-			r.p.printf("Pod %s/%s is not ready; it cannot be tested now. Wait for it and run init again.\n", p.Ref.Namespace, p.Ref.Name)
-			return nil, nil
-		}
-		inst.Pod = p.Ref.String()
-		r.srcImage, r.srcKind = p.Image, "pod"
-		inst.User = r.podUser(p)
-		conn.User = inst.User
-		where = pg.Where{Pod: p.Ref}
-	case cand != nil && cand.Host == "":
-		dir := filepath.Dir(cand.Socket)
-		inst.Socket = dir
-		if cand.Port != 5432 {
-			inst.Port = cand.Port
-		}
-		conn.Host, conn.Port = dir, cand.Port
-		inst.User, conn.User = "postgres", "postgres"
-		where = pg.Where{SocketDir: dir}
+		t.conn.User = inst.User
+		t.where = pg.Where{Container: ct.Name}
+	case cand != nil && cand.Local != nil:
+		r.useLocal(&inst, &t, *cand.Local)
 	case cand != nil:
-		host := cand.Host
-		switch host {
-		case "0.0.0.0", "::", "::1", "127.0.0.1":
-			host = "localhost"
-		}
-		inst.Host, inst.Port = host, cand.Port
-		conn.Host, conn.Port = host, cand.Port
-		inst.User = "postgres"
-		conn.User = inst.User
+		t.hostPort = net.JoinHostPort(strings.Trim(cand.URLHost(), "[]"), strconv.Itoa(cand.Port))
 	default:
-		s, err := r.p.askRequired("host:port, postgres://user:password@host:port/db?sslmode=…, or namespace/pod[/container]")
+		s, err := r.p.askRequired("host:port, or postgres://user:password@host:port/db?sslmode=…")
 		if err != nil {
 			return nil, err
 		}
-		if isPodRef(s) {
-			// The image gave no sign to list it automatically: a postgres process is still required.
-			p, err := r.verifyPod(s)
-			if err != nil {
-				r.p.printf("%v\n", err)
-				return nil, nil
-			}
-			inst.Pod = p.Ref.String()
-			r.srcImage, r.srcKind = p.Image, "pod"
-			inst.User = r.podUser(p)
-			conn.User = inst.User
-			where = pg.Where{Pod: p.Ref}
-		} else if strings.HasPrefix(s, "postgres://") || strings.HasPrefix(s, "postgresql://") {
+		if strings.HasPrefix(s, "postgres://") || strings.HasPrefix(s, "postgresql://") {
 			c, err := pg.ParseURL(s)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("%v (characters such as @ : / %% in the user or password must be percent-encoded)", err)
 			}
-			conn = c
-			inst.URLEnv = "pending" // named once the instance name is known
+			t.conn, t.fromURL = c, true
 			r.secrets["__url__"] = s
 		} else {
 			host, port, ok := splitHostPort(s)
 			if !ok {
 				return nil, fmt.Errorf("expected host:port, got %q", s)
 			}
-			inst.Host, inst.Port = host, port
-			conn.Host, conn.Port = host, port
-			inst.User, conn.User = "postgres", "postgres" // asked again when the server requires authentication
+			t.hostPort = net.JoinHostPort(host, strconv.Itoa(port))
+		}
+		// A local address whose port has a socket here is the local cluster:
+		// offer the full backup through the socket (ADR-0015).
+		if port, sock := r.localSocket(hs, t); sock != "" {
+			ok, err := r.p.yesNo(fmt.Sprintf("This is the local Postgres on port %d. Back it up through its socket instead (full backup: users, privileges, settings)?", port), true)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				delete(r.secrets, "__url__")
+				t = target{conn: pg.Conn{Database: "postgres"}}
+				r.useLocal(&inst, &t, pg.Local{Dir: filepath.Dir(sock), Port: port})
+			}
 		}
 	}
-	// 4. Runner per ADR-0009, major not known yet; re-picked after asking the version.
-	runner, err := r.tools.Pick(r.ctx, where, 0)
+	if t.isURL() {
+		inst.URLEnv = "pending" // named once the instance name is known
+		r.p.printf("URL source: bracer backs up the databases only, not users, privileges or server settings.\n" +
+			"To back up everything, run bracer on the machine where Postgres runs.\n")
+	}
+	// 3. Runner per ADR-0013, major not known yet; re-picked after asking the version.
+	runner, err := r.tools.Pick(r.ctx, t.where, 0)
 	if err != nil {
 		r.p.printf("Cannot reach this Postgres from here: %v\n", err)
 		return nil, nil
 	}
-	if ir, ok := runner.(pg.ImageRunner); ok && where.Container != "" {
-		r.p.printf("Container %s has no pg_dump; using %s on its network.\n", where.Container, ir.Image)
+	if ir, ok := runner.(pg.ImageRunner); ok && t.where.Container != "" {
+		r.p.printf("Container %s has no pg_dump; using %s on its network.\n", t.where.Container, ir.Image)
 	}
 
-	// Instance name; same target as an existing instance → add databases to it.
-	var existing *config.Instance
-	for i := range r.cfg.Instances {
-		if sameTarget(r.cfg.Instances[i], inst) {
-			existing = &r.cfg.Instances[i]
-		}
-	}
+	// Instance name; same target as an existing instance → add databases to it;
+	// an instance from before ADR-0013 → keep its name and databases.
+	existing := r.findSame(inst, t)
+	var replaced *config.Instance
 	if existing != nil {
 		ok, err := r.p.yesNo(fmt.Sprintf("Instance %q in %s already points here. Add databases to it?", existing.Name, r.path), true)
 		if err != nil {
@@ -371,14 +413,23 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 			return nil, nil
 		}
 		inst.Name = existing.Name
+		if t.isURL() {
+			inst.URLEnv = existing.URLEnv
+		}
+	} else if replaced, err = r.pickLegacy(); err != nil {
+		return nil, err
+	} else if replaced != nil {
+		inst.Name = replaced.Name
+		inst.Databases = replaced.Databases
 	} else {
-		def := "local"
-		if cand != nil {
+		def := "cloud"
+		switch {
+		case inst.Local != nil:
+			def = fmt.Sprintf("local-%d", inst.Local.Port)
+		case cand != nil:
 			def = cand.SuggestName()
-		} else if inst.Host != "" {
-			def = sanitizeName(fmt.Sprintf("%s-%d", inst.Host, inst.Port))
-		} else {
-			def = "cloud"
+		case t.hostPort != "":
+			def = sanitizeName(strings.NewReplacer(":", "-", "[", "", "]", "").Replace(t.hostPort))
 		}
 		for {
 			name, err := r.p.ask("Instance name", def)
@@ -395,81 +446,116 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 	}
 	if inst.URLEnv == "pending" {
 		inst.URLEnv = config.EnvVarName(r.cfg.App, inst.Name, "url")
+	}
+	if t.fromURL {
 		r.secrets[inst.URLEnv] = r.secrets["__url__"]
 		delete(r.secrets, "__url__")
-		inst.User = ""
 	}
 
-	// 5. Test connection; auth error → ask for user + password.
-	client := &pg.Client{Runner: runner, Conn: conn}
-	if err := r.connectLoop(client, &inst); err != nil {
+	// 4. Test connection; host:port → user + password → URL; auth error → ask.
+	client := &pg.Client{Runner: runner, Conn: t.conn}
+	if t.hostPort != "" {
+		r.p.printf("\nPostgres on %s is reached over TCP with a user and a password.\n"+
+			"If you only ever use `sudo -u postgres psql`, create a backup user first:\n\n  %s\n%s\n\n", t.hostPort, sudoPsql(t.hostPort), indent(pg.FixRoleSQL("bracer_backup", 0), "  "))
+		if err := r.askHostLogin(client, &inst, t.hostPort, "bracer_backup"); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.connectLoop(client, &inst, t); err != nil {
 		if errors.Is(err, errSkipInstance) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	// 4. Version → pg_major; re-pick the runner for the right major (host binary too old → image).
+	// 3. Version → pg_major and system_id; pull postgres:N; re-pick the runner for the right major.
 	_, major, err := client.ServerVersionNum(r.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("show server_version_num: %w", err)
 	}
 	inst.PgMajor = major
-	if client.Runner, err = r.tools.Pick(r.ctx, where, major); err != nil {
+	if client.Runner, err = r.tools.Pick(r.ctx, t.where, major); err != nil {
 		r.p.printf("Cannot back up PostgreSQL %d from here: %v\n", major, err)
 		return nil, nil
 	}
+	if ir, ok := client.Runner.(pg.ImageRunner); ok {
+		r.p.printf("Pulling %s (backup runs pg_dump from it)...\n", ir.Image)
+		if err := r.docker.Pull(r.ctx, ir.Image); err != nil {
+			r.p.printf("  ✗ %v\n  Fix: check this machine reaches the registry (docker pull %s), then run: %s\n", err, ir.Image, r.again)
+			return nil, nil
+		}
+	}
 	r.p.printf("Connected: PostgreSQL %d via %s\n", major, client.Runner.Describe())
+	if id, err := client.SystemIdentifier(r.ctx); err == nil {
+		inst.SystemID = id
+	} else {
+		r.p.printf("system_identifier is not readable here (%s); backup will not check that this stays the same cluster.\n", firstLine(err.Error()))
+	}
 
-	// 8. Pooler
+	// 7. Pooler
 	if ok, why := client.DetectPooler(r.ctx); ok {
 		r.warn("this looks like a connection pooler (%s). pg_dump through a transaction-mode pooler fails; point bracer at Postgres directly.", why)
 	}
 
-	// 6. Database
-	dbs, err := client.ListDatabases(r.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list databases: %w", err)
-	}
-	if len(dbs) == 0 {
-		return nil, fmt.Errorf("no databases found")
-	}
-	r.p.printf("\nDatabases:\n")
-	for i, db := range dbs {
-		r.p.printf("  %d) %s\n", i+1, db)
-	}
-	all, dbIdx, err := r.p.chooseMany("Databases to back up (numbers separated by commas, or all)", len(dbs))
-	if err != nil {
-		return nil, err
-	}
+	// 5. Databases (an instance picked again keeps its list).
 	var selected []string
-	if all {
-		inst.Databases = config.Databases{All: true}
-		selected = dbs
+	if replaced != nil && !inst.Databases.All {
+		for _, db := range inst.Databases.List {
+			selected = append(selected, db.Name)
+		}
+		r.p.printf("Keeping the databases of %s: %s\n", inst.Name, strings.Join(selected, ", "))
 	} else {
-		for _, i := range dbIdx {
-			selected = append(selected, dbs[i])
-			inst.Databases.List = append(inst.Databases.List, config.Database{Name: dbs[i]})
+		dbs, err := client.ListDatabases(r.ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list databases: %w", err)
+		}
+		if len(dbs) == 0 {
+			return nil, fmt.Errorf("no databases found")
+		}
+		if replaced != nil {
+			selected = dbs
+			r.p.printf("Keeping databases: all of %s (%s)\n", inst.Name, strings.Join(dbs, ", "))
+		} else {
+			r.p.printf("\nDatabases:\n")
+			for i, db := range dbs {
+				r.p.printf("  %d) %s\n", i+1, db)
+			}
+			all, dbIdx, err := r.p.chooseMany("Databases to back up (numbers separated by commas, or all)", len(dbs))
+			if err != nil {
+				return nil, err
+			}
+			if all {
+				inst.Databases = config.Databases{All: true}
+				selected = dbs
+			} else {
+				for _, i := range dbIdx {
+					selected = append(selected, dbs[i])
+					inst.Databases.List = append(inst.Databases.List, config.Database{Name: dbs[i]})
+				}
+			}
 		}
 	}
 
-	// 7. Permissions
-	kept, err := r.checkPermissions(client, &inst, selected)
+	// 6. Permissions
+	kept, err := r.checkPermissions(client, &inst, t, selected)
 	if err != nil {
 		return nil, err
 	}
 	if !kept {
 		return nil, nil
 	}
-	// 11b. Drill image
-	if err := r.chooseDrillImage(client, &inst, selected); err != nil {
-		return nil, err
+	if replaced != nil {
+		r.dropLegacy(replaced.Name)
 	}
-	// 11c. Drill runtime: a pod through kubectl when this machine has no Docker.
-	r.chooseDrillRuntime(&inst)
+	// 11. Drill image
+	if !r.noDrill {
+		if err := r.chooseDrillImage(client, &inst, selected); err != nil {
+			return nil, err
+		}
+	}
 
 	if existing != nil {
 		mergeDatabases(existing, inst)
-		existing.PgMajor = inst.PgMajor
+		existing.PgMajor, existing.SystemID = inst.PgMajor, inst.SystemID
 		if inst.PasswordEnv != "" {
 			existing.PasswordEnv = inst.PasswordEnv
 		}
@@ -478,68 +564,99 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 	return &inst, nil
 }
 
-// podUser picks the first user to try for a pod: env in the spec, env resolved
-// inside the container or the OS user of the postgres process, then the default
-// for the image (supabase_admin/postgres). If wrong, connectLoop asks when the
-// server reports the user does not exist; no further guessing.
-func (r *initRun) podUser(p *pg.Pod) string {
-	if p.Env["POSTGRES_USER"] == "" && p.Env["POSTGRESQL_USERNAME"] == "" {
-		if k := r.tools.Kubectl(); k != nil {
-			if u := k.ContainerUser(r.ctx, p.Ref, p.PgPID); u != "" {
-				return u
+// findSame returns the instance of app.yaml that points at the same Postgres:
+// same container, or a URL to the same host:port.
+func (r *initRun) findSame(inst config.Instance, t target) *config.Instance {
+	for i := range r.cfg.Instances {
+		ex := &r.cfg.Instances[i]
+		switch {
+		case inst.Container != "" && ex.Container == inst.Container:
+			return ex
+		case inst.Local != nil && ex.Local != nil && ex.Local.Port == inst.Local.Port && ex.Local.Dir() == inst.Local.Dir():
+			return ex
+		case t.isURL() && ex.URLEnv != "" && r.loaded != nil:
+			v, err := r.loaded.Require(ex.URLEnv)
+			if err != nil {
+				continue
+			}
+			c, err := pg.ParseURL(v)
+			if err != nil {
+				continue
+			}
+			hp := t.hostPort
+			if t.fromURL {
+				hp = net.JoinHostPort(t.conn.Host, strconv.Itoa(t.conn.Port))
+			}
+			if net.JoinHostPort(c.Host, strconv.Itoa(c.Port)) == hp {
+				return ex
 			}
 		}
 	}
-	return p.DefaultUser()
+	return nil
 }
 
-// verifyPod takes a manually entered ns/pod[/container] and checks for a postgres process.
-func (r *initRun) verifyPod(s string) (*pg.Pod, error) {
-	ref, err := pg.ParsePodRef(s)
-	if err != nil {
+// pickLegacy asks whether the picked Postgres replaces an instance from before ADR-0013.
+func (r *initRun) pickLegacy() (*config.Instance, error) {
+	if len(r.legacy) == 0 {
+		return nil, nil
+	}
+	r.p.printf("\nIs this the new way to reach an instance that needs to be picked again? It keeps its name, databases and retention.\n")
+	for i, in := range r.legacy {
+		r.p.printf("  %d) %s (%s)\n", i+1, in.Name, in.Legacy())
+	}
+	r.p.printf("  n) no, a new instance\n")
+	idx, key, err := r.p.choose("Pick (number or n)", len(r.legacy), "n")
+	if err != nil || key == "n" {
 		return nil, err
 	}
-	k := r.tools.Kubectl()
-	if k == nil {
-		return nil, fmt.Errorf("kubectl (or k3s) was not found on this machine, so pod %s cannot be reached", s)
+	in := r.legacy[idx]
+	return &in, nil
+}
+
+func (r *initRun) dropLegacy(name string) {
+	for i, in := range r.legacy {
+		if in.Name == name {
+			r.legacy = append(r.legacy[:i], r.legacy[i+1:]...)
+			return
+		}
 	}
-	pid, err := k.PostgresProcess(r.ctx, ref)
+}
+
+// askHostLogin asks user and password for Postgres at hostPort, builds the URL
+// (percent-encoded) into the instance's secret and the client's Conn.
+func (r *initRun) askHostLogin(client *pg.Client, inst *config.Instance, hostPort, defUser string) error {
+	u, err := r.p.ask("User", defUser)
 	if err != nil {
-		// The user named the pod themselves: do not block, but say clearly it is unverified.
-		r.warn("could not look for a postgres process in %s (%v%s); continuing because you named it", s, err, hintSuffix(pg.KubeHint(err)))
-		return &pg.Pod{Ref: ref, Ready: true, Unverified: true, Env: map[string]string{}}, nil
+		return err
 	}
-	if pid == "" {
-		return nil, fmt.Errorf("no postgres process is running in %s; pick the container that runs the server", s)
+	pw, err := r.p.askSecret("Password")
+	if err != nil {
+		return err
 	}
-	p := &pg.Pod{Ref: ref, Ready: true, HasPgProc: true, PgPID: pid, Env: map[string]string{}}
-	// Image to fill drill.image (step 11b); if it cannot be read leave it empty, drill picks on its own.
-	if img, err := k.PodImage(r.ctx, ref); err == nil {
-		p.Image = img
-	} else {
-		r.warn("could not read the image of %s (%v); drill will pick an image from the extensions in use", s, err)
+	raw := buildURL(u, pw, hostPort, "postgres")
+	c, err := pg.ParseURL(raw)
+	if err != nil {
+		return err
 	}
-	return p, nil
+	client.Conn = c
+	r.secrets[inst.URLEnv] = raw
+	return nil
 }
 
-// isPodRef: ns/pod[/container], not a URL or host:port.
-func isPodRef(s string) bool {
-	return strings.Contains(s, "/") && !strings.Contains(s, "://") && !strings.Contains(s, ":")
-}
-
-func hintSuffix(h string) string {
-	if h == "" {
-		return ""
-	}
-	return " (" + h + ")"
+// buildURL is postgres://user:password@host:port/db with user and password percent-encoded.
+func buildURL(user, password, hostPort, db string) string {
+	u := url.URL{Scheme: "postgres", User: url.UserPassword(user, password), Host: hostPort, Path: "/" + db}
+	return u.String()
 }
 
 // errSkipInstance: the user cannot go on with this instance; skip it, write nothing.
 var errSkipInstance = errors.New("skip instance")
 
-// connectLoop tries to connect without a password; on an auth failure it asks,
-// other errors offer a retry.
-func (r *initRun) connectLoop(client *pg.Client, inst *config.Instance) error {
+var reHbaHost = regexp.MustCompile(`no pg_hba\.conf entry for host "([^"]+)"`)
+
+// connectLoop tries to connect; on an auth failure it asks (user and password
+// for host:port, password for a container or pasted URL), other errors offer a retry.
+func (r *initRun) connectLoop(client *pg.Client, inst *config.Instance, t target) error {
 	for {
 		err := client.Ping(r.ctx)
 		if err == nil {
@@ -547,24 +664,35 @@ func (r *initRun) connectLoop(client *pg.Client, inst *config.Instance) error {
 		}
 		if isNoSuchDB(err) && client.Conn.Database == "postgres" {
 			client.Conn.Database = "template1"
+			if t.isURL() {
+				r.secrets[inst.URLEnv] = withDatabase(r.secrets[inst.URLEnv], "template1")
+			}
 			continue
 		}
-		if pg.IsAuthError(err) && inst.Pod != "" {
-			r.p.printf("Authentication required, but a password cannot be passed through kubectl exec (%v).\nPoint bracer at the service with a postgres:// URL instead (option m).\n", err)
-			return errSkipInstance
+		if m := reHbaHost.FindStringSubmatch(err.Error()); m != nil {
+			where := ""
+			if t.hostPort != "" {
+				where = fmt.Sprintf(" (find it with: %s -Atc 'show hba_file')", sudoPsql(t.hostPort))
+			}
+			r.p.printf("Postgres refused the connection: pg_hba.conf has no line for %s.\nAdd this line to pg_hba.conf%s, then reload Postgres (sudo systemctl reload postgresql, or SELECT pg_reload_conf()):\n\n  host all %s %s/32 scram-sha-256\n\n", m[1], where, orAll(client.Conn.User), m[1])
+			_, key, err := r.p.choose("[r] retry  [q] quit", 0, "r", "q")
+			if err != nil {
+				return err
+			}
+			if key == "q" {
+				return errQuit
+			}
+			continue
 		}
-		if pg.IsAuthError(err) && inst.Socket != "" && strings.Contains(err.Error(), "Peer authentication failed") {
-			r.p.printf("Peer authentication failed: over this socket Postgres only accepts the OS user of the same name.\nRun `sudo -u postgres bracer init` (key and env files will then belong to postgres, as should the cron job), or use a user with a password over TCP.\n")
+		if pg.IsAuthError(err) && t.hostPort != "" {
+			r.p.printf("Authentication failed: %s\nNo user with a password yet? Create one with `%s`:\n%s\n", firstLine(err.Error()), sudoPsql(t.hostPort), indent(pg.FixRoleSQL("bracer_backup", 0), "  "))
+			if err := r.askHostLogin(client, inst, t.hostPort, client.Conn.User); err != nil {
+				return err
+			}
+			continue
 		}
 		if pg.IsAuthError(err) {
 			r.p.printf("Authentication required.\n")
-			if inst.URLEnv == "" {
-				u, err := r.p.ask("User", client.Conn.User)
-				if err != nil {
-					return err
-				}
-				client.Conn.User, inst.User = u, u
-			}
 			pw, err := r.p.askSecret("Password")
 			if err != nil {
 				return err
@@ -579,8 +707,8 @@ func (r *initRun) connectLoop(client *pg.Client, inst *config.Instance) error {
 			}
 			continue
 		}
-		if isNoSuchRole(err) && inst.URLEnv == "" {
-			// The image runs with a different POSTGRES_USER that init could not read (Secret).
+		if isNoSuchRole(err) && t.hostPort == "" && inst.URLEnv == "" {
+			// The image runs with a different POSTGRES_USER that init could not read.
 			r.p.printf("User %s does not exist on this server; it was probably started with another POSTGRES_USER.\n", client.Conn.User)
 			u, err := r.p.ask("User", client.Conn.User)
 			if err != nil {
@@ -595,18 +723,52 @@ func (r *initRun) connectLoop(client *pg.Client, inst *config.Instance) error {
 			return aerr
 		}
 		if !again {
-			return fmt.Errorf("connection failed")
+			return errSkipInstance
 		}
 	}
 }
 
-// checkPermissions is step 7 for each database. Returns kept=false if the user drops the instance.
-func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs []string) (bool, error) {
+func orAll(user string) string {
+	if user == "" {
+		return "all"
+	}
+	return user
+}
+
+func indent(s, prefix string) string {
+	return prefix + strings.ReplaceAll(s, "\n", "\n"+prefix)
+}
+
+// psqlCommand opens psql on the instance for the user to run the SQL (spec init
+// AC permissions): no secret in it, psql asks for the password.
+func (r *initRun) psqlCommand(inst config.Instance, conn pg.Conn, db string) string {
+	if inst.Container != "" {
+		return fmt.Sprintf("docker exec -it %s psql -U %s %s", inst.Container, orDefault(conn.User, "postgres"), db)
+	}
+	return fmt.Sprintf("docker run --rm -it --network host %s psql -h %s -p %d -U %s %s", pg.ImageForMajor(inst.PgMajor), conn.Host, conn.Port, orDefault(conn.User, "postgres"), db)
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+// checkPermissions is step 6 for each database. Returns kept=false if the user drops the instance.
+func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, t target, dbs []string) (bool, error) {
 	priv, err := client.Privileges(r.ctx)
 	if err != nil {
 		return false, fmt.Errorf("check user: %w", err)
 	}
 	r.p.printf("\nUser %s: superuser=%v pg_read_all_data=%v bypassrls=%v\n", priv.Role, priv.Superuser, priv.ReadAllData, priv.BypassRLS)
+	// backup records shared_preload_libraries for restore to check the target
+	// (ADR-0014); without pg_read_all_settings it cannot, which only warns.
+	if !priv.Superuser {
+		if _, err := client.PreloadLibraries(r.ctx); err != nil {
+			r.p.printf("  ! %s cannot read shared_preload_libraries, so restore will not be able to check the libraries a target must load.\n    Fix (as a superuser): GRANT pg_read_all_settings TO %s;\n", priv.Role, pg.QuoteIdent(priv.Role))
+		}
+	}
 	var skipped []string
 	for i := 0; i < len(dbs); i++ {
 		db := dbs[i]
@@ -624,10 +786,12 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 			continue
 		}
 		r.p.printf("  ✗ %s: %s\n", db, problem)
+		fix := ""
 		if !priv.CanDump() {
-			r.p.printf("\nRun this as a superuser to create a backup user, then use it here:\n\n%s\n\n", pg.FixRoleSQL("bracer_backup", inst.PgMajor))
+			fix = fmt.Sprintf("Run this as a superuser to create a backup user, then use it here:\n\n  %s\n%s\n", r.psqlCommand(*inst, client.Conn, db), indent(pg.FixRoleSQL("bracer_backup", inst.PgMajor), "  "))
+			r.p.printf("\n%s\n", fix)
 		}
-		_, key, err := r.p.choose("[r] retry  [w] write anyway  [s] skip this database  [q] drop this instance", 0, "r", "w", "s", "q")
+		_, key, err := r.p.choose("[r] retry  [w] write anyway  [s] skip this database  [d] drop this instance  [q] quit", 0, "r", "w", "s", "d", "q")
 		if err != nil {
 			return false, err
 		}
@@ -637,8 +801,13 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 		case "w":
 		case "s":
 			skipped = append(skipped, db)
-		case "q":
+		case "d":
 			return false, nil
+		case "q":
+			if fix != "" {
+				r.p.printf("\n%s", fix)
+			}
+			return false, errQuit
 		}
 	}
 	if len(skipped) > 0 {
@@ -666,11 +835,7 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 	return true, nil
 }
 
-func (r *initRun) addInstance(in config.Instance) {
-	r.cfg.Instances = append(r.cfg.Instances, in)
-}
-
-// setupStorage is step 9.
+// setupStorage is step 8.
 func (r *initRun) setupStorage() error {
 	r.p.printf("\nBackups go to an S3-compatible bucket you own (R2, B2, Wasabi, MinIO...).\n")
 	for {
@@ -716,17 +881,18 @@ func (r *initRun) setupStorage() error {
 			return nil
 		}
 		r.p.printf("  ✗ %v\n", err)
-		_, key, err := r.p.choose("[r] fix and retry  [s] skip the bucket for now (backup will not run until storage: is set)", 0, "r", "s")
+		// No skip: without a bucket backup has nowhere to go.
+		_, key, err := r.p.choose("[r] fix and retry  [q] quit", 0, "r", "q")
 		if err != nil {
 			return err
 		}
-		if key == "s" {
-			return nil
+		if key == "q" {
+			return errQuit
 		}
 	}
 }
 
-// setupEncryption is step 10.
+// setupEncryption is step 9.
 func (r *initRun) setupEncryption() error {
 	yes, err := r.p.yesNo("\nEncrypt backups with age? Protects the data from whoever can read the bucket (recommended)", true)
 	if err != nil {
@@ -741,7 +907,10 @@ func (r *initRun) setupEncryption() error {
 	if err != nil {
 		return err
 	}
-	defPath := r.configPath(r.cfg.App + ".key")
+	defPath, err := r.configPath(r.cfg.App + ".key")
+	if err != nil {
+		return err
+	}
 	if pub == "" {
 		kp, err := crypto.Generate()
 		if err != nil {
@@ -752,10 +921,11 @@ func (r *initRun) setupEncryption() error {
 			if err != nil {
 				return err
 			}
-			full, err := config.ExpandHome(path)
+			full, err := absHome(path)
 			if err != nil {
 				return err
 			}
+			path = full
 			err = crypto.WriteIdentityFile(full, kp)
 			if errors.Is(err, crypto.ErrExists) {
 				_, recips, rerr := crypto.ReadIdentities(full)
@@ -778,7 +948,16 @@ func (r *initRun) setupEncryption() error {
 			}
 			r.cfg.Encryption, r.cfg.AgeRecipient, r.cfg.AgeIdentityFile = "age", kp.Recipient, path
 			r.p.printf("\nPrivate key written to %s (mode 600). Shown once, never logged:\n\n  %s\n\nBack it up in a password manager now. If this file is lost, the backups cannot be decrypted.\n\n", path, kp.Identity)
-			return nil
+			// Without the key off this machine, encrypted backups die with it (ADR-0015).
+			for {
+				ans, err := r.p.ask(fmt.Sprintf("Copy %s somewhere off this machine (password manager, another disk). Without it the encrypted backups cannot be opened if this machine is lost. Type copied when done", path), "")
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(ans) == "copied" {
+					return nil
+				}
+			}
 		}
 	}
 	recip, err := crypto.ParseRecipient(pub)
@@ -789,7 +968,8 @@ func (r *initRun) setupEncryption() error {
 	if err != nil {
 		return err
 	}
-	if full, err := config.ExpandHome(path); err == nil {
+	if full, err := absHome(path); err == nil {
+		path = full
 		if _, recips, rerr := crypto.ReadIdentities(full); rerr != nil {
 			r.warn("%s is not readable (%v); drill will not run until the private key is there", path, rerr)
 		} else if !containsStr(recips, recip) {
@@ -800,36 +980,20 @@ func (r *initRun) setupEncryption() error {
 	return nil
 }
 
-// storeSecrets is step 11.
+// storeSecrets is step 10: no question, secrets_file is the one source init
+// writes (absolute, chmod 600) and the one the timers read.
 func (r *initRun) storeSecrets() error {
 	if len(r.secrets) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(r.secrets))
-	for k := range r.secrets {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	defPath := r.cfg.SecretsFile
-	if defPath == "" {
-		defPath = r.configPath(r.cfg.App + ".env")
-	}
-	r.p.printf("\nSecrets collected: %s\nThey are never written to %s.\n", strings.Join(names, ", "), r.path)
-	r.p.printf("  1) bracer keeps them in %s (mode 600) and loads it automatically\n  2) I manage them myself (pass --env-file or environment variables)\n", defPath)
-	idx, _, err := r.p.choose("Where should secrets live? (1 or 2)", 2)
-	if err != nil {
-		return err
-	}
-	if idx == 1 {
-		r.cfg.SecretsFile = ""
-		r.p.printf("\nSet these before running bracer:\n")
-		for _, n := range names {
-			r.p.printf("  %s\n", n)
+	path := r.cfg.SecretsFile
+	if path == "" {
+		var err error
+		if path, err = r.configPath(r.cfg.App + ".env"); err != nil {
+			return err
 		}
-		r.p.printf("\nEither:\n  bracer backup -c %s --env-file /path/to/%s.env\nor:\n  %s=... bracer backup -c %s\n", r.path, r.cfg.App, strings.Join(names, "=... "), r.path)
-		return nil
 	}
-	path, err := r.p.ask("Env file path", defPath)
+	path, err := absHome(path)
 	if err != nil {
 		return err
 	}
@@ -843,31 +1007,105 @@ func (r *initRun) storeSecrets() error {
 	for _, k := range kept {
 		r.warn("kept the existing value of %s in %s", k, path)
 	}
+	names := make([]string, 0, len(r.secrets))
+	for k := range r.secrets {
+		names = append(names, k)
+	}
+	sort.Strings(names)
 	r.cfg.SecretsFile = path
-	r.p.printf("  ✓ wrote %s\n", path)
+	r.p.printf("Secrets saved to %s (mode 600): %s. They are never written to %s.\n", path, strings.Join(names, ", "), r.path)
 	return nil
 }
 
-// configPath returns ~/.config/bracer/<name> in its `~` form so app.yaml does
-// not contain the absolute path of one machine.
-func (r *initRun) configPath(name string) string {
-	return filepath.Join("~", ".config", "bracer", name)
+// configPath is <home>/.config/bracer/<name>, absolute: the timers run without
+// a shell, so app.yaml must not depend on `~` (spec init AC secrets).
+func (r *initRun) configPath(name string) (string, error) {
+	home, err := r.home()
+	if err != nil {
+		return "", fmt.Errorf("home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "bracer", name), nil
 }
 
-func sameTarget(a, b config.Instance) bool {
-	switch {
-	case a.Container != "" || b.Container != "":
-		return a.Container == b.Container
-	case a.Pod != "" || b.Pod != "":
-		return a.Pod == b.Pod
-	case a.Socket != "" || b.Socket != "":
-		ad, ap := a.SocketDir()
-		bd, bp := b.SocketDir()
-		return ad == bd && ap == bp
-	case a.Host != "" || b.Host != "":
-		return a.Host == b.Host && a.Port == b.Port
+// absHome expands `~` and makes the path absolute.
+func absHome(p string) (string, error) {
+	p, err := config.ExpandHome(p)
+	if err != nil {
+		return "", err
 	}
-	return false
+	return filepath.Abs(p)
+}
+
+// selfCheck is step 14: backup --dry-run and drill --dry-run as the timer will
+// run them, with only HOME and runtime.path in the environment.
+func (r *initRun) selfCheck() error {
+	home, err := r.home()
+	if err != nil {
+		return fmt.Errorf("home directory: %w", err)
+	}
+	env := []string{"HOME=" + home, "PATH=" + r.cfg.Runtime.Path}
+	runs := [][]string{{"backup", "--dry-run", "-c", r.abs}}
+	if !r.cfg.DrillOff() {
+		runs = append(runs, []string{"drill", "--dry-run", "-c", r.abs})
+	}
+	for _, args := range runs {
+		r.p.printf("\nChecking as the nightly job will run: bracer %s\n", strings.Join(args, " "))
+		if code := r.runSelf(r.ctx, args, env, r.stdout, r.stderr); code != exitOK {
+			r.p.printf("\nSelf-check failed (exit %d). %s is kept; fix the above, then run: %s\n", code, r.abs, r.again)
+			return errSelfCheck
+		}
+	}
+	return nil
+}
+
+// offerSchedule is step 15.
+func (r *initRun) offerSchedule() error {
+	bin := stableBinaryPath()
+	if !r.env.hasSystemd() {
+		r.p.printf("\nNo systemd on this machine. For a crontab with the nightly jobs run:\n  %s schedule print -c %s\n", bin, r.abs)
+		return nil
+	}
+	cmd := []string{"sudo", bin, "schedule", "install", "-c", r.abs}
+	yes, err := r.p.yesNo(fmt.Sprintf("\nInstall the nightly schedule now? It runs: %s", strings.Join(cmd, " ")), true)
+	if err != nil {
+		return err
+	}
+	if !yes {
+		r.p.printf("To install it later:\n  %s\n", strings.Join(cmd, " "))
+		return nil
+	}
+	if err := r.runTTY(r.ctx, cmd[0], cmd[1:]...); err != nil {
+		r.p.printf("%s failed: %v\nRun it again when ready:\n  %s\n", cmd[0], err, strings.Join(cmd, " "))
+		return errSelfCheck
+	}
+	return nil
+}
+
+// execSelf runs this binary for the self-check with exactly env.
+func execSelf(ctx context.Context, args, env []string, stdout, stderr io.Writer) int {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(stderr, "bracer init: cannot find this binary:", err)
+		return exitError
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Env, cmd.Stdout, cmd.Stderr = env, stdout, stderr
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
+		}
+		fmt.Fprintln(stderr, "bracer init:", err)
+		return exitError
+	}
+	return exitOK
+}
+
+// execTTY runs a command on the terminal (sudo asks its password there).
+func execTTY(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 func mergeDatabases(dst *config.Instance, src config.Instance) {
@@ -951,51 +1189,21 @@ func containsStr(ss []string, s string) bool {
 	return false
 }
 
-// chooseDrillRuntime writes drill.runtime: kube (spec drill § Data model "Chọn
-// runtime") when Docker is not available but kubectl may create pods and network
-// policies — in the source pod's namespace, else "default" — so drill does not have
-// to detect it again and the user sees the choice in app.yaml. With Docker, or
-// when drill.runtime is already set, nothing changes.
-func (r *initRun) chooseDrillRuntime(inst *config.Instance) {
-	if r.tools.DockerOK(r.ctx) || (r.cfg.Drill != nil && r.cfg.Drill.Runtime != "") {
-		return
+// withDatabase replaces the database in a postgres:// URL.
+func withDatabase(rawURL, db string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
 	}
-	kube := r.tools.Kubectl()
-	if kube == nil {
-		return // warned in step 1
-	}
-	ns := config.DefaultDrillNamespace
-	if inst.Pod != "" {
-		if ref, err := pg.ParsePodRef(inst.Pod); err == nil {
-			ns = ref.Namespace
-		}
-	}
-	for _, resource := range []string{"pods", "networkpolicies.networking.k8s.io"} {
-		ok, err := kube.CanI(r.ctx, "create", resource, ns)
-		if err != nil {
-			r.warn("cannot ask the cluster whether drill may create %s in namespace %s (%v); `bracer drill` will check again when it runs", resource, ns, err)
-			return
-		}
-		if !ok {
-			r.warn("this kubeconfig may not create %s in namespace %s, which `bracer drill` needs for its temporary Postgres pod; set drill.runtime: kube and drill.namespace in app.yaml once it can", resource, ns)
-			return
-		}
-	}
-	if r.cfg.Drill == nil {
-		r.cfg.Drill = &config.Drill{}
-	}
-	r.cfg.Drill.Runtime = config.DrillRuntimeKube
-	if ns != config.DefaultDrillNamespace {
-		r.cfg.Drill.Namespace = ns
-	}
-	r.p.printf("drill will run its temporary Postgres as a pod in namespace %s through %s (no Docker on this machine).\n", ns, kube.Describe())
+	u.Path = "/" + db
+	return u.String()
 }
 
-// chooseDrillImage fills drill.image (spec init § Flow 11b) so the user does not
+// chooseDrillImage fills drill.image (spec init § Flow 11) so the user does not
 // have to know this field: container → the running image if it is of the official
-// family (evidence: docker image inspect); pod → the image in the pod spec except
-// Bitnami; host → drill picks by the extensions in the manifest, asking only when an
-// extension is outside the mapping table (it may be contrib; drill checks with pg_available_extensions).
+// family (evidence: docker image inspect); URL → drill picks by the extensions in
+// the manifest, asking only when an extension is outside the mapping table and
+// missing from the default image.
 func (r *initRun) chooseDrillImage(client *pg.Client, inst *config.Instance, dbs []string) error {
 	if r.cfg.Drill != nil && r.cfg.Drill.Image != "" {
 		return nil
@@ -1007,26 +1215,24 @@ func (r *initRun) chooseDrillImage(client *pg.Client, inst *config.Instance, dbs
 		r.cfg.Drill.Image = image
 		r.p.printf("drill will use image %s (%s).\n", image, why)
 	}
-	switch r.srcKind {
-	case "container":
+	if inst.Local != nil {
+		r.p.printf("drill will build an image like this cluster (postgres:%d with its extension packages and locales).\n", inst.PgMajor)
+		return nil
+	}
+	if inst.Container != "" {
 		official, err := r.docker.ImageOfficialFamily(r.ctx, r.srcImage)
 		if err != nil {
 			r.warn("cannot inspect image %s (%v); drill will pick an image from the extensions in use", r.srcImage, err)
 			return nil
 		}
 		if official {
-			set(r.srcImage, "the same image as this Postgres")
+			r.p.printf("drill will use the same image as this Postgres (%s).\n", r.srcImage)
 		} else {
-			r.p.printf("Image %s is not built on the official postgres image; drill will pick an image from the extensions in use.\n", r.srcImage)
-		}
-		return nil
-	case "pod":
-		if r.srcImage != "" && !config.IsBitnamiImage(r.srcImage) {
-			set(r.srcImage, "the same image as this pod")
+			r.p.printf("Image %s is not built on the official postgres image: drill cannot run it. Set drill.image in %s to an official-family image with the same extensions.\n", r.srcImage, r.path)
 		}
 		return nil
 	}
-	// Host/socket/URL: no image to copy. If mappable (postgis…) drill picks on its
+	// URL: no image to copy. If mappable (postgis…) drill picks on its
 	// own; otherwise check against evidence in the default image instead of asking
 	// the user which extension is contrib.
 	var exts []pg.Extension
@@ -1046,9 +1252,6 @@ func (r *initRun) chooseDrillImage(client *pg.Client, inst *config.Instance, dbs
 		r.p.printf("%v\n", err)
 	} else if image != def {
 		return nil // drill will pick the dedicated image from the manifest
-	}
-	if !r.tools.DockerOK(r.ctx) {
-		return nil // drill does not run on this machine (warned in step 1)
 	}
 	have, err := r.docker.ImageExtensions(r.ctx, def)
 	if err != nil {

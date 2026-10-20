@@ -9,7 +9,7 @@ import (
 )
 
 // ProbeSSLRequest sends the Postgres protocol's SSLRequest packet and waits for
-// one byte, S or N. No password is sent, the server logs nothing. true = is Postgres.
+// one byte, S or N, and nothing after it. No password is sent, the server logs nothing. true = is Postgres.
 func ProbeSSLRequest(ctx context.Context, host string, port int) (bool, error) {
 	d := net.Dialer{Timeout: 2 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, fmt.Sprint(port)))
@@ -28,5 +28,14 @@ func ProbeSSLRequest(ctx context.Context, host string, port int) (bool, error) {
 	if _, err := conn.Read(b[:]); err != nil {
 		return false, err
 	}
-	return b[0] == 'S' || b[0] == 'N', nil
+	if b[0] != 'S' && b[0] != 'N' {
+		return false, nil
+	}
+	// Postgres sends exactly that byte and waits for us; sshd's banner
+	// ("SSH-2.0-…") also starts with S but keeps coming.
+	_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn.Read(b[:]); n > 0 {
+		return false, nil
+	}
+	return true, nil
 }

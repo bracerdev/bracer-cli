@@ -14,6 +14,7 @@ type Selection struct {
 	Instance  string
 	Database  string // "" when Globals
 	Globals   bool
+	Env       bool // the environment record of a run (ADR-0015)
 	Dump      *backup.Dump
 	PgVersion string
 }
@@ -27,9 +28,32 @@ func usagef(format string, a ...interface{}) error {
 	return &UsageError{Msg: fmt.Sprintf(format, a...)}
 }
 
-// Select picks the dump by --instance/--database/--globals/--ts from the manifest,
-// only among the instances present in app.yaml (spec fetch-restore § Flow step 2).
-func Select(m *backup.Manifest, cfg *config.App, instance, database, ts string, globals bool) (*Selection, error) {
+// SelectEnv picks the environment record at ts (default: the latest run).
+func SelectEnv(m *backup.Manifest, cfg *config.App, instance, ts string) (*Selection, error) {
+	instance, err := ResolveInstance(m, cfg, instance)
+	if err != nil {
+		return nil, err
+	}
+	im := m.Instances[instance]
+	if len(im.Env.Dumps) == 0 {
+		return nil, usagef("instance %s has no environment record yet (backups before ADR-0015 have none); run bracer backup", instance)
+	}
+	if ts == "" || ts == "latest" {
+		ts = im.Env.Latest
+	}
+	var have []string
+	for _, dp := range im.Env.Dumps {
+		if dp.TS == ts {
+			return &Selection{Instance: instance, Env: true, Dump: dp, PgVersion: im.PgVersion}, nil
+		}
+		have = append(have, dp.TS)
+	}
+	return nil, usagef("no environment record of %s at %s; runs: %s", instance, ts, strings.Join(have, ", "))
+}
+
+// ResolveInstance picks the source instance: --instance, or the only one in
+// app.yaml that has backups.
+func ResolveInstance(m *backup.Manifest, cfg *config.App, instance string) (string, error) {
 	var names []string
 	for _, in := range cfg.Instances {
 		if im := m.Instances[in.Name]; im != nil && (len(im.Databases) > 0 || len(im.Globals.Dumps) > 0) {
@@ -37,17 +61,27 @@ func Select(m *backup.Manifest, cfg *config.App, instance, database, ts string, 
 		}
 	}
 	if len(names) == 0 {
-		return nil, usagef("no backup in the bucket for the instance(s) in app.yaml; run bracer backup first")
+		return "", usagef("no backup in the bucket for the instance(s) in app.yaml; run bracer backup first")
 	}
 	switch {
 	case instance == "" && len(names) == 1:
 		instance = names[0]
 	case instance == "":
-		return nil, usagef("app.yaml has several instances with backups (%s); pass --instance", strings.Join(names, ", "))
+		return "", usagef("app.yaml has several instances with backups (%s); pass --instance", strings.Join(names, ", "))
 	case cfg.FindInstance(instance) == nil:
-		return nil, usagef("instance %q is not in app.yaml", instance)
+		return "", usagef("instance %q is not in app.yaml", instance)
 	case m.Instances[instance] == nil:
-		return nil, usagef("no backup in the bucket for instance %s; run bracer backup first", instance)
+		return "", usagef("no backup in the bucket for instance %s; run bracer backup first", instance)
+	}
+	return instance, nil
+}
+
+// Select picks the dump by --instance/--database/--globals/--ts from the manifest,
+// only among the instances present in app.yaml (spec fetch-restore § Flow step 2).
+func Select(m *backup.Manifest, cfg *config.App, instance, database, ts string, globals bool) (*Selection, error) {
+	instance, err := ResolveInstance(m, cfg, instance)
+	if err != nil {
+		return nil, err
 	}
 	im := m.Instances[instance]
 	sel := &Selection{Instance: instance, Globals: globals, PgVersion: im.PgVersion}

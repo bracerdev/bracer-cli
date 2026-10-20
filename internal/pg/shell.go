@@ -1,7 +1,6 @@
-// Package pg discovers Postgres on the user's machine (Docker containers,
-// Kubernetes pods, ports, sockets) and runs Postgres tools (psql, pg_dump…) with
-// whatever the environment provides: docker exec, kubectl exec, host binaries, docker run.
-// → ADR-0002, ADR-0009
+// Package pg discovers Postgres on the user's machine (Docker containers, TCP
+// ports) and runs Postgres tools (psql, pg_dump…) through Docker: docker exec into
+// the user's container, or docker run of postgres:<major>. → ADR-0002, ADR-0013
 package pg
 
 import (
@@ -54,17 +53,29 @@ type Shell interface {
 
 // ExecShell runs for real via os/exec. Verbose logs every command to slog (env
 // variable names only, no values).
+//
+// Docker and Env carry app.yaml's runtime: (spec init § Data model): `docker` is
+// run as Docker when set, and Env (PATH=…, DOCKER_HOST=…) is the default
+// environment of every child, overridden by the same names in the process
+// environment (a run by hand wins over what init recorded).
 type ExecShell struct {
 	Verbose bool
+	Docker  string
+	Env     []string
 }
 
 func (s ExecShell) Run(ctx context.Context, c Cmd) (Result, error) {
-	cmd := exec.CommandContext(ctx, c.Name, c.Args...)
+	name := c.Name
+	if name == "docker" && s.Docker != "" {
+		name = s.Docker
+	}
+	cmd := exec.CommandContext(ctx, name, c.Args...)
 	// Do not set WaitDelay: that timer runs even when the child exits normally,
 	// while the tail of pg_dump's stdout is still waiting to be uploaded (minio-go
 	// does not read the pipe while pushing a part) → spurious backup failure. Hanging
 	// on ctx cancel is handled locally (StartSession closes the session's stdin pipe).
-	cmd.Env = append(os.Environ(), c.Env...)
+	// exec keeps the last value of a duplicated key: runtime defaults < process env < c.Env.
+	cmd.Env = append(append(append([]string{}, s.Env...), os.Environ()...), c.Env...)
 	cmd.Stdin = c.Stdin
 	var stdout, stderr bytes.Buffer
 	if c.Stdout != nil {

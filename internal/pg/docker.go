@@ -22,7 +22,7 @@ type Container struct {
 	Port       int   // Postgres port inside the container, default 5432
 	HostPorts  []int // ports published on the host for Port
 	Networks   []string
-	Kubernetes bool // name prefixed k8s_: cri-dockerd; that pod is discovered via kubectl (ADR-0009)
+	Kubernetes bool // name prefixed k8s_: cri-dockerd; not listed, only counted for the Kubernetes notice (ADR-0013)
 	HasPgProc  bool // docker top saw a postgres process (evidence)
 	Unverified bool // running but docker top failed: could not check
 }
@@ -237,6 +237,44 @@ func (d Docker) HasTool(ctx context.Context, container, tool string) bool {
 	return err == nil
 }
 
+// ContainerState returns the container's status (running, exited…); a missing
+// container is an error that says so.
+func (d Docker) ContainerState(ctx context.Context, container string) (string, error) {
+	res, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"inspect", "--format", "{{.State.Status}}", container}})
+	if err != nil {
+		if strings.Contains(err.Error(), "No such") {
+			return "", fmt.Errorf("container %s does not exist\nFix: docker ps -a to find it, then bracer init -c <app.yaml> if it was renamed", container)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(res.Stdout)), nil
+}
+
+// ContainerUser is the superuser to connect as inside a running container: its
+// POSTGRES_USER (or Bitnami/Supabase equivalent), otherwise postgres.
+func (d Docker) ContainerUser(ctx context.Context, container string) (string, error) {
+	state, err := d.ContainerState(ctx, container)
+	if err != nil {
+		return "", err
+	}
+	if state != "running" {
+		return "", fmt.Errorf("container %s is not running (%s)\nFix: docker start %s", container, state, container)
+	}
+	res, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"inspect", "--format", "{{.Config.Image}}\t{{json .Config.Env}}", container}})
+	if err != nil {
+		return "", err
+	}
+	image, envJSON, _ := strings.Cut(strings.TrimSpace(string(res.Stdout)), "\t")
+	var list []string
+	_ = json.Unmarshal([]byte(envJSON), &list)
+	env := map[string]string{}
+	for _, kv := range list {
+		k, v, _ := strings.Cut(kv, "=")
+		env[k] = v
+	}
+	return defaultUser(image, env), nil
+}
+
 // ImageOfficialFamily: the image is the official `postgres` image or built on it
 // (postgis, timescaledb, pgvector, a user's own image built FROM postgres) — the
 // evidence is Entrypoint `docker-entrypoint.sh` and Cmd `postgres` in the image
@@ -274,4 +312,36 @@ func (d Docker) ImageExtensions(ctx context.Context, image string) (map[string]b
 		return nil, fmt.Errorf("docker run %s: no extension control files found in pg_config --sharedir", image)
 	}
 	return out, nil
+}
+
+// Endpoint is the Docker endpoint the CLI talks to: DOCKER_HOST when set,
+// otherwise the endpoint of the current context (DOCKER_CONTEXT or the
+// configured one), as `docker context inspect` reports it.
+func (d Docker) Endpoint(ctx context.Context, dockerHost string) (string, error) {
+	if dockerHost != "" {
+		return dockerHost, nil
+	}
+	res, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"context", "inspect", "--format", "{{.Endpoints.docker.Host}}"}})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(res.Stdout)), nil
+}
+
+// Info checks that the daemon answers (`docker info`); the error holds docker's own message.
+func (d Docker) Info(ctx context.Context) error {
+	_, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"info", "--format", "{{.ServerVersion}}"}})
+	return err
+}
+
+// Pull pulls an image unless it is present already; init pulls the images the
+// runner and drill will need while someone is at the screen (spec init § Flow 3).
+func (d Docker) Pull(ctx context.Context, image string) error {
+	if _, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"image", "inspect", "--format", "{{.Id}}", image}}); err == nil {
+		return nil
+	}
+	if _, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"pull", "--quiet", image}}); err != nil {
+		return fmt.Errorf("docker pull %s: %w", image, err)
+	}
+	return nil
 }

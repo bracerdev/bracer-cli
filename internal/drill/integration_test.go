@@ -55,7 +55,7 @@ func TestIntegrationDrill(t *testing.T) {
 	}
 
 	// 1. Encrypted backup: the manifest must have orders rows=500 (counted in the snapshot).
-	bres, err := backup.Run(ctx, cfg, backup.Deps{Shell: sh, Store: st, GOOS: "darwin"})
+	bres, err := backup.Run(ctx, cfg, backup.Deps{Shell: sh, Store: st})
 	if err != nil || !bres.OK {
 		t.Fatalf("backup: %v %+v", err, bres)
 	}
@@ -88,13 +88,14 @@ func TestIntegrationDrill(t *testing.T) {
 	if dr.Error != "" || len(dr.MissingTables) != 0 || len(dr.RowMismatches) != 0 || dr.TablesFound != 1 || dr.TablesExpected != 1 {
 		t.Errorf("db: %+v", dr)
 	}
-	if ir.Globals == nil || !ir.Globals.OK || ir.Globals.IgnoredErrors < 1 {
-		t.Errorf("globals (role postgres already exists must be ignored): %+v", ir.Globals)
+	if ir.Mode != "full" || ir.Source != "container" || ir.TS == "" {
+		t.Errorf("run: %+v", ir)
 	}
 	if len(dr.Checks) != 2 || !dr.Checks[0].OK || dr.Checks[1].OK || dr.Checks[1].Error != "no rows returned" {
 		t.Errorf("checks: %+v", dr.Checks)
 	}
-	if ir.Image != "postgres:17-alpine" {
+	// ADR-0015: the source container's own image, by ID when it is on this machine.
+	if !strings.HasPrefix(ir.Image, "sha256:") && ir.Image != "postgres:17-alpine" {
 		t.Errorf("image: %s", ir.Image)
 	}
 	assertNoDrillContainers(t, ctx, sh)
@@ -123,9 +124,9 @@ func TestIntegrationDrill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dr = res.Instances[0].Databases[0]
-	if res.OK || !strings.Contains(dr.Error, kp.Recipient) {
-		t.Errorf("wrong key: %+v", dr)
+	// The environment record of the run is read first: the instance fails naming the recipient.
+	if ir := res.Instances[0]; res.OK || !strings.Contains(ir.Error, kp.Recipient) || len(ir.Databases) != 0 {
+		t.Errorf("wrong key: %+v", ir)
 	}
 	assertNoDrillContainers(t, ctx, sh)
 }

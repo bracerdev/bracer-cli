@@ -46,7 +46,7 @@ func TestIntegrationBackupPlainAndEncrypted(t *testing.T) {
 		Storage:    &config.Storage{Endpoint: endpoint, Bucket: "backups", Prefix: prefix, AccessKeyEnv: "A", SecretKeyEnv: "S", PathStyle: true},
 		Encryption: "none",
 	}
-	deps := Deps{Shell: pg.ExecShell{}, Store: st, GOOS: "darwin"}
+	deps := Deps{Shell: pg.ExecShell{}, Store: st}
 
 	// 1. Unencrypted: the downloaded dump must be an archive pg_restore can read, the manifest has tables.
 	res, err := Run(ctx, cfg, deps)

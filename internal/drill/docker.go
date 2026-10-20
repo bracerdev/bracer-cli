@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"bracer.dev/bracer/internal/config"
 	"bracer.dev/bracer/internal/pg"
@@ -18,8 +20,6 @@ import (
 type dockerRuntime struct {
 	sh pg.Shell
 }
-
-func (r *dockerRuntime) kind() string { return config.DrillRuntimeDocker }
 
 // cleanupOrphans removes the app's drill containers and volumes left over from a
 // previous run (same label; named volumes can be cleaned up, unlike anonymous ones).
@@ -115,17 +115,22 @@ func (r *dockerRuntime) imageVolumes(ctx context.Context, image string) ([]strin
 	return inspect()
 }
 
-func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.Instance, image string, needBytes int64, ir *InstanceResult, res *Result, d Deps) (*tempPG, error) {
-	// A named + labeled volume for each VOLUME of the image: docker rm -f does not
-	// remove a --rm container's anonymous volumes; each drill would leave a copy of the data behind.
+// start creates the temporary Postgres with image, bootstrap superuser user
+// and the preload libraries, checks free disk (needBytes), waits until it
+// answers, and returns it; whatever it created is removed on error.
+func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.Instance, image, user string, preload []string, needBytes int64, ir *InstanceResult, res *Result, d Deps) (*tempPG, error) {
+	// A named + labeled volume for each VOLUME of the image, so docker rm -v
+	// leaves no copy of the data behind.
 	paths, err := r.imageVolumes(ctx, image)
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s: %v", image, err)
 	}
 	name := containerPrefix + cfg.App + "-" + d.Rand(3)
-	t := &tempPG{run: pg.ExecRunner{Shell: r.sh, Container: name}, image: image, name: name}
+	t := &tempPG{run: pg.ExecRunner{Shell: r.sh, Container: name}, image: image, name: name, user: user}
 	// POSTGRES_PASSWORD is required by the official image; never used (socket connection).
-	runArgs := []string{"run", "-d", "--rm", "--network", "none", "--label", Label + "=" + cfg.App, "--name", name, "-e", "POSTGRES_PASSWORD"}
+	// No --rm: a container that exits must stay for its logs.
+	runArgs := []string{"run", "-d", "--network", "none", "--label", Label + "=" + cfg.App, "--name", name,
+		"-e", "POSTGRES_PASSWORD", "-e", "POSTGRES_USER=" + user, "-e", "POSTGRES_DB=postgres"}
 	// Image declares no VOLUME: still create one volume (not mounted) to measure disk.
 	if len(paths) == 0 {
 		paths = []string{""}
@@ -159,22 +164,62 @@ func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.In
 		}
 	}
 	runArgs = append(runArgs, image)
+	if len(preload) > 0 {
+		// The image entrypoint passes arguments starting with - to postgres.
+		runArgs = append(runArgs, "-c", "shared_preload_libraries="+strings.Join(preload, ","))
+	}
 	if _, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: runArgs, Env: []string{"POSTGRES_PASSWORD=" + d.Rand(16)}}); err != nil {
-		r.removeVolumes(ctx, t.volumes, res, in.Name)
+		r.remove(ctx, t, res, in.Name)
 		return nil, fmt.Errorf("start %s: %v", image, err)
 	}
 	if took := d.Now().Sub(start); took > slowPull {
 		res.warn("%s: starting %s took %.0f s (image pull?)", in.Name, image, took.Seconds())
 	}
 	d.Log.Info("temp postgres started", "instance", in.Name, "container", name, "image", image)
-	if err := waitReady(ctx, t, d, func(ctx context.Context) []byte {
-		logs, _ := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"logs", "--tail", "20", name}})
-		return append(logs.Stdout, logs.Stderr...)
-	}); err != nil {
+	if err := r.waitReady(ctx, t, d); err != nil {
 		r.remove(ctx, t, res, in.Name)
 		return nil, err
 	}
 	return t, nil
+}
+
+// restart restarts the temporary Postgres (env-up changed a setting that
+// only takes effect at start) and waits for it.
+func (r *dockerRuntime) restart(ctx context.Context, t *tempPG, d Deps) error {
+	if _, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"restart", t.name}}); err != nil {
+		return fmt.Errorf("restart %s: %v", t.name, err)
+	}
+	return r.waitReady(ctx, t, d)
+}
+
+// waitReady polls pg_isready over TCP loopback inside the temporary Postgres: the
+// entrypoint's temporary server (during initdb) opens only the socket, so TCP being
+// up means the real server runs. A container that exited fails at once, with its logs.
+func (r *dockerRuntime) waitReady(ctx context.Context, t *tempPG, d Deps) error {
+	logs := func() string {
+		out, _ := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"logs", "--tail", "20", t.name}})
+		return restore.Tail(append(out.Stdout, out.Stderr...), restore.StderrTail)
+	}
+	deadline := d.Now().Add(d.ReadyTimeout)
+	for {
+		if err := t.runner().Run(ctx, t.conn("postgres"), "pg_isready", []string{"-h", "127.0.0.1", "-U", t.user}, nil, io.Discard); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("interrupted while waiting for Postgres: %v", ctx.Err())
+		}
+		out, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"inspect", "-f", "{{.State.Running}}", t.name}})
+		if err != nil || strings.TrimSpace(string(out.Stdout)) != "true" {
+			return fmt.Errorf("Postgres in %s (%s) stopped while starting; last log lines:\n%s", t.name, t.image, logs())
+		}
+		if !d.Now().Before(deadline) {
+			return fmt.Errorf("Postgres in %s not ready after %.0f s; last log lines:\n%s", t.name, d.ReadyTimeout.Seconds(), logs())
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(d.Poll):
+		}
+	}
 }
 
 func (r *dockerRuntime) remove(ctx context.Context, t *tempPG, res *Result, instance string) {

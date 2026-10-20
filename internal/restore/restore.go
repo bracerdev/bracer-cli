@@ -14,15 +14,11 @@ import (
 
 // GlobalsResult is the result of restoring globals.
 type GlobalsResult struct {
-	OK              bool     `json:"ok"`
-	IgnoredErrors   int      `json:"ignored_errors,omitempty"`   // drill: "already exists" ignored
-	Created         []string `json:"created,omitempty"`          // restore: users created
-	SkippedExisting int      `json:"skipped_existing,omitempty"` // restore: users already present, left untouched
-	SkippedGrants   []string `json:"skipped_grants,omitempty"`   // restore: "a -> x" skipped because a is the customer's pre-existing user
-	Downgraded      []string `json:"downgraded,omitempty"`       // restore: "x: SUPERUSER" downgraded
-	PgGrants        []string `json:"pg_grants,omitempty"`        // restore: "pg_read_all_data -> x"
-	SkippedMissing  []string `json:"skipped_missing,omitempty"`  // restore: "pg_maintain -> x" skipped because the built-in pg_* role does not exist on the target
-	Error           string   `json:"error,omitempty"`
+	OK            bool     `json:"ok"`
+	IgnoredErrors int      `json:"ignored_errors,omitempty"` // drill: "already exists" ignored
+	Skipped       []string `json:"skipped,omitempty"`        // restore to a clean target: statements left out ("CREATE ROLE postgres")
+	PasswordReset string   `json:"password_reset,omitempty"` // restore to a clean target: the connecting user whose password now comes from the backup
+	Error         string   `json:"error,omitempty"`
 }
 
 // RowMismatch is a table whose row count differs from the manifest.
@@ -269,13 +265,13 @@ func Hint(stderr []byte) string {
 		bytes.Contains(stderr, []byte("could not open extension control file")):
 		return "\nhint: the dump needs extensions this image lacks; set drill.image in app.yaml to an image that has them"
 	case bytes.Contains(stderr, []byte("role")) && bytes.Contains(stderr, []byte("does not exist")):
-		return "\nhint: users from the source server are missing; restore them first with --with-globals, or pass --no-owner"
+		return "\nhint: users from the source server are missing on this server"
 	}
 	return ""
 }
 
 // ListRoles returns the names of every user on the target (built-in pg_* roles
-// included), so GlobalsCreateMissing knows which ones already exist.
+// included), to apply database attributes only for users that exist.
 func ListRoles(ctx context.Context, c *pg.Client) ([]string, error) {
 	rows, err := c.Query(ctx, "select rolname from pg_roles order by rolname")
 	if err != nil {
@@ -292,50 +288,6 @@ func ListRoles(ctx context.Context, c *pg.Client) ([]string, error) {
 
 // MaxGlobals is the maximum size of globals.sql read into memory (a few KB per user).
 const MaxGlobals = 16 << 20
-
-// GlobalsCreateMissing is the variant for restoring into a real server: filter with
-// FilterGlobals, then run psql in a single transaction with ON_ERROR_STOP=1: create all
-// missing users or create nothing. A file it cannot understand → nothing runs, Error
-// states why. drill uses the unfiltered Globals.
-func GlobalsCreateMissing(ctx context.Context, runner pg.Runner, conn pg.Conn, existing []string, src io.Reader) *GlobalsResult {
-	gr := &GlobalsResult{}
-	data, err := io.ReadAll(io.LimitReader(src, MaxGlobals+1))
-	if err != nil {
-		gr.Error = "read globals: " + err.Error()
-		return gr
-	}
-	if len(data) > MaxGlobals {
-		gr.Error = "globals dump larger than 16 MB; refusing to parse"
-		return gr
-	}
-	have := map[string]bool{}
-	for _, r := range existing {
-		have[r] = true
-	}
-	plan, err := FilterGlobals(data, have)
-	if err != nil {
-		gr.Error = err.Error() + "; no user was created"
-		return gr
-	}
-	gr.SkippedExisting, gr.SkippedGrants, gr.Downgraded, gr.PgGrants, gr.SkippedMissing = plan.SkippedExisting, plan.SkippedGrants, plan.Downgraded, plan.PgGrants, plan.SkippedMissing
-	if len(plan.Created) == 0 {
-		gr.OK = true
-		return gr
-	}
-	conn.Database = "postgres"
-	stderr, err := pg.RunCapture(ctx, runner, conn, "psql", []string{"-X", "-q", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", "-"}, bytes.NewReader(plan.SQL), io.Discard)
-	if err != nil {
-		gr.Error = "psql: " + Tail(stderr, StderrTail)
-		if gr.Error == "psql: " {
-			gr.Error = "psql: " + err.Error()
-		}
-		gr.Error += "; the transaction was rolled back, no user was created"
-		return gr
-	}
-	gr.Created = plan.Created
-	gr.OK = true
-	return gr
-}
 
 // DiskCheck is the result of measuring free disk on the target before restoring.
 type DiskCheck struct {
@@ -359,10 +311,6 @@ func CheckDisk(ctx context.Context, runner pg.Runner, admin *pg.Client, dumpByte
 	df, ok := runner.(pg.DiskFreer)
 	if !ok {
 		dc.Error = "could not check free disk space on target (tools run on another machine)"
-		return dc
-	}
-	if _, local := runner.(pg.LocalRunner); local && !pg.IsLocalHost(admin.Conn.Host) {
-		dc.Error = fmt.Sprintf("could not check free disk space on target (%s is not this machine)", admin.Conn.Host)
 		return dc
 	}
 	rows, err := admin.Query(ctx, "show data_directory")

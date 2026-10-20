@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime"
 	"strings"
 )
 
 // Runner runs a Postgres tool (psql, pg_dump, pg_dumpall, pg_restore) with the
-// given connection info: docker exec, kubectl exec, a host binary or
-// docker run, depending on where Postgres runs. → ADR-0009
+// given connection info: docker exec into the user's container, or docker run
+// of postgres:<major>. → ADR-0013
 type Runner interface {
 	Run(ctx context.Context, conn Conn, tool string, args []string, stdin io.Reader, stdout io.Writer) error
 	// Describe is a one-liner for --dry-run and --verbose.
@@ -68,26 +67,18 @@ func RunCapture(ctx context.Context, r Runner, conn Conn, tool string, args []st
 }
 
 // ImageRunner: `docker run --rm` of a client image (postgres:N). Network is chosen
-// by target: "container:<name>" for a container without pg_dump, "host" for
-// Postgres on a Linux machine, empty + HostGateway for macOS/Windows.
+// by target: "container:<name>" for a container without pg_dump, "host" for a URL
+// (Postgres on this Linux machine or anywhere it reaches). → ADR-0013
 type ImageRunner struct {
-	Shell       Shell
-	Image       string
-	Network     string
-	HostGateway bool // --add-host=host.docker.internal:host-gateway, rewrites localhost to host.docker.internal
+	Shell   Shell
+	Image   string
+	Network string
 }
 
-// NewHostRunner picks how to reach Postgres on this machine based on the OS.
-func NewHostRunner(sh Shell, image string) ImageRunner {
-	return NewHostRunnerFor(sh, image, runtime.GOOS)
-}
-
-// NewHostRunnerFor is NewHostRunner with a given GOOS (for tests).
-func NewHostRunnerFor(sh Shell, image, goos string) ImageRunner {
-	if goos == "linux" {
-		return ImageRunner{Shell: sh, Image: image, Network: "host"}
-	}
-	return ImageRunner{Shell: sh, Image: image, HostGateway: true}
+// NewURLRunner reaches a URL from the host's network namespace, so 127.0.0.1 in
+// the URL is this machine.
+func NewURLRunner(sh Shell, image string) ImageRunner {
+	return ImageRunner{Shell: sh, Image: image, Network: "host"}
 }
 
 func (r ImageRunner) Describe() string {
@@ -95,9 +86,6 @@ func (r ImageRunner) Describe() string {
 	parts = append(parts, "docker run "+r.Image)
 	if r.Network != "" {
 		parts = append(parts, "--network "+r.Network)
-	}
-	if r.HostGateway {
-		parts = append(parts, "via host.docker.internal")
 	}
 	return strings.Join(parts, " ")
 }
@@ -109,9 +97,6 @@ func (r ImageRunner) Run(ctx context.Context, conn Conn, tool string, args []str
 
 // RunStderr is like Run but also returns stderr even when the command succeeds.
 func (r ImageRunner) RunStderr(ctx context.Context, conn Conn, tool string, args []string, stdin io.Reader, stdout io.Writer) ([]byte, error) {
-	if r.HostGateway && isLoopback(conn.Host) {
-		conn.Host = "host.docker.internal"
-	}
 	if r.Network != "" && strings.HasPrefix(r.Network, "container:") && conn.Host == "" {
 		conn.Host = "localhost"
 	}
@@ -120,9 +105,6 @@ func (r ImageRunner) RunStderr(ctx context.Context, conn Conn, tool string, args
 	if r.Network != "" {
 		dargs = append(dargs, "--network", r.Network)
 	}
-	if r.HostGateway {
-		dargs = append(dargs, "--add-host=host.docker.internal:host-gateway")
-	}
 	for _, n := range envNames(env) {
 		dargs = append(dargs, "-e", n)
 	}
@@ -130,14 +112,6 @@ func (r ImageRunner) RunStderr(ctx context.Context, conn Conn, tool string, args
 	dargs = append(dargs, args...)
 	res, err := r.Shell.Run(ctx, Cmd{Name: "docker", Args: dargs, Env: env, Stdin: stdin, Stdout: stdout})
 	return res.Stderr, err
-}
-
-func isLoopback(h string) bool {
-	switch h {
-	case "", "localhost", "127.0.0.1", "::1", "0.0.0.0", "::":
-		return true
-	}
-	return false
 }
 
 // ClientImage is the fixed, latest client image used to ask the server for its

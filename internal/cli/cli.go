@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"runtime"
 
 	"bracer.dev/bracer/internal/pg"
 	"bracer.dev/bracer/internal/storage"
@@ -23,12 +22,13 @@ Usage:
 
 Commands:
   init      find Postgres on this machine, pick databases, write app.yaml
+  check     check that this machine can run bracer (Docker, lingering, systemd)
   backup    dump, encrypt and upload every database in app.yaml
   drill     restore the latest backup into a temp Postgres and verify it
   fetch     download a backup (decrypted) to a file or stdout
   restore   restore a backup into a real Postgres with pg_restore
   ping      send a heartbeat for any job, or wrap a command: bracer ping <id> -- <cmd>
-  cron-example  print a cron / systemd timer schedule for app.yaml
+  schedule  install, remove or show systemd timers for backup and drill (or print a crontab)
   rotate-key  switch to a new age key; old backups stay readable with the old key
   version   print the version
 `
@@ -57,6 +57,8 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitOK
 	case "init":
 		return runInit(ctx, args[1:], defaultInitDeps(stdin, stdout, stderr))
+	case "check":
+		return runCheck(ctx, args[1:], defaultEnvDeps(pg.ExecShell{}), stdout, stderr)
 	case "backup":
 		return runBackup(ctx, args[1:], defaultBackupDeps(stdin, stdout, stderr))
 	case "drill":
@@ -67,8 +69,10 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runRestore(ctx, args[1:], defaultBackupDeps(stdin, stdout, stderr))
 	case "ping":
 		return runPing(ctx, args[1:], stdin, stdout, stderr)
-	case "cron-example":
-		return runCronExample(ctx, args[1:], stdout, stderr)
+	case "schedule":
+		return runSchedule(ctx, args[1:], defaultScheduleDeps(stdin, stdout, stderr))
+	case "cron-example": // deprecated alias, kept out of the usage text
+		return runCronExample(ctx, args[1:], defaultScheduleDeps(stdin, stdout, stderr))
 	case "rotate-key":
 		return runRotateKey(ctx, args[1:], stdin, stdout, stderr)
 	default:
@@ -82,7 +86,10 @@ func defaultInitDeps(stdin io.Reader, stdout, stderr io.Writer) initDeps {
 		shell:    pg.ExecShell{},
 		probe:    pg.ProbeSSLRequest,
 		newStore: func(c storage.S3Config) (storage.Store, error) { return storage.NewS3(c) },
-		goos:     runtime.GOOS,
+		env:      defaultEnvDeps(pg.ExecShell{}),
+		home:     os.UserHomeDir,
+		runSelf:  execSelf,
+		runTTY:   execTTY,
 		stdin:    stdin,
 		stdout:   stdout,
 		stderr:   stderr,

@@ -14,14 +14,13 @@ instances:
   - name: main
     container: shop-db
     user: postgres
+    password_env: BRACER_SHOP_MAIN_PASSWORD
     pg_major: 17
     databases: all
   - name: analytics
-    host: localhost
-    port: 5433
-    user: bracer_backup
-    password_env: BRACER_SHOP_ANALYTICS_PASSWORD
+    url_env: BRACER_SHOP_ANALYTICS_URL
     pg_major: 16
+    system_id: "7698216964553203752"
     databases:
       - analytics
       - name: events
@@ -52,7 +51,7 @@ func TestParseSample(t *testing.T) {
 	if !a.Instances[0].Databases.All {
 		t.Error("main.databases must be all")
 	}
-	if a.Instances[0].Kind() != KindContainer || a.Instances[1].Kind() != KindHost || a.Instances[2].Kind() != KindURL {
+	if a.Instances[0].Kind() != KindContainer || a.Instances[1].Kind() != KindURL || a.Instances[2].Kind() != KindURL {
 		t.Error("Kind sai")
 	}
 	dbs := a.Instances[1].Databases.List
@@ -61,6 +60,9 @@ func TestParseSample(t *testing.T) {
 	}
 	if a.Instances[2].Databases.List[0].Name != "postgres" {
 		t.Error("flow-style list not parsed")
+	}
+	if a.Instances[1].SystemID != "7698216964553203752" {
+		t.Errorf("system_id = %q", a.Instances[1].SystemID)
 	}
 }
 
@@ -91,26 +93,28 @@ func TestRoundTrip(t *testing.T) {
 func TestValidateErrors(t *testing.T) {
 	cases := map[string]string{
 		"app: shop\ninstances: []\n": "instances: at least one",
-		"app: Shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n":                                                                                                              "app: lowercase",
-		"app: shop\ninstances:\n  - name: a\n    databases: all\n":                                                                                                                                "exactly one of",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    host: y\n    port: 1\n    databases: all\n":                                                                                    "exactly one of",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: []\n":                                                                                                               "databases: expected",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    password: s3cret\n    databases: all\n":                                                                                        "secrets must not be written",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n  - name: a\n    container: y\n    databases: all\n":                                                           "duplicates instances[0]",
-		"app: shop\ninstances:\n  - name: a\n    host: h\n    port: 1\n    password_env: P\n    databases: all\n  - name: b\n    host: h\n    port: 2\n    password_env: P\n    databases: all\n": "two instances cannot share",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nencryption: age\n":                                                                                             "age_recipient",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nencryption: rot13\n":                                                                                           "must be none | age",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nstorage:\n  bucket: b\n":                                                                                       "storage.endpoint",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  image: bitnamilegacy/postgresql:16\n":                                                                "not supported as the drill image",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  runtime: podman\n":                                                                                   "drill.runtime: must be docker or kube",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  namespace: Bad_NS\n":                                                                                 "drill.namespace: must be a Kubernetes namespace name",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nretention: { keep: 0 }\n":                                                                                      "retention.keep",
-		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n    bogus: 1\n":                                                                                                "bogus",
-		"app: shop\ninstances:\n  - name: a\n    pod: onlyns\n    databases: all\n":                                                                                                               "namespace/pod",
-		"app: shop\ninstances:\n  - name: a\n    pod: ns/pg\n    password_env: P\n    databases: all\n":                                                                                           "passwords cannot be passed",
-		"app: shop\ninstances:\n  - name: a\n    socket: run/postgresql\n    databases: all\n":                                                                                                    "absolute path",
-		"app: shop\ninstances:\n  - name: a\n    socket: /var/run/postgresql/.s.PGSQL.5433\n    port: 5432\n    databases: all\n":                                                                 "differs from the port",
-		"app: shop\ninstances:\n  - name: a\n    pod: ns/pg\n    socket: /tmp\n    databases: all\n":                                                                                              "exactly one of",
+		"app: Shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n":                                                    "app: lowercase",
+		"app: shop\ninstances:\n  - name: a\n    databases: all\n":                                                                      "exactly one of",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    url_env: U\n    databases: all\n":                                    "exactly one of",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: []\n":                                                     "databases: expected",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    password: s3cret\n    databases: all\n":                              "secrets must not be written",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n  - name: a\n    container: y\n    databases: all\n": "duplicates instances[0]",
+		"app: shop\ninstances:\n  - name: a\n    url_env: U\n    databases: all\n  - name: b\n    url_env: U\n    databases: all\n":     "two instances cannot share",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nencryption: age\n":                                   "age_recipient",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nencryption: rot13\n":                                 "must be none | age",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nstorage:\n  bucket: b\n":                             "storage.endpoint",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  image: bitnamilegacy/postgresql:16\n":      "not supported as the drill image",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  runtime: podman\n":                         "drill.runtime: must be docker or none",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  namespace: default\n":                      "drill.namespace: no longer used",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\ndrill:\n  runtime: kube\n":                           "kube is no longer supported",
+		"app: shop\ninstances:\n  - name: a\n    url_env: U\n    user: x\n    databases: all\n":                                         "url_env already carries",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    system_id: abc\n    databases: all\n":                                "system_id",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nretention: { keep: 0 }\n":                            "retention.keep",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\n    bogus: 1\n":                                      "bogus",
+		"app: shop\ninstances:\n  - name: a\n    pod: ns/pg\n    databases: all\n":                                                      "pod is no longer supported",
+		"app: shop\ninstances:\n  - name: a\n    socket: /tmp\n    databases: all\n":                                                    "socket is no longer supported",
+		"app: shop\ninstances:\n  - name: a\n    host: h\n    port: 5432\n    databases: all\n":                                         "host/port are no longer supported",
+		"app: shop\ninstances:\n  - name: a\n    container: x\n    password_file: /p\n    databases: all\n":                             "password_file is no longer supported",
 	}
 	for in, want := range cases {
 		_, err := Parse([]byte(in))
@@ -161,27 +165,45 @@ func TestSaveAtomicAndLoad(t *testing.T) {
 	}
 }
 
-func TestPodAndSocketInstances(t *testing.T) {
-	app, err := Parse([]byte("app: shop\ninstances:\n  - name: k\n    pod: attendy-dev/postgres-0/postgres\n    user: attendy\n    databases: all\n  - name: s\n    socket: /var/run/postgresql\n    port: 5433\n    databases: all\n  - name: f\n    socket: /tmp/.s.PGSQL.5434\n    databases: all\n"))
+func TestLegacyInstances(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.yaml")
+	data := "app: shop\ninstances:\n  - name: db\n    pod: attendy-dev/postgres-0/postgres\n    user: attendy\n    databases: [attendy]\n  - name: main\n    container: shop-db\n    databases: all\ndrill:\n  runtime: kube\n  namespace: attendy-dev\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "instances[0]: pod is no longer supported") || !strings.Contains(err.Error(), "\nFix: bracer init -c "+path) {
+		t.Fatalf("Load: %v", err)
+	}
+	app, legacy, err := LoadForInit(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	k, s, f := app.Instances[0], app.Instances[1], app.Instances[2]
-	if k.Kind() != KindPod || s.Kind() != KindSocket || f.Kind() != KindSocket {
-		t.Errorf("kinds: %v %v %v", k.Kind(), s.Kind(), f.Kind())
+	if len(legacy) != 1 || legacy[0].Name != "db" || len(app.Instances) != 1 || app.Instances[0].Name != "main" {
+		t.Errorf("legacy = %+v, instances = %+v", legacy, app.Instances)
 	}
-	if ns, pod, ctr, ok := k.PodRef(); !ok || ns != "attendy-dev" || pod != "postgres-0" || ctr != "postgres" {
-		t.Errorf("PodRef: %s %s %s %v", ns, pod, ctr, ok)
+	if app.Drill.Runtime != "" || app.Drill.Namespace != "" {
+		t.Errorf("drill = %+v", app.Drill)
 	}
-	if dir, port := s.SocketDir(); dir != "/var/run/postgresql" || port != 5433 {
-		t.Errorf("SocketDir: %s %d", dir, port)
+	only := filepath.Join(dir, "only.yaml")
+	_ = os.WriteFile(only, []byte("app: shop\ninstances:\n  - name: h\n    host: localhost\n    port: 5433\n    databases: all\n"), 0o644)
+	app, legacy, err = LoadForInit(only)
+	if err != nil || len(legacy) != 1 || len(app.Instances) != 0 {
+		t.Errorf("only legacy: %v %+v %+v", err, legacy, app)
 	}
-	if dir, port := f.SocketDir(); dir != "/tmp" || port != 5434 {
-		t.Errorf("SocketDir from file: %s %d", dir, port)
+}
+
+func TestRuntimeRoundTrip(t *testing.T) {
+	a, err := Parse([]byte("app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nruntime:\n  user: khanh\n  path: /usr/bin:/bin\n  docker: /usr/bin/docker\n  docker_host: unix:///var/run/docker.sock\ndrill:\n  runtime: none\n"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	out, _ := Marshal(app)
-	if !strings.Contains(string(out), "pod: attendy-dev/postgres-0/postgres") || !strings.Contains(string(out), "socket: /var/run/postgresql") {
-		t.Errorf("marshal:\n%s", out)
+	if a.Runtime.User != "khanh" || a.Runtime.Docker != "/usr/bin/docker" || !a.DrillOff() {
+		t.Errorf("runtime = %+v, drill off = %v", a.Runtime, a.DrillOff())
+	}
+	if _, err := Parse([]byte("app: shop\ninstances:\n  - name: a\n    container: x\n    databases: all\nruntime:\n  docker: docker\n")); err == nil || !strings.Contains(err.Error(), "runtime.docker") {
+		t.Errorf("relative docker: %v", err)
 	}
 }
 

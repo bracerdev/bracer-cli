@@ -9,7 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"runtime"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -25,9 +26,6 @@ type backupDeps struct {
 	shell    pg.Shell
 	newStore func(storage.S3Config) (storage.Store, error)
 	http     *http.Client
-	goos     string
-	lookPath func(string) (string, error) // nil: exec.LookPath; tests block host binaries
-	glob     func(string) ([]string, error)
 	stdin    io.Reader // restore --drop asks for confirmation
 	stdout   io.Writer
 	stderr   io.Writer
@@ -38,16 +36,51 @@ func defaultBackupDeps(stdin io.Reader, stdout, stderr io.Writer) backupDeps {
 		shell:    pg.ExecShell{},
 		newStore: func(c storage.S3Config) (storage.Store, error) { return storage.NewS3(c) },
 		http:     &http.Client{Timeout: 15 * time.Second},
-		goos:     runtime.GOOS,
 		stdin:    stdin,
 		stdout:   stdout,
 		stderr:   stderr,
 	}
 }
 
-// tools builds pg.Tools from the current shell (after --verbose is applied).
+// tools builds pg.Tools from the current shell (after --verbose and runtime: are applied).
 func (d backupDeps) tools() *pg.Tools {
-	return &pg.Tools{Shell: d.shell, GOOS: d.goos, LookPath: d.lookPath, Glob: d.glob}
+	return pg.NewTools(d.shell)
+}
+
+// withRuntime applies app.yaml's runtime: to the real shell: the absolute docker
+// path, and PATH/DOCKER_HOST as defaults the process environment overrides
+// (spec init § Data model). Fake shells in tests are left alone.
+func (d backupDeps) withRuntime(cfg *config.App) backupDeps {
+	sh, ok := d.shell.(pg.ExecShell)
+	if !ok || cfg.Runtime == nil {
+		return d
+	}
+	rt := cfg.Runtime
+	sh.Docker = rt.Docker
+	if rt.Docker != "" {
+		if _, err := os.Stat(rt.Docker); err != nil {
+			// app.yaml copied to another machine (restore elsewhere): use PATH.
+			fmt.Fprintf(d.stderr, "warning: runtime.docker %s not found on this machine; using docker from PATH\n", rt.Docker)
+			sh.Docker = ""
+		}
+	}
+	sh.Env = nil
+	if rt.Path != "" {
+		sh.Env = append(sh.Env, "PATH="+rt.Path)
+	}
+	if rt.DockerHost != "" {
+		sh.Env = append(sh.Env, "DOCKER_HOST="+rt.DockerHost)
+	}
+	d.shell = sh
+	return d
+}
+
+// absPath is the absolute form of app.yaml's path for `Fix: bracer init -c …`.
+func absPath(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return p
 }
 
 // runBackup is `bracer backup` (spec backup/backup).
@@ -58,7 +91,7 @@ func runBackup(ctx context.Context, args []string, d backupDeps) int {
 	envFile := fs.String("env-file", "", "dotenv file with secrets (overrides secrets_file, overridden by the environment)")
 	dryRun := fs.Bool("dry-run", false, "check config, connections and bucket; dump nothing")
 	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
-	verbose := fs.Bool("verbose", false, "log every docker, kubectl and pg_* command")
+	verbose := fs.Bool("verbose", false, "log every docker and pg_* command")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -81,6 +114,7 @@ func runBackup(ctx context.Context, args []string, d backupDeps) int {
 	if err != nil {
 		return fail(exitUsage, "%v", err)
 	}
+	d = d.withRuntime(cfg)
 	secrets, warns, err := config.LoadSecrets(cfg, *envFile)
 	if err != nil {
 		return fail(exitUsage, "%v", err)
@@ -113,7 +147,7 @@ func runBackup(ctx context.Context, args []string, d backupDeps) int {
 	}
 	defer lock.Release()
 
-	res, err := backup.Run(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, GOOS: d.goos, Tools: d.tools(), Log: logger})
+	res, err := backup.Run(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, ConfigPath: absPath(*cfgPath)})
 	if err != nil {
 		report(ctx, cfg, secrets, d, logger, failureReport("backup", cfg.App, err))
 		return fail(exitError, "%v", err)

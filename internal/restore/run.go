@@ -1,14 +1,12 @@
 package restore
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,19 +19,22 @@ import (
 	"bracer.dev/bracer/internal/storage"
 )
 
-// Options holds the flags of `bracer restore`.
+// Options holds the flags of `bracer restore` (spec fetch-restore, ADR-0015).
 type Options struct {
-	Instance      string // --instance: source instance in the manifest
-	Database      string // --database: source database
-	TS            string // --ts, defaults to latest
-	File          string // --file: the source is a fetched file instead of the bucket
-	Into          string // --into <instance>[/<db>]
-	IntoURLEnv    string // --into-url-env NAME
-	WithGlobals   bool   // --with-globals: only create the missing users
-	SkipDiskCheck bool   // --skip-disk-check
-	NoOwner       bool   // --no-owner
-	NoACL         bool   // --no-acl
-	DryRun        bool   // --dry-run
+	Instance      string   // --instance: source instance in the manifest
+	Databases     []string // --database (repeatable); empty: every database of the run
+	TS            string   // --ts: the run; default the latest environment file
+	File          string   // --file: a fetched file, preview only
+	IntoContainer string   // --into-container <name>
+	IntoLocal     int      // --into-local <port>
+	SocketDir     string   // --socket-dir, with --into-local
+	IntoURL       bool     // --into-url: ask for the URL
+	IntoURLEnv    string   // --into-url-env NAME
+	Preview       bool     // --preview: data to look at only
+	DryRun        bool     // --dry-run
+	SQLDir        string   // --sql-dir; default ./bracer-restore-<app>-<instance>-<ts>
+	AppURL        bool     // --app-url: ask for the app's URL
+	AppURLEnv     string   // --app-url-env NAME
 }
 
 // Deps is everything Run reaches outside; tests swap in fakes.
@@ -41,411 +42,490 @@ type Deps struct {
 	Shell          pg.Shell
 	Store          storage.Store
 	Secrets        *config.Secrets
-	GOOS           string
-	Tools          *pg.Tools // nil: built from Shell and GOOS
+	Tools          *pg.Tools // nil: built from Shell
 	Now            func() time.Time
 	Log            *slog.Logger
 	ReadIdentities func(path string) ([]age.Identity, []string, error)
-	// Connect defaults to backup.Connect.
+	// Connect defaults to backup.Connect; restore uses it for --into-container and --into-local.
 	Connect backup.ConnectFunc
+	// ContainerUser names the superuser inside a container (default: its POSTGRES_USER).
+	ContainerUser func(ctx context.Context, container string) (string, error)
+	// AskURL asks for the target URL without echo (--into-url); nil: no terminal.
+	AskURL func() (string, error)
+	// AskAppURL asks for the app's URL without echo (--app-url); nil: no terminal.
+	AskAppURL func() (string, error)
 	// Timeout for pg_restore; 0 = DefaultDrillTimeout (shares the drill.timeout setting).
 	Timeout time.Duration
+	// Started is called once the checks passed, before the data is loaded.
+	Started func(*Result)
 }
 
 // Result is the result of `restore` (`--json`, spec fetch-restore § Data model).
 type Result struct {
-	Kind           string         `json:"kind"`
-	App            string         `json:"app"`
-	Source         Source         `json:"source"`
-	Target         Target         `json:"target"`
-	Disk           *DiskCheck     `json:"disk,omitempty"`
-	Globals        *GlobalsResult `json:"globals,omitempty"`
-	OK             bool           `json:"ok"`
-	DryRun         bool           `json:"dry_run,omitempty"`
-	RestoreSeconds float64        `json:"restore_seconds"`
-	TablesExpected int            `json:"tables_expected"`
-	TablesFound    int            `json:"tables_found"`
-	MissingTables  []string       `json:"missing_tables,omitempty"`
-	RowMismatches  []RowMismatch  `json:"row_mismatches,omitempty"`
-	Error          string         `json:"error,omitempty"`
-	Warnings       []string       `json:"warnings,omitempty"`
+	Kind      string      `json:"kind"`
+	App       string      `json:"app"`
+	Mode      string      `json:"mode"` // full | data | preview
+	Source    Source      `json:"source"`
+	Target    Target      `json:"target"`
+	Checks    []Check     `json:"checks,omitempty"`
+	Notes     []string    `json:"notes,omitempty"`
+	SQLDir    string      `json:"sql_dir,omitempty"`
+	EnvUp     string      `json:"env_up,omitempty"`
+	EnvDown   string      `json:"env_down,omitempty"`
+	DataDown  string      `json:"data_down,omitempty"`
+	Apply     string      `json:"apply,omitempty"`   // how to apply a file: the command with <file>
+	Restart   string      `json:"restart,omitempty"` // after env-up, when a setting needs it
+	Verify    []Check     `json:"verify,omitempty"`  // the comparison after the load that failed
+	Databases []*DBResult `json:"databases"`
+	AppCheck  *AppCheck   `json:"app_check,omitempty"`
+	Disk      *DiskCheck  `json:"disk,omitempty"`
+	Preflight *Preflight  `json:"preflight,omitempty"` // --preview only
+	OK        bool        `json:"ok"`
+	DryRun    bool        `json:"dry_run,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Warnings  []string    `json:"warnings,omitempty"`
 }
 
-// Source is the dump being restored.
+// Source is where the dumps come from.
 type Source struct {
 	Instance  string `json:"instance,omitempty"`
-	DB        string `json:"db,omitempty"`
 	TS        string `json:"ts,omitempty"`
-	Key       string `json:"key,omitempty"`
+	Kind      string `json:"kind,omitempty"` // container | local | url
 	File      string `json:"file,omitempty"`
-	Bytes     int64  `json:"bytes,omitempty"`
 	Encrypted bool   `json:"encrypted"`
 	PgVersion string `json:"pg_version,omitempty"`
 }
 
-// Target is the target server and database.
+// Target is the target server, given on the command line and never stored.
 type Target struct {
-	Instance  string `json:"instance,omitempty"`
+	Container string `json:"container,omitempty"`
+	Local     string `json:"local,omitempty"` // socket path
 	URLEnv    string `json:"url_env,omitempty"`
-	Host      string `json:"host,omitempty"`
-	DB        string `json:"db"`
+	Host      string `json:"host,omitempty"` // host:port of a URL; no user or password
 	Runner    string `json:"runner"`
 	PgVersion string `json:"pg_version,omitempty"`
-	Exists    bool   `json:"exists"`
+	User      string `json:"user,omitempty"`
+	Superuser bool   `json:"superuser"`
 }
 
-// ErrExists: the target database already exists; restore never overwrites.
-var ErrExists = errors.New("database exists")
+// Preflight is the --preview check before anything is created.
+type Preflight struct {
+	OK             bool     `json:"ok"`
+	NeedsSuperuser []string `json:"needs_superuser,omitempty"`
+}
+
+// DBResult is one restored database.
+type DBResult struct {
+	SourceDB       string        `json:"source_db"`
+	TargetDB       string        `json:"target_db"`
+	State          string        `json:"state,omitempty"` // absent | empty | has_data, of the source name on the target
+	TS             string        `json:"ts,omitempty"`
+	Key            string        `json:"key,omitempty"`
+	Bytes          int64         `json:"bytes,omitempty"`
+	Encrypted      bool          `json:"encrypted"`
+	OK             bool          `json:"ok"`
+	RestoreSeconds float64       `json:"restore_seconds"`
+	TablesExpected int           `json:"tables_expected"`
+	TablesFound    int           `json:"tables_found"`
+	MissingTables  []string      `json:"missing_tables,omitempty"`
+	RowMismatches  []RowMismatch `json:"row_mismatches,omitempty"`
+	Checks         []CheckResult `json:"checks,omitempty"`
+	Attributes     *AttrResult   `json:"attributes,omitempty"`
+	Error          string        `json:"error,omitempty"`
+
+	dump *backup.Dump
+	info *ArchiveInfo
+}
+
+// ErrPreflight: the target needs changes the customer makes first (exit 2);
+// Result.Checks says which, Result.EnvUp has the SQL.
+var ErrPreflight = errors.New("the target is not ready for this restore")
 
 func (r *Result) warn(format string, a ...interface{}) {
 	r.Warnings = append(r.Warnings, fmt.Sprintf(format, a...))
 }
 
 // Run performs the restore (spec fetch-restore § Flow). *UsageError → exit 2;
-// other errors → exit 1; Result.Error records pg_restore/comparison errors.
+// ErrPreflight → exit 2 with the result; other errors → exit 1.
 func Run(ctx context.Context, cfg *config.App, o Options, d Deps) (*Result, error) {
 	d = withDefaults(d)
-	res := &Result{Kind: "restore", App: cfg.App, DryRun: o.DryRun}
+	n := 0
+	for _, set := range []bool{o.IntoContainer != "", o.IntoLocal != 0, o.IntoURL, o.IntoURLEnv != ""} {
+		if set {
+			n++
+		}
+	}
+	if n != 1 {
+		return nil, usagef("pass exactly one target: --into-container <name>, --into-local <port>, --into-url, or --into-url-env <NAME>")
+	}
+	if o.Preview || o.File != "" {
+		return runPreview(ctx, cfg, o, d)
+	}
+	res := &Result{Kind: "restore", App: cfg.App, DryRun: o.DryRun, Databases: []*DBResult{}}
 
-	// 1. Source.
-	var manifest *backup.Manifest
-	var sel *Selection
-	var globals *backup.Dump
-	if o.File == "" {
-		var err error
-		manifest, err = backup.LoadManifest(ctx, d.Store, storage.Join(cfg.Storage.Prefix, cfg.App, "manifest.json"), cfg.App)
-		if err != nil {
-			return nil, fmt.Errorf("load manifest: %w", err)
-		}
-		if o.Database == "" {
-			return nil, usagef("pass --database <name> (or --file <dump>)")
-		}
-		sel, err = Select(manifest, cfg, o.Instance, o.Database, o.TS, false)
-		if err != nil {
-			return nil, err
-		}
-		res.Source = Source{Instance: sel.Instance, DB: sel.Database, TS: sel.Dump.TS, Key: sel.Dump.Key, Bytes: sel.Dump.Bytes, Encrypted: sel.Dump.Encrypted, PgVersion: sel.PgVersion}
-		if sel.Dump.SHA256 == "" {
-			res.warn("manifest has no sha256 for this dump; its integrity cannot be checked")
-		}
-		if !sel.Dump.Encrypted && earlierEncrypted(manifest, sel) {
-			res.warn("this dump is not encrypted although an earlier dump of %s was; check that encryption was turned off on purpose", sel.Database)
-		}
-		if o.WithGlobals {
-			im := manifest.Instances[sel.Instance]
-			for _, g := range im.Globals.Dumps {
-				if g.TS == im.Globals.Latest {
-					globals = g
-				}
-			}
-			if globals == nil {
-				return nil, usagef("--with-globals: instance %s has no globals dump", sel.Instance)
-			}
-		}
-	} else {
-		if o.WithGlobals {
-			return nil, usagef("--with-globals needs the bucket; it cannot be combined with --file")
-		}
-		res.Source = Source{File: o.File}
+	// 1. One run from the bucket.
+	manifest, err := backup.LoadManifest(ctx, d.Store, storage.Join(cfg.Storage.Prefix, cfg.App, "manifest.json"), cfg.App)
+	if err != nil {
+		return nil, fmt.Errorf("load manifest: %w", err)
 	}
-	targetDB := o.Database
+	inst, err := ResolveInstance(manifest, cfg, o.Instance)
+	if err != nil {
+		return nil, err
+	}
+	im := manifest.Instances[inst]
+	rp, err := PickRun(im, inst, o.TS, o.Databases)
+	if err != nil {
+		return nil, err
+	}
+	res.Source = Source{Instance: inst, TS: rp.TS, PgVersion: im.PgVersion, Encrypted: rp.Env.Encrypted}
+	for _, dp := range rp.DBs {
+		res.Source.Encrypted = res.Source.Encrypted || dp.Encrypted
+	}
+	var ids *Identities
+	if res.Source.Encrypted {
+		ids = identities(cfg, d)
+	}
 
-	// 2. Target.
-	if (o.Into == "") == (o.IntoURLEnv == "") {
-		return nil, usagef("pass exactly one of --into <instance>[/<db>] or --into-url-env <NAME>")
+	// 2. Target, from the command line only (never stored).
+	conn, runner, spec, err := connectTarget(ctx, o, d, res)
+	if err != nil {
+		return nil, err
 	}
-	var conn pg.Conn
-	var runner pg.Runner
-	var in *config.Instance
-	if o.Into != "" {
-		name, db, _ := strings.Cut(o.Into, "/")
-		in = cfg.FindInstance(name)
-		if in == nil {
-			return nil, usagef("--into: instance %q is not in app.yaml", name)
-		}
-		if db != "" {
-			targetDB = db
-		}
-		var err error
-		conn, runner, err = d.Connect(ctx, d.Tools, *in, d.Secrets)
-		if err != nil {
-			return nil, fmt.Errorf("connect to %s: %w", name, err)
-		}
-		res.Target.Instance = name
-	} else {
-		raw, err := d.Secrets.Require(o.IntoURLEnv)
-		if err != nil {
-			return nil, usagef("--into-url-env: %v", err)
-		}
-		conn, err = pg.ParseURL(raw)
-		if err != nil {
-			return nil, usagef("--into-url-env %s: %v", o.IntoURLEnv, err)
-		}
-		res.Target.URLEnv = o.IntoURLEnv
-		// The database in the URL (postgres://…/newdb) is the target name; "postgres" or empty → the source name.
-		if conn.Database != "" && conn.Database != "postgres" {
-			targetDB = conn.Database
-		}
-		// Runner per ADR-0009: a host binary that is new enough, otherwise an image of the same major as
-		// the target server (version queried first). Connect to the maintenance database: the database
-		// in the URL may not exist yet (it is the target).
-		conn.Database = "postgres"
-		runner, _, err = d.Tools.Resolve(ctx, pg.Where{}, conn, 0)
-		if err != nil {
-			return nil, fmt.Errorf("connect to %s: %w", conn.Host, err)
-		}
-	}
-	if targetDB == "" {
-		if o.File != "" {
-			return nil, usagef("--file needs the target database name: --into <instance>/<db>, or a database in the --into-url-env URL")
-		}
-		return nil, usagef("target database name is required")
-	}
-	res.Target.DB = targetDB
-	res.Target.Host = hostPort(conn)
-	res.Target.Runner = runner.Describe()
 	admin := &pg.Client{Runner: runner, Conn: conn}
-	admin.Conn.Database = "postgres"
-	if v, err := admin.ServerVersion(ctx); err != nil {
+	if res.Target.PgVersion, err = admin.ServerVersion(ctx); err != nil {
 		return nil, fmt.Errorf("connect to target: %w", err)
-	} else {
-		res.Target.PgVersion = v
 	}
-	// The target user must be able to create databases (and users with --with-globals); the instance's
-	// backup user is read-only, so report right away, before downloading anything.
-	if ap, err := admin.AdminPrivileges(ctx); err != nil {
+	if runner, err = pickRestoreRunner(ctx, d, o, rp, runner, conn, res); err != nil {
+		return nil, err
+	}
+	admin = &pg.Client{Runner: runner, Conn: conn}
+
+	src, err := LoadSource(ctx, d.Store, rp, ids, runner, conn)
+	if err != nil {
+		return res, fmt.Errorf("%w; nothing was changed", err)
+	}
+	res.Source.Kind = src.Kind
+	res.Mode = src.Mode()
+	ap, err := admin.AdminPrivileges(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("check target user: %w", err)
-	} else if !ap.Superuser && (!ap.CreateDB || (o.WithGlobals && !ap.CreateRole)) {
-		need := "CREATEDB"
-		if ap.CreateDB {
-			need = "CREATEROLE (for --with-globals)"
-		}
-		return nil, usagef("user %s on %s cannot restore: it needs %s or superuser. A backup user (pg_read_all_data) is read-only by design; restore with --into-url-env pointing at an admin URL, or GRANT the privilege yourself", ap.Role, targetName(res.Target), need)
+	}
+	res.Target.User, res.Target.Superuser = ap.Role, ap.Superuser
+	if res.Mode == ModeFull && !ap.Superuser {
+		return res, usagef("a full backup restores only into a target where you connect as a superuser; %s on %s is not one.\n  To look at the data only, use --preview.", ap.Role, targetName(res.Target))
+	}
+	if res.Mode == ModeData {
+		res.warn("this backup has databases only (source was a URL): restoring data owned by %s, without users or privileges", ap.Role)
 	}
 	if pooler, info := admin.DetectPooler(ctx); pooler {
-		res.warn("target looks like a connection pooler (%s); pg_restore needs a direct connection (Supabase: port 5432, not 6543)", info)
-	}
-	if sel != nil && sel.PgVersion != "" && major(sel.PgVersion) > major(res.Target.PgVersion) {
-		res.warn("dump is from PostgreSQL %s, target is %s; pg_restore may reject a dump from a newer server", sel.PgVersion, res.Target.PgVersion)
-	}
-	// An archive from pg_dump N can only be read by pg_restore ≥ N (ADR-0009 § Amendments).
-	if sel != nil && pg.MajorOf(sel.Dump.ToolVersion) > 0 {
-		need := pg.MajorOf(sel.Dump.ToolVersion)
-		tv, tmaj, err := admin.ToolVersion(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("check pg_restore on target: %w", err)
-		}
-		if tmaj < need {
-			switch {
-			case o.IntoURLEnv != "" || (in != nil && in.Host != "") || (in != nil && in.URLEnv != ""):
-				// Host/URL: re-pick a runner that is new enough (a host binary of the same major, or the postgres:N image).
-				alt, perr := d.Tools.Pick(ctx, pg.Where{}, need)
-				if perr != nil {
-					return nil, fmt.Errorf("dump was made with pg_dump %s but pg_restore %s here cannot read it: %v", sel.Dump.ToolVersion, tv, perr)
-				}
-				runner = alt
-				admin = &pg.Client{Runner: runner, Conn: admin.Conn}
-				res.Target.Runner = runner.Describe()
-				if _, amaj, aerr := admin.ToolVersion(ctx); aerr != nil || amaj < need {
-					return nil, fmt.Errorf("dump was made with pg_dump %s; no pg_restore >= %d is available here (install the PostgreSQL %d client package or Docker)", sel.Dump.ToolVersion, need, need)
-				}
-			default:
-				// Container/pod/socket: pg_restore is the target server's own and cannot be swapped.
-				return nil, usagef("dump was made with pg_dump %s; pg_restore %s in %s cannot read it (archive format is newer). Restore from a host with pg_restore >= %d via --into-url-env", sel.Dump.ToolVersion, tv, targetName(res.Target), need)
-			}
-		}
-		if major(res.Target.PgVersion) < need {
-			res.warn("dump was made with pg_dump %s, target is PostgreSQL %s: pg_restore may report errors for settings this server does not know (pg_dump output is meant for the same or a newer server)", sel.Dump.ToolVersion, res.Target.PgVersion)
-		}
-	}
-	// Source locale (manifest): the ICU/builtin provider needs a target server that is new enough; if known
-	// up front, stop before downloading anything.
-	var loc *pg.Locale
-	if sel != nil {
-		loc = sel.Dump.Locale
-	}
-	if loc != nil {
-		if _, err := loc.CreateOptions(major(res.Target.PgVersion)); err != nil {
-			return nil, usagef("cannot create %s on %s: %v", targetDB, targetName(res.Target), err)
-		}
-	} else {
-		res.warn("source locale unknown (--file, or a manifest written by an older Bracer): %s is created with the server's default locale", targetDB)
-	}
-	// The source database's extensions must exist on the target (evidence:
-	// pg_available_extensions), checked before creating anything (spec fetch-restore § Flow 2).
-	if sel != nil && len(sel.Dump.Extensions) > 0 {
-		avail, err := admin.AvailableExtensions(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("check extensions on target: %w", err)
-		}
-		missing, differ := pg.MissingExtensions(sel.Dump.Extensions, avail)
-		if len(missing) > 0 {
-			return nil, usagef("target %s does not have extension %s that database %s uses; install it on the target first", targetName(res.Target), joinExtensions(missing), sel.Database)
-		}
-		for i, e := range differ {
-			res.warn("target has extension %s %s, the source database used %s %s; pg_restore installs the target's version", e.Name, e.Version, e.Name, versionOf(sel.Dump.Extensions, e.Name))
-			_ = i
-		}
+		res.warn("target looks like a connection pooler (%s); pg_restore needs a direct connection to the server", info)
 	}
 
-	// 3. Does the target database exist? There is no overwrite flag: the customer drops it themselves if they really want to.
-	exists, err := DatabaseExists(ctx, admin, targetDB)
+	// 3. Compare.
+	full := res.Mode == ModeFull
+	tgt, err := ReadTarget(ctx, admin, spec, full, src.Names(), src.Locales())
 	if err != nil {
-		return nil, fmt.Errorf("check database: %w", err)
+		return res, fmt.Errorf("read target: %w", err)
 	}
-	res.Target.Exists = exists
-	if exists {
-		how := fmt.Sprintf("restore into another name with --into %s/<name>", res.Target.Instance)
-		if res.Target.Instance == "" {
-			how = "put another database name in the URL path"
-		}
-		return res, fmt.Errorf("%w: database %s already exists on %s; %s, or drop it yourself first (bracer never drops databases)", ErrExists, targetDB, targetName(res.Target), how)
+	plan := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: res.Mode, Now: d.Now()})
+	res.Checks, res.Notes = plan.Checks, plan.Notes
+	res.Apply = applyCommand(spec, conn, tgt.Major)
+	for i, dp := range plan.DBs {
+		res.Databases = append(res.Databases, &DBResult{SourceDB: dp.Source, TargetDB: dp.Target, State: dp.State, TS: rp.TS,
+			Key: rp.DBs[i].Key, Bytes: rp.DBs[i].Bytes, Encrypted: rp.DBs[i].Encrypted, dump: rp.DBs[i]})
 	}
-
-	// Free disk on the target: actual data ≈ DiskFactor × the compressed dump.
-	dumpBytes := int64(0)
-	if sel != nil {
-		dumpBytes = sel.Dump.Bytes
-	} else if fi, err := os.Stat(o.File); err == nil {
-		dumpBytes = fi.Size()
+	var dumpBytes int64
+	for _, dp := range rp.DBs {
+		dumpBytes += dp.Bytes
 	}
 	dc := CheckDisk(ctx, runner, admin, dumpBytes)
 	res.Disk = &dc
-	if !dc.Checked {
-		res.warn("%s", dc.Error)
-	} else if !dc.Enough() {
-		if !o.SkipDiskCheck {
-			return res, fmt.Errorf("%w: %s has %s free at %s; restoring a %s dump may need about %s; free space or pass --skip-disk-check",
-				ErrDiskSpace, targetName(res.Target), humanBytes(dc.FreeBytes), dc.DataDirectory, humanBytes(dumpBytes), humanBytes(dc.NeedBytes))
+	if dc.Checked && !dc.Enough() {
+		res.warn("only %s free at %s, about %s may be needed", humanBytes(dc.FreeBytes), dc.DataDirectory, humanBytes(dc.NeedBytes))
+	}
+	dir := o.SQLDir
+	if dir == "" {
+		dir = "bracer-restore-" + cfg.App + "-" + inst + "-" + rp.TS
+	}
+	if !plan.OK() {
+		if len(plan.Up) > 0 && !o.DryRun {
+			if err := writeEnvFiles(dir, plan, res, spec); err != nil {
+				return res, fmt.Errorf("write SQL files: %w", err)
+			}
 		}
-		res.warn("only %s free at %s, about %s may be needed (--skip-disk-check)", humanBytes(dc.FreeBytes), dc.DataDirectory, humanBytes(dc.NeedBytes))
+		if plan.Restart {
+			res.Restart = plan.RestartCmd
+		}
+		return res, ErrPreflight
 	}
 	if o.DryRun {
 		return res, nil
 	}
 
-	// The age key only when the source is encrypted (file: recognized by the header).
-	var ids *Identities
-	if (sel != nil && (sel.Dump.Encrypted || (globals != nil && globals.Encrypted))) || o.File != "" {
-		path, perr := config.ExpandHome(cfg.AgeIdentityFile)
-		if perr != nil {
-			ids = &Identities{Err: perr}
-		} else {
-			ids = ReadIdentities(path, d.ReadIdentities)
-		}
+	// 4. Load: each database in one transaction, then ANALYZE.
+	if d.Started != nil {
+		d.Started(res)
 	}
-
-	// 4. Open the source, create database, globals, pg_restore over stdin.
-	var src interface {
-		Read([]byte) (int, error)
-		Close() error
-	}
-	if o.File != "" {
-		rc, enc, err := OpenFile(o.File, ids)
+	loaded := map[string]string{}
+	var targets []string
+	res.OK = true
+	for _, db := range res.Databases {
+		start := d.Now()
+		err := LoadDB(ctx, d.Store, db.dump, ids, runner, conn, db.TargetDB, res.Mode, d.Timeout)
+		db.RestoreSeconds = d.Now().Sub(start).Seconds()
 		if err != nil {
-			return res, fmt.Errorf("open %s: %w", o.File, err)
-		}
-		src, res.Source.Encrypted = rc, enc
-	} else {
-		rc, err := OpenDump(ctx, d.Store, sel.Dump, ids)
-		if err != nil {
-			return res, err
-		}
-		src = rc
-	}
-	defer src.Close()
-	// A pg_dump custom archive starts with "PGDMP"; a foreign/corrupt file stops us
-	// before creating the database (checksumErr is still called on the original src).
-	body := bufio.NewReader(src)
-	if head, _ := body.Peek(len(pgdmpMagic)); !bytes.Equal(head, []byte(pgdmpMagic)) {
-		return res, fmt.Errorf("%s is not a pg_dump custom-format archive (expected it to start with %q); nothing was created", sourceName(o, sel), pgdmpMagic)
-	}
-	if err := CreateDatabase(ctx, admin, targetDB, loc, major(res.Target.PgVersion)); err != nil {
-		return res, fmt.Errorf("create database %s: %w", targetDB, err)
-	}
-	leftInPlace := fmt.Sprintf("database %s was left in place for inspection; drop it with: drop database %s", targetDB, pg.QuoteIdent(targetDB))
-
-	// 5. Globals (after create database: a failure here only leaves an empty database behind).
-	if globals != nil {
-		rc, err := OpenDump(ctx, d.Store, globals, ids)
-		if err != nil {
-			return res, fmt.Errorf("globals: %w; %s", err, leftInPlace)
-		}
-		existing, err := ListRoles(ctx, admin)
-		if err != nil {
-			rc.Close()
-			return res, fmt.Errorf("globals: list users on target: %w; %s", err, leftInPlace)
-		}
-		res.Globals = GlobalsCreateMissing(ctx, runner, conn, existing, rc)
-		rc.Close()
-		if !res.Globals.OK {
-			res.warn("globals: %s", res.Globals.Error)
-		}
-		for _, g := range res.Globals.SkippedGrants {
-			res.warn("globals: skipped GRANT %s: the granted user already exists on the target and bracer does not add members to existing users", g)
-		}
-		for _, dg := range res.Globals.Downgraded {
-			res.warn("globals: privilege removed from user, %s (new users get no cluster-wide power; ALTER ROLE yourself if needed)", dg)
-		}
-		for _, g := range res.Globals.SkippedMissing {
-			res.warn("globals: skipped GRANT %s: that built-in role does not exist on the target's PostgreSQL version", g)
-		}
-		for _, g := range res.Globals.PgGrants {
-			role, _, _ := strings.Cut(g, " ->")
-			if RiskyPgRoles[role] {
-				res.warn("globals: GRANT %s gives the new user access beyond the restored database; REVOKE it if that is not intended", g)
+			db.Error = err.Error()
+			if ctx.Err() != nil {
+				db.Error = "pg_restore interrupted"
 			}
+			db.Error += "; the transaction rolled back, " + db.TargetDB + " is empty as before"
+			res.OK = false
+			continue
 		}
-		d.Log.Info("globals: users created", "created", len(res.Globals.Created), "existing_skipped", res.Globals.SkippedExisting, "ok", res.Globals.OK)
+		loaded[db.SourceDB] = db.TargetDB
+		targets = append(targets, db.TargetDB)
+		d.Log.Info("restored", "db", db.TargetDB, "seconds", fmt.Sprintf("%.1f", db.RestoreSeconds))
 	}
-	var extra []string
-	if o.NoOwner {
-		extra = append(extra, "--no-owner")
-	}
-	if o.NoACL {
-		extra = append(extra, "--no-acl")
-	}
-	start := d.Now()
-	rerr := Database(ctx, runner, conn, targetDB, extra, body, d.Timeout)
-	res.RestoreSeconds = d.Now().Sub(start).Seconds()
-	// A SHA-256 mismatch takes priority: for an encrypted dump, age reports the error before handing over
-	// the last chunk, so pg_restore only sees a truncated stream ("could not read input file").
-	if ce := checksumErr(src); ce != nil {
-		rerr = ce
-	}
-	if rerr != nil {
-		if ctx.Err() != nil {
-			res.Error = "pg_restore interrupted"
+	if len(targets) > 0 {
+		paths, err := WriteSQLFiles(dir, SQLFile{Suffix: "data-down", Header: dataDownHeader(targets, res.Apply), Statements: DataDown(tgt, targets)})
+		if err != nil {
+			res.warn("could not write data-down SQL: %v", err)
 		} else {
-			res.Error = rerr.Error()
+			res.SQLDir, res.DataDown = absPath(dir), paths[0]
 		}
-		res.Error += "\n" + leftInPlace
+	}
+	if !res.OK {
 		return res, nil
 	}
-	d.Log.Info("restored", "db", targetDB, "seconds", fmt.Sprintf("%.1f", res.RestoreSeconds))
 
-	// 6. Compare against the manifest (file: only count tables).
-	target := &pg.Client{Runner: runner, Conn: conn}
-	target.Conn.Database = targetDB
-	if sel != nil {
-		res.TablesExpected = len(sel.Dump.Tables)
-		cmp, err := Compare(ctx, target, sel.Dump.Tables)
+	// 5. Prove it: the environment again, the tables, drill.checks, the app.
+	after, err := ReadTarget(ctx, admin, spec, full, targets, src.Locales())
+	if err != nil {
+		return res, fmt.Errorf("read target after the load: %w", err)
+	}
+	check := MakePlan(PlanInput{Src: src, Tgt: after, Mode: res.Mode, Loaded: loaded, Now: d.Now()})
+	if !check.OK() {
+		res.Verify = check.Failed()
+		res.OK = false
+	}
+	dumps := map[string]*backup.Dump{}
+	for _, db := range res.Databases {
+		c := &pg.Client{Runner: runner, Conn: conn.WithDatabase(db.TargetDB)}
+		db.TablesExpected = len(db.dump.Tables)
+		cmp, err := Compare(ctx, c, db.dump.Tables)
 		if err != nil {
-			res.Error = fmt.Sprintf("compare tables: %v", err)
-			return res, nil
+			db.Error = fmt.Sprintf("compare tables: %v", err)
+			res.OK = false
+			continue
 		}
-		res.TablesFound, res.MissingTables, res.RowMismatches = cmp.Found, cmp.Missing, cmp.Mismatches
-		res.OK = cmp.OK()
-	} else {
-		tables, err := target.Tables(ctx)
+		db.TablesFound, db.MissingTables, db.RowMismatches = cmp.Found, cmp.Missing, cmp.Mismatches
+		db.Checks = RunChecks(ctx, c, cfg, db.SourceDB)
+		db.OK = cmp.OK()
+		for _, ch := range db.Checks {
+			db.OK = db.OK && ch.OK
+		}
+		res.OK = res.OK && db.OK
+		dumps[db.TargetDB] = db.dump
+	}
+	if o.AppURL || o.AppURLEnv != "" {
+		raw, err := appURL(o, d)
 		if err != nil {
-			res.Error = fmt.Sprintf("list tables: %v", err)
-			return res, nil
+			res.AppCheck = &AppCheck{Error: err.Error()}
+		} else {
+			res.AppCheck = CheckApp(ctx, d.Shell, pg.ImageForMajor(tgt.Major), appNetwork(tgt), raw, dumps)
 		}
-		res.TablesFound = len(tables)
-		res.OK = true
+		res.OK = res.OK && res.AppCheck.OK
 	}
 	return res, nil
+}
+
+// identities reads the age key named in app.yaml.
+func identities(cfg *config.App, d Deps) *Identities {
+	path, err := config.ExpandHome(cfg.AgeIdentityFile)
+	if err != nil {
+		return &Identities{Err: err}
+	}
+	return ReadIdentities(path, d.ReadIdentities)
+}
+
+// pickRestoreRunner: an archive from pg_dump N can only be read by pg_restore ≥ N.
+func pickRestoreRunner(ctx context.Context, d Deps, o Options, rp *RunPick, runner pg.Runner, conn pg.Conn, res *Result) (pg.Runner, error) {
+	need := 0
+	for _, dp := range rp.DBs {
+		need = max(need, pg.MajorOf(dp.ToolVersion))
+	}
+	if need == 0 {
+		return runner, nil
+	}
+	admin := &pg.Client{Runner: runner, Conn: conn}
+	tv, tmaj, err := admin.ToolVersion(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check pg_restore on target: %w", err)
+	}
+	if tmaj >= need {
+		return runner, nil
+	}
+	if o.IntoContainer != "" {
+		return nil, usagef("dumps were made with pg_dump %d; pg_restore %s in container %s cannot read them (archive format is newer)", need, tv, o.IntoContainer)
+	}
+	w := pg.Where{}
+	if o.IntoLocal != 0 {
+		w.Local = &pg.Local{Dir: socketDir(o), Port: o.IntoLocal}
+	}
+	alt, err := d.Tools.Pick(ctx, w, need)
+	if err != nil {
+		return nil, fmt.Errorf("dumps were made with pg_dump %d but pg_restore %s cannot read them: %v", need, tv, err)
+	}
+	res.Target.Runner = alt.Describe()
+	return alt, nil
+}
+
+func socketDir(o Options) string {
+	if o.SocketDir != "" {
+		return o.SocketDir
+	}
+	return config.DefaultSocketDir
+}
+
+// connectTarget builds the runner for the target given on the command line.
+func connectTarget(ctx context.Context, o Options, d Deps, res *Result) (pg.Conn, pg.Runner, TargetSpec, error) {
+	switch {
+	case o.IntoContainer != "":
+		user, err := d.ContainerUser(ctx, o.IntoContainer)
+		if err != nil {
+			return pg.Conn{}, nil, TargetSpec{}, usagef("--into-container: %v", err)
+		}
+		in := config.Instance{Name: o.IntoContainer, Container: o.IntoContainer, User: user}
+		conn, runner, err := d.Connect(ctx, d.Tools, in, d.Secrets)
+		if err != nil {
+			return conn, nil, TargetSpec{}, fmt.Errorf("connect to container %s: %w", o.IntoContainer, err)
+		}
+		conn.Database = "postgres"
+		res.Target.Container = o.IntoContainer
+		res.Target.Runner = runner.Describe()
+		return conn, runner, TargetSpec{Kind: "container", Container: o.IntoContainer, Shell: d.Shell}, nil
+	case o.IntoLocal != 0:
+		in := config.Instance{Name: "local", Local: &config.Local{Port: o.IntoLocal, SocketDir: o.SocketDir}}
+		conn, runner, err := d.Connect(ctx, d.Tools, in, d.Secrets)
+		if err != nil {
+			return conn, nil, TargetSpec{}, fmt.Errorf("connect to the local Postgres on port %d: %w", o.IntoLocal, err)
+		}
+		l := &pg.Local{Dir: socketDir(o), Port: o.IntoLocal}
+		res.Target.Local = l.SocketPath()
+		res.Target.Runner = runner.Describe()
+		return conn, runner, TargetSpec{Kind: "local", Local: l, Shell: d.Shell}, nil
+	}
+	var raw string
+	if o.IntoURL {
+		if d.AskURL == nil {
+			return pg.Conn{}, nil, TargetSpec{}, usagef("no terminal to ask for the target URL; pass it in an environment variable with --into-url-env <NAME>")
+		}
+		v, err := d.AskURL()
+		if err != nil {
+			return pg.Conn{}, nil, TargetSpec{}, usagef("--into-url: %v", err)
+		}
+		raw = strings.TrimSpace(v)
+	} else {
+		v, err := d.Secrets.Require(o.IntoURLEnv)
+		if err != nil {
+			return pg.Conn{}, nil, TargetSpec{}, usagef("--into-url-env: %v", err)
+		}
+		raw = v
+		res.Target.URLEnv = o.IntoURLEnv
+	}
+	conn, err := pg.ParseURL(raw)
+	if err != nil {
+		return conn, nil, TargetSpec{}, usagef("target URL: %v", err)
+	}
+	if conn.Database == "" {
+		conn.Database = "postgres"
+	}
+	runner, _, err := d.Tools.Resolve(ctx, pg.Where{}, conn, 0)
+	if err != nil {
+		return conn, nil, TargetSpec{}, fmt.Errorf("connect to %s: %w", hostPort(conn), err)
+	}
+	res.Target.Host = hostPort(conn)
+	res.Target.Runner = runner.Describe()
+	return conn, runner, TargetSpec{Kind: "url"}, nil
+}
+
+// applyCommand is how the customer applies a file to this target.
+func applyCommand(spec TargetSpec, conn pg.Conn, major int) string {
+	switch spec.Kind {
+	case "container":
+		return fmt.Sprintf("docker exec -i %s psql -U %s -d postgres -v ON_ERROR_STOP=1 < <file>", spec.Container, conn.User)
+	case "local":
+		h := ""
+		if spec.Local.Dir != config.DefaultSocketDir {
+			h = " -h " + spec.Local.Dir
+		}
+		return fmt.Sprintf("sudo -u postgres psql%s -p %d -d postgres -v ON_ERROR_STOP=1 < <file>", h, spec.Local.Port)
+	}
+	return fmt.Sprintf(`PGURL='<target URL>' docker run --rm -i --network host -e PGURL %s sh -c 'psql "$PGURL" -v ON_ERROR_STOP=1' < <file>`, pg.ImageForMajor(major))
+}
+
+// appNetwork: the app of a container target reaches it on the container's
+// network (db:5432 resolves as the app sees it); others from the host.
+func appNetwork(t *TargetState) string {
+	if t.Kind == "container" && t.Env.Container != nil && len(t.Env.Container.Networks) > 0 {
+		return t.Env.Container.Networks[0]
+	}
+	return "host"
+}
+
+func appURL(o Options, d Deps) (string, error) {
+	if o.AppURLEnv != "" {
+		return d.Secrets.Require(o.AppURLEnv)
+	}
+	if d.AskAppURL == nil {
+		return "", fmt.Errorf("no terminal to ask for the app URL; use --app-url-env <NAME>")
+	}
+	v, err := d.AskAppURL()
+	return strings.TrimSpace(v), err
+}
+
+func writeEnvFiles(dir string, plan *Plan, res *Result, spec TargetSpec) error {
+	head := func(what string) []string {
+		h := []string{
+			fmt.Sprintf("bracer restore: %s for the backup run %s of %s", what, res.Source.TS, res.Source.Instance),
+			"Apply with: " + res.Apply,
+		}
+		if what == "env-up" {
+			h = append(h, "Read it first. It may hold password hashes: delete this directory when done.",
+				"Then run the same bracer restore again.")
+			if plan.Restart {
+				h = append(h, "After it: "+plan.RestartCmd)
+			}
+		} else {
+			h = append(h, "Puts the target back as it was before env-up (safe to run twice).")
+			if plan.Restart {
+				h = append(h, "After it: "+plan.RestartCmd)
+			}
+		}
+		return h
+	}
+	paths, err := WriteSQLFiles(dir, SQLFile{Suffix: "env-up", Header: head("env-up"), Statements: plan.Up},
+		SQLFile{Suffix: "env-down", Header: head("env-down"), Statements: plan.Down})
+	if err != nil {
+		return err
+	}
+	res.SQLDir, res.EnvUp, res.EnvDown = absPath(dir), paths[0], paths[1]
+	return nil
+}
+
+func dataDownHeader(targets []string, apply string) []string {
+	return []string{
+		"bracer restore: data-down for " + strings.Join(targets, ", "),
+		"Empties the loaded databases again: drops each and recreates it as it was right before the load.",
+		"Apply with: " + apply,
+	}
+}
+
+func absPath(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return p
 }
 
 func withDefaults(d Deps) Deps {
@@ -464,11 +544,12 @@ func withDefaults(d Deps) Deps {
 	if d.Timeout == 0 {
 		d.Timeout = config.DefaultDrillTimeout
 	}
-	if d.GOOS == "" {
-		d.GOOS = "linux"
-	}
 	if d.Tools == nil {
-		d.Tools = pg.NewTools(d.Shell, d.GOOS)
+		d.Tools = pg.NewTools(d.Shell)
+	}
+	if d.ContainerUser == nil {
+		docker := d.Tools.Docker()
+		d.ContainerUser = docker.ContainerUser
 	}
 	return d
 }
@@ -478,16 +559,21 @@ func hostPort(c pg.Conn) string {
 		return ""
 	}
 	if c.Port != 0 {
-		return fmt.Sprintf("%s:%d", c.Host, c.Port)
+		return c.Host + ":" + strconv.Itoa(c.Port)
 	}
 	return c.Host
 }
 
 func targetName(t Target) string {
-	if t.Instance != "" {
-		return t.Instance
+	switch {
+	case t.Container != "":
+		return "container " + t.Container
+	case t.Local != "":
+		return "local " + t.Local
+	case t.Host != "":
+		return t.Host
 	}
-	return "$" + t.URLEnv
+	return "the target"
 }
 
 func major(v string) int {
@@ -496,7 +582,7 @@ func major(v string) int {
 	return n
 }
 
-// humanBytes is as in the CLI, used for the disk error message.
+// humanBytes is as in the CLI, used for the disk message.
 func humanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
@@ -510,57 +596,13 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// checksumErr returns the source stream's SHA-256 error if one was detected.
 // pgdmpMagic is the first 5 bytes of a custom archive (pg_dump -Fc).
 const pgdmpMagic = "PGDMP"
 
-// sourceName names the source for error messages.
-func sourceName(o Options, sel *Selection) string {
-	if o.File != "" {
-		return o.File
-	}
-	if sel != nil {
-		return sel.Dump.Key
-	}
-	return "the source"
-}
-
-func checksumErr(r io.Reader) error {
+// checksumErr returns the source stream's SHA-256 error if one was detected.
+func checksumErr(r interface{}) error {
 	if c, ok := r.(interface{ ChecksumErr() error }); ok {
 		return c.ChecksumErr()
 	}
 	return nil
-}
-
-// earlierEncrypted: an older dump of the same database was encrypted while the chosen one is not.
-func earlierEncrypted(m *backup.Manifest, sel *Selection) bool {
-	im := m.Instances[sel.Instance]
-	if im == nil || im.Databases[sel.Database] == nil {
-		return false
-	}
-	for _, dp := range im.Databases[sel.Database].Dumps {
-		if dp.Encrypted && dp.UploadedAt.Before(sel.Dump.UploadedAt) {
-			return true
-		}
-	}
-	return false
-}
-
-// joinExtensions: "postgis 3.4.2, pg_partman 5.0.1".
-func joinExtensions(exts []pg.Extension) string {
-	parts := make([]string, len(exts))
-	for i, e := range exts {
-		parts[i] = e.String()
-	}
-	return strings.Join(parts, ", ")
-}
-
-// versionOf returns the version of extension name in the manifest list.
-func versionOf(exts []pg.Extension, name string) string {
-	for _, e := range exts {
-		if e.Name == name {
-			return e.Version
-		}
-	}
-	return ""
 }

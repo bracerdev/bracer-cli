@@ -9,9 +9,8 @@ import (
 )
 
 // DiskFreer is a Runner that can measure free space on the Postgres server's
-// own filesystem (spec fetch-restore: disk check before restore). Only runners
-// that run on the same machine/container as the server have it: docker exec,
-// kubectl exec, host binaries. An ImageRunner to another host/cloud cannot measure it.
+// own filesystem (spec fetch-restore: disk check before restore). Only docker
+// exec into the server's container has it; an ImageRunner (URL) cannot measure it.
 type DiskFreer interface {
 	DiskFree(ctx context.Context, dir string) (int64, error)
 }
@@ -39,24 +38,6 @@ func dfArgs(dir string) []string { return []string{"-Pk", dir} }
 func (r ExecRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
 	var out bytes.Buffer
 	if err := r.Run(ctx, Conn{}, "df", dfArgs(dir), nil, &out); err != nil {
-		return 0, err
-	}
-	return ParseDF(out.Bytes())
-}
-
-// DiskFree: `df` inside the pod.
-func (r KubeExecRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
-	var out bytes.Buffer
-	if err := r.Run(ctx, Conn{}, "df", dfArgs(dir), nil, &out); err != nil {
-		return 0, err
-	}
-	return ParseDF(out.Bytes())
-}
-
-// DiskFree: `df` on the host (not via the Postgres binary directory).
-func (r LocalRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
-	var out bytes.Buffer
-	if _, err := r.Shell.Run(ctx, Cmd{Name: "df", Args: dfArgs(dir), Stdout: &out}); err != nil {
 		return 0, err
 	}
 	return ParseDF(out.Bytes())

@@ -5,8 +5,6 @@ package backup
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
 
 	"bracer.dev/bracer/internal/config"
 	"bracer.dev/bracer/internal/pg"
@@ -15,10 +13,11 @@ import (
 // ConnectFunc is the signature of Connect, so tests can replace it with a fake.
 type ConnectFunc func(ctx context.Context, tools *pg.Tools, in config.Instance, s *config.Secrets) (pg.Conn, pg.Runner, error)
 
-// Connect builds Conn + Runner for one instance in app.yaml per the ADR-0009
-// table: container → docker exec; pod → kubectl exec; socket → host binary;
-// host/URL → a recent enough host binary, then a Docker image. pg_major in
-// app.yaml is the major used to check the host binary; if absent, ask the server.
+// Connect builds Conn + Runner for one instance in app.yaml per ADR-0013 and
+// ADR-0015: container → docker exec (image on its network when it has no
+// pg_dump); local → postgres:<pg_major> over the mounted socket; URL → docker
+// run postgres:<pg_major>. pg_major in app.yaml picks the image; if
+// absent, ask the server.
 func Connect(ctx context.Context, tools *pg.Tools, in config.Instance, s *config.Secrets) (pg.Conn, pg.Runner, error) {
 	where, conn, err := Target(in, s)
 	if err != nil {
@@ -39,33 +38,26 @@ func Target(in config.Instance, s *config.Secrets) (pg.Where, pg.Conn, error) {
 	case config.KindContainer:
 		// The socket inside a container is usually `trust`, but not always (Bitnami:
 		// `local all all md5`): with password_env, pass it via -e PGPASSWORD.
-		if err := password(in, s, &conn); err != nil {
-			return pg.Where{}, conn, err
+		if in.PasswordEnv != "" {
+			v, err := s.Require(in.PasswordEnv)
+			if err != nil {
+				return pg.Where{}, conn, err
+			}
+			conn.Password = v
 		}
 		return pg.Where{Container: in.Container}, conn, nil
-	case config.KindPod:
-		ref, err := pg.ParsePodRef(in.Pod)
-		if err != nil {
-			return pg.Where{}, conn, fmt.Errorf("instance %s: %w", in.Name, err)
+	case config.KindLocal:
+		// Peer authentication over the socket first; password_env when pg_hba asks for one.
+		l := pg.Local{Dir: in.Local.Dir(), Port: in.Local.Port}
+		password := ""
+		if in.PasswordEnv != "" {
+			v, err := s.Require(in.PasswordEnv)
+			if err != nil {
+				return pg.Where{}, conn, err
+			}
+			password = v
 		}
-		if in.PasswordEnv != "" || in.PasswordFile != "" {
-			// kubectl exec cannot pass env outside argv (ADR-0009): say so plainly instead of silently ignoring it.
-			return pg.Where{}, conn, fmt.Errorf("instance %s: a password cannot be passed to a pod (kubectl exec has no way to set it without exposing it); remove password_env/password_file and allow the socket connection inside the pod, or use a postgres:// URL", in.Name)
-		}
-		return pg.Where{Pod: ref}, conn, nil
-	case config.KindSocket:
-		dir, port := in.SocketDir()
-		conn.Host, conn.Port = dir, port
-		if err := password(in, s, &conn); err != nil {
-			return pg.Where{}, conn, err
-		}
-		return pg.Where{SocketDir: dir}, conn, nil
-	case config.KindHost:
-		conn.Host, conn.Port = in.Host, in.Port
-		if err := password(in, s, &conn); err != nil {
-			return pg.Where{}, conn, err
-		}
-		return pg.Where{}, conn, nil
+		return pg.Where{Local: &l}, pg.LocalConn(l, in.User, password), nil
 	case config.KindURL:
 		v, err := s.Require(in.URLEnv)
 		if err != nil {
@@ -73,27 +65,12 @@ func Target(in config.Instance, s *config.Secrets) (pg.Where, pg.Conn, error) {
 		}
 		conn, err := pg.ParseURL(v)
 		if err != nil {
-			return pg.Where{}, conn, err
+			return pg.Where{}, conn, fmt.Errorf("instance %s: %s: %w", in.Name, in.URLEnv, err)
 		}
 		return pg.Where{}, conn, nil
 	}
-	return pg.Where{}, pg.Conn{}, fmt.Errorf("instance %s: invalid connection", in.Name)
-}
-
-func password(in config.Instance, s *config.Secrets, conn *pg.Conn) error {
-	switch {
-	case in.PasswordEnv != "":
-		v, err := s.Require(in.PasswordEnv)
-		if err != nil {
-			return err
-		}
-		conn.Password = v
-	case in.PasswordFile != "":
-		b, err := os.ReadFile(in.PasswordFile)
-		if err != nil {
-			return err
-		}
-		conn.Password = strings.TrimRight(string(b), "\r\n")
+	if legacy := in.Legacy(); legacy != "" {
+		return pg.Where{}, pg.Conn{}, fmt.Errorf("instance %s: %s no longer supported (ADR-0013)", in.Name, legacy)
 	}
-	return nil
+	return pg.Where{}, pg.Conn{}, fmt.Errorf("instance %s: invalid connection", in.Name)
 }

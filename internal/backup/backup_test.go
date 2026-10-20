@@ -27,12 +27,14 @@ import (
 
 // fakeRunner fakes psql/pg_dump/pg_dumpall by tool and SQL statement.
 type fakeRunner struct {
-	dbs      []string
-	payload  map[string]string // db → pg_dump contents
-	failDump string            // db whose pg_dump fails
-	super    bool
-	readAll  bool // pg_read_all_data
-	calls    []string
+	dbs        []string
+	payload    map[string]string // db → pg_dump contents
+	failDump   string            // db whose pg_dump fails
+	super      bool
+	readAll    bool   // pg_read_all_data
+	sysid      string // system_identifier; empty: pg_control_system() fails (managed)
+	noSettings bool   // shared_preload_libraries unreadable (no pg_read_all_settings)
+	calls      []string
 }
 
 func (f *fakeRunner) Describe() string { return "fake runner" }
@@ -48,8 +50,34 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 		switch {
 		case strings.HasPrefix(sql, "select 1"):
 			io.WriteString(stdout, "1\n")
+		case sql == "show server_version_num":
+			io.WriteString(stdout, "170011\n")
 		case strings.HasPrefix(sql, "show server_version"):
 			io.WriteString(stdout, "17.11\n")
+		// Environment record (ADR-0015).
+		case strings.HasPrefix(sql, "select (select rolname from pg_roles where oid = 10)"):
+			su := "f"
+			if f.super {
+				su = "t"
+			}
+			io.WriteString(stdout, "postgres\x1fbackup\x1f"+su+"\x1foff\x1f100\x1f\n")
+		case strings.HasPrefix(sql, "select name, setting, coalesce(unit, '')"):
+			io.WriteString(stdout, "DateStyle\x1fISO, MDY\x1f\x1fstring\x1fconfiguration file\x1fISO, MDY\x1fuser\n")
+		case strings.HasPrefix(sql, "select lower(name), coalesce(setting, '') from pg_file_settings"):
+			if !strings.Contains(sql, "auto.conf") {
+				io.WriteString(stdout, "datestyle\x1fiso, mdy\n")
+			}
+		case strings.HasPrefix(sql, "select lower(name) from pg_settings"),
+			strings.HasPrefix(sql, "select spcname"),
+			strings.HasPrefix(sql, "select 'function '"),
+			strings.HasPrefix(sql, "select 'subscription '"):
+		case strings.HasPrefix(sql, "select (select count(*) from pg_class"):
+			io.WriteString(stdout, "0\n")
+		case sql == "show shared_preload_libraries":
+			if f.noSettings {
+				return &pg.ExitError{Cmd: "psql", Code: 1, Stderr: []byte(`ERROR:  permission denied to examine "shared_preload_libraries"`)}
+			}
+			io.WriteString(stdout, "pg_stat_statements,timescaledb\n")
 		case strings.HasPrefix(sql, "select datname"):
 			io.WriteString(stdout, strings.Join(f.dbs, "\n")+"\n")
 		case strings.HasPrefix(sql, "select current_user"):
@@ -65,8 +93,15 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 			io.WriteString(stdout, "public\x1forders\x1f14302\npublic\x1fnew_table\x1f-1\n")
 		case strings.HasPrefix(sql, "select pg_encoding_to_char(encoding), datcollate, datctype"):
 			io.WriteString(stdout, "UTF8\x1fC.UTF-8\x1fC.UTF-8\x1fc\x1f\x1f\n")
-		case strings.HasPrefix(sql, "select extname, extversion from pg_extension"):
-			io.WriteString(stdout, "uuid-ossp\x1f1.1\n")
+		case strings.HasPrefix(sql, "select extname, extversion"):
+			if conn.Database != "template1" {
+				io.WriteString(stdout, "uuid-ossp\x1f1.1\x1fpublic\n")
+			}
+		case strings.HasPrefix(sql, "select system_identifier"):
+			if f.sysid == "" {
+				return &pg.ExitError{Cmd: "psql", Code: 1, Stderr: []byte("ERROR:  permission denied for function pg_control_system")}
+			}
+			io.WriteString(stdout, f.sysid+"\n")
 		default:
 			return fmt.Errorf("fake: unexpected sql %q", sql)
 		}
@@ -255,6 +290,9 @@ func TestRunPlainDumpsAndManifest(t *testing.T) {
 	if im == nil || im.PgVersion != "17.11" || !im.Globals.HasPasswords || im.Globals.Latest == "" {
 		t.Fatalf("manifest instance: %+v", im)
 	}
+	if im.SharedPreloadLibraries == nil || *im.SharedPreloadLibraries != "pg_stat_statements,timescaledb" {
+		t.Errorf("manifest shared_preload_libraries: %v", im.SharedPreloadLibraries)
+	}
 	shop := im.Databases["shop"]
 	if shop == nil || len(shop.Dumps) != 1 || shop.Latest != shop.Dumps[0].TS {
 		t.Fatalf("manifest shop: %+v", shop)
@@ -263,8 +301,17 @@ func TestRunPlainDumpsAndManifest(t *testing.T) {
 	if d.Locale == nil || *d.Locale != (pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C.UTF-8"}) {
 		t.Errorf("manifest locale: %+v", d.Locale)
 	}
-	if len(d.Extensions) != 1 || d.Extensions[0] != (pg.Extension{Name: "uuid-ossp", Version: "1.1"}) {
+	if len(d.Extensions) != 1 || d.Extensions[0] != (pg.Extension{Name: "uuid-ossp", Version: "1.1", Schema: "public"}) {
 		t.Errorf("manifest extensions: %+v", d.Extensions)
+	}
+	// ADR-0015: one ts per run, shared by every dump, the globals and the environment record.
+	im = st.manifest(t).Instances["main"]
+	if im.Kind != "container" || len(im.Env.Dumps) != 1 || im.Env.Latest != d.TS || im.Globals.Latest != d.TS || im.Databases["postgres"].Latest != d.TS {
+		t.Errorf("run ts: kind %s, env %+v, globals %s, shop %s", im.Kind, im.Env, im.Globals.Latest, d.TS)
+	}
+	var env pg.Env
+	if err := json.Unmarshal(st.objects[im.Env.Dumps[0].Key], &env); err != nil || env.SourceKind != "container" || env.ServerVersionNum != 170011 || !env.HasFileSettings || len(env.Settings) != 1 {
+		t.Errorf("environment record: %v %+v", err, env)
 	}
 	sum := sha256.Sum256([]byte("PGDMP-shop"))
 	if d.Bytes != int64(len("PGDMP-shop")) || d.SHA256 != hex.EncodeToString(sum[:]) || d.Encrypted || d.Recipient != nil {
@@ -588,7 +635,7 @@ func TestRetentionNeverPrunesThisRunAndWarnsOrphans(t *testing.T) {
 }
 
 // Container with password_env (Bitnami demands a password even over the socket): the
-// password must go into Conn so ExecRunner passes -e PGPASSWORD; pod with password_env → clear error.
+// password must go into Conn so ExecRunner passes -e PGPASSWORD; a pod (before ADR-0013) → clear error.
 func TestTargetPasswordForContainerNotPod(t *testing.T) {
 	sec := config.NewSecrets(map[string]string{"PW": "s3cret"}, "test")
 	_, conn, err := Target(config.Instance{Name: "c", Container: "db", User: "postgres", PasswordEnv: "PW", Databases: config.Databases{All: true}}, sec)
@@ -599,7 +646,74 @@ func TestTargetPasswordForContainerNotPod(t *testing.T) {
 	if err != nil || conn.Password != "" {
 		t.Fatalf("container without password_env: conn=%+v err=%v", conn, err)
 	}
-	if _, _, err = Target(config.Instance{Name: "p", Pod: "ns/pg", User: "postgres", PasswordEnv: "PW", Databases: config.Databases{All: true}}, sec); err == nil || !strings.Contains(err.Error(), "cannot be passed to a pod") {
-		t.Fatalf("pod with password_env: err=%v", err)
+	if _, _, err = Target(config.Instance{Name: "p", Pod: "ns/pg", User: "postgres", PasswordEnv: "PW", Databases: config.Databases{All: true}}, sec); err == nil || !strings.Contains(err.Error(), "ADR-0013") {
+		t.Fatalf("pod: err=%v", err)
+	}
+}
+
+// spec backup § Flow 3a2: another cluster at the same place is still dumped, but no old
+// dump is deleted; the dumps carry system_id; a different major only warns.
+func TestIdentityChangedHoldsRetention(t *testing.T) {
+	st := newMemStore()
+	old := newManifest("shop")
+	im := old.instance("main")
+	for i, ts := range []string{"2026-10-14T030000Z", "2026-10-15T030000Z"} {
+		key := "bracer/shop/main/shop/" + ts + ".dump"
+		st.objects[key] = []byte("old")
+		im.database("shop").addDump(&Dump{TS: ts, Key: key, UploadedAt: time.Date(2026, 10, 14+i, 3, 0, 0, 0, time.UTC), SystemID: "7698217040907026472"})
+	}
+	SaveManifest(context.Background(), st, "bracer/shop/manifest.json", old, time.Now())
+	cfg := baseCfg()
+	cfg.Instances[0].Databases = config.Databases{List: []config.Database{{Name: "shop"}}}
+	cfg.Instances[0].SystemID = "7698217040907026472"
+	cfg.Instances[0].PgMajor = 16
+	r := &fakeRunner{payload: map[string]string{"shop": "new"}, super: true, sysid: "7562871935211888659"}
+	d := deps(st, r)
+	d.ConfigPath = "/srv/shop/app.yaml"
+	res, err := Run(context.Background(), cfg, d)
+	if err != nil || !res.OK {
+		t.Fatal(err, res)
+	}
+	ir := res.Instances[0]
+	if !ir.IdentityChanged || ir.SystemID != "7562871935211888659" || len(st.deleted) != 0 {
+		t.Errorf("identity_changed=%v system_id=%s deleted=%v", ir.IdentityChanged, ir.SystemID, st.deleted)
+	}
+	all := strings.Join(res.Warnings, "\n")
+	if !strings.Contains(all, "main is a different Postgres cluster than before (initialized 2025-10-19") || !strings.Contains(all, "Fix: bracer init -c /srv/shop/app.yaml") || !strings.Contains(all, "Postgres on main is now 17 (app.yaml says 16)") {
+		t.Errorf("warnings: %v", res.Warnings)
+	}
+	mf := st.manifest(t)
+	dumps := mf.Instances["main"].Databases["shop"].Dumps
+	if len(dumps) != 3 || dumps[2].SystemID != "7562871935211888659" {
+		t.Errorf("dumps: %+v", dumps)
+	}
+
+	// Same cluster → retention runs again; managed without pg_control_system() → no check, no failure.
+	r.sysid = "7562871935211888659"
+	cfg.Instances[0].SystemID = r.sysid
+	if res, err = Run(context.Background(), cfg, d); err != nil || res.Instances[0].IdentityChanged || len(st.deleted) == 0 {
+		t.Errorf("same cluster: %v %+v deleted=%v", err, res.Instances[0], st.deleted)
+	}
+	r.sysid = ""
+	if res, err = Run(context.Background(), cfg, d); err != nil || !res.OK || res.Instances[0].IdentityChanged {
+		t.Errorf("managed: %v %+v", err, res)
+	}
+}
+
+// ADR-0014: a backup user without pg_read_all_settings cannot read
+// shared_preload_libraries; the backup still succeeds, the field stays empty
+// and a warning names the GRANT.
+func TestRunPreloadLibrariesUnreadable(t *testing.T) {
+	st := newMemStore()
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "PGDMP-shop"}, super: true, noSettings: true}
+	res, err := Run(context.Background(), baseCfg(), deps(st, r))
+	if err != nil || !res.OK {
+		t.Fatalf("res %+v, err %v", res, err)
+	}
+	if im := st.manifest(t).Instances["main"]; im.SharedPreloadLibraries != nil {
+		t.Errorf("shared_preload_libraries = %q", *im.SharedPreloadLibraries)
+	}
+	if w := strings.Join(res.Warnings, "\n"); !strings.Contains(w, "GRANT pg_read_all_settings TO") {
+		t.Errorf("warnings: %s", w)
 	}
 }

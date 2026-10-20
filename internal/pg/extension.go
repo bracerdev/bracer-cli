@@ -13,6 +13,7 @@ import (
 type Extension struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
+	Schema  string `json:"schema,omitempty"` // empty in manifests written before ADR-0015
 }
 
 func (e Extension) String() string { return e.Name + " " + e.Version }
@@ -20,7 +21,7 @@ func (e Extension) String() string { return e.Name + " " + e.Version }
 // Extensions reads pg_extension of the connected database, skipping plpgsql
 // (every database has it, every image has it).
 func (c *Client) Extensions(ctx context.Context) ([]Extension, error) {
-	rows, err := c.Query(ctx, "select extname, extversion from pg_extension where extname <> 'plpgsql' order by extname")
+	rows, err := c.Query(ctx, "select extname, extversion, extnamespace::regnamespace::text from pg_extension where extname <> 'plpgsql' order by extname")
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +30,11 @@ func (c *Client) Extensions(ctx context.Context) ([]Extension, error) {
 		if len(r) < 2 || r[0] == "" {
 			return nil, fmt.Errorf("unexpected pg_extension row: %q", r)
 		}
-		out = append(out, Extension{Name: r[0], Version: r[1]})
+		e := Extension{Name: r[0], Version: r[1]}
+		if len(r) > 2 {
+			e.Schema = strings.Trim(r[2], `"`)
+		}
+		out = append(out, e)
 	}
 	return out, nil
 }
@@ -104,4 +109,22 @@ func majorMinor(v string) string {
 		return v
 	}
 	return parts[0] + "." + parts[1]
+}
+
+// PreloadNeeds splits the source's shared_preload_libraries into the libraries
+// a restore needs (named like an extension the databases use: timescaledb,
+// pg_cron, citus…) and the rest (auto_explain…), which a restore does not need.
+func PreloadNeeds(preload string, exts []Extension) (needed, others []string) {
+	used := map[string]bool{}
+	for _, e := range exts {
+		used[e.Name] = true
+	}
+	for _, lib := range SplitLibraries(preload) {
+		if used[lib] {
+			needed = append(needed, lib)
+		} else {
+			others = append(others, lib)
+		}
+	}
+	return needed, others
 }

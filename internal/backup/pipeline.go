@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -68,4 +69,29 @@ func streamToStore(ctx context.Context, runner pg.Runner, conn pg.Conn, tool str
 		return 0, "", putErr
 	}
 	return counter.n, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// putBytes stores a small object (environment file, app.yaml copy):
+// [age] → sha256 + byte count → Put.
+func putBytes(ctx context.Context, st storage.Store, key string, data []byte, recipient string) (int64, string, error) {
+	body := data
+	if recipient != "" {
+		var buf bytes.Buffer
+		enc, err := crypto.Encrypt(&buf, recipient)
+		if err != nil {
+			return 0, "", err
+		}
+		if _, err := enc.Write(data); err != nil {
+			return 0, "", err
+		}
+		if err := enc.Close(); err != nil {
+			return 0, "", err
+		}
+		body = buf.Bytes()
+	}
+	sum := sha256.Sum256(body)
+	if err := st.Put(ctx, key, bytes.NewReader(body), int64(len(body))); err != nil {
+		return 0, "", err
+	}
+	return int64(len(body)), hex.EncodeToString(sum[:]), nil
 }

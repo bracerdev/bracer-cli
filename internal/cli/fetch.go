@@ -29,6 +29,7 @@ func runFetch(ctx context.Context, args []string, d backupDeps) int {
 	instance := fs.String("instance", "", "instance to fetch from (default: the only one with backups)")
 	database := fs.String("database", "", "database to fetch")
 	globals := fs.Bool("globals", false, "fetch the globals dump (users and their settings) instead of a database")
+	env := fs.Bool("env", false, "fetch the environment record of the run (settings, roles' server, image) instead of a database")
 	ts := fs.String("ts", "", "dump timestamp as shown by --list (default: latest)")
 	out := fs.String("o", "", "output file, or - for stdout (default: <app>-<instance>-<db>-<ts>.dump)")
 	raw := fs.Bool("raw", false, "keep the object as stored (encrypted), do not decrypt")
@@ -58,7 +59,15 @@ func runFetch(ctx context.Context, args []string, d backupDeps) int {
 		return exitOK
 	}
 
-	sel, err := restore.Select(manifest, cfg, *instance, *database, *ts, *globals)
+	var sel *restore.Selection
+	switch {
+	case *env && (*globals || *database != ""):
+		return fail(exitUsage, "--env fetches the environment record; it does not go with --globals or --database")
+	case *env:
+		sel, err = restore.SelectEnv(manifest, cfg, *instance, *ts)
+	default:
+		sel, err = restore.Select(manifest, cfg, *instance, *database, *ts, *globals)
+	}
 	if err != nil {
 		return fail(exitUsage, "%v", err)
 	}
@@ -79,7 +88,8 @@ func runFetch(ctx context.Context, args []string, d backupDeps) int {
 	var f *os.File
 	path := *out
 	if path == "-" {
-		if of, ok := d.stdout.(*os.File); ok && term.IsTerminal(int(of.Fd())) {
+		text := (sel.Env || sel.Globals) && !(*raw && dp.Encrypted)
+		if of, ok := d.stdout.(*os.File); ok && !text && term.IsTerminal(int(of.Fd())) {
 			return fail(exitUsage, "refusing to write a binary dump to a terminal; use -o <file>")
 		}
 		w = d.stdout
@@ -112,8 +122,11 @@ func runFetch(ctx context.Context, args []string, d backupDeps) int {
 		return fail(exitError, "%v", err)
 	}
 	what := sel.Database
-	if sel.Globals {
+	switch {
+	case sel.Globals:
 		what = "globals"
+	case sel.Env:
+		what = "env"
 	}
 	enc := "not encrypted"
 	switch {
@@ -135,8 +148,11 @@ var reFileChar = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 // defaultFetchName: <app>-<instance>-<db>-<ts>.dump[.age] (globals: .sql).
 func defaultFetchName(app string, sel *restore.Selection, raw bool) string {
 	what, ext := sel.Database, ".dump"
-	if sel.Globals {
+	switch {
+	case sel.Globals:
 		what, ext = "globals", ".sql"
+	case sel.Env:
+		what, ext = "env", ".json"
 	}
 	name := reFileChar.ReplaceAllString(strings.Join([]string{app, sel.Instance, what, sel.Dump.TS}, "-"), "_") + ext
 	if raw && sel.Dump.Encrypted {

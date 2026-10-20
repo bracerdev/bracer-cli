@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -104,14 +105,6 @@ LISTEN 0 4096 *:22 *:*
 	if len(ls) != 3 || ls[0].Port != 5432 || ls[0].Process != "postgres" || ls[1].Addr != "::1" || ls[2].Addr != "0.0.0.0" || ls[2].Process != "" {
 		t.Errorf("parseSS = %+v", ls)
 	}
-	lsof := `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
-postgres 4242 alice    7u  IPv6 0x1      0t0  TCP [::1]:5433 (LISTEN)
-ssh     15281 alice   55u  IPv4 0x2      0t0  TCP *:15432 (LISTEN)
-`
-	ls = parseLsof(lsof)
-	if len(ls) != 2 || ls[0].Port != 5433 || ls[0].Process != "postgres" || ls[1].Port != 15432 || ls[1].Process != "ssh" {
-		t.Errorf("parseLsof = %+v", ls)
-	}
 }
 
 func TestDiscoverMergesMappedPort(t *testing.T) {
@@ -130,18 +123,20 @@ func TestDiscoverMergesMappedPort(t *testing.T) {
 		probed[fmt.Sprintf("%s:%d", host, port)] = true
 		return true, nil
 	}
-	cands, _ := Discover(context.Background(), []*Container{ct}, nil, hs, probe)
+	d := Discover(context.Background(), []*Container{ct}, hs, probe)
+	cands := d.Candidates
+	// The sockets are the clusters (ADR-0015): the TCP row of 5433 is folded into its socket.
 	if len(cands) != 3 {
-		t.Fatalf("want 3 candidates (container, :5433, socket 5440), got %d: %+v", len(cands), cands)
+		t.Fatalf("want 3 candidates (container, local 5433, local 5440), got %d: %+v", len(cands), cands)
 	}
 	if cands[0].Container != ct || !strings.Contains(cands[0].Label(), "published on localhost:15432") {
 		t.Errorf("candidate 0: %s", cands[0].Label())
 	}
-	if cands[1].Host != "127.0.0.1" || cands[1].Port != 5433 || cands[1].Socket != "/tmp/.s.PGSQL.5433" || cands[1].Confirmed == nil || !*cands[1].Confirmed {
+	if l := cands[1].Local; l == nil || l.Port != 5433 || l.Dir != "/tmp" {
 		t.Errorf("candidate 1: %+v", cands[1])
 	}
-	if cands[2].Host != "" || cands[2].Port != 5440 || cands[2].Confirmed != nil {
-		t.Errorf("candidate 2 (socket only): %+v", cands[2])
+	if l := cands[2].Local; l == nil || l.Port != 5440 || l.Dir != "/var/run/postgresql" {
+		t.Errorf("candidate 2: %+v", cands[2])
 	}
 	if !probed["127.0.0.1:5433"] || len(probed) != 1 {
 		t.Errorf("probe sai: %v", probed)
@@ -194,14 +189,14 @@ func TestRunnersBuildDockerArgsWithoutSecrets(t *testing.T) {
 		t.Error("password must go into the docker process env")
 	}
 
-	r := ImageRunner{Shell: sh, Image: "postgres:17-alpine", HostGateway: true}
-	conn = Conn{Host: "localhost", Port: 5433, User: "u", Database: "d"}
+	r := NewURLRunner(sh, "postgres:17-alpine")
+	conn = Conn{Host: "127.0.0.1", Port: 5433, User: "u", Database: "d"}
 	if err := r.Run(context.Background(), conn, "pg_dump", []string{"-Fc"}, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	args = strings.Join(sh.calls[1].Args, " ")
-	if !strings.Contains(args, "--add-host=host.docker.internal:host-gateway") || !contains(sh.calls[1].Env, "PGHOST=host.docker.internal") {
-		t.Errorf("macOS runner must rewrite localhost → host.docker.internal: %s %v", args, sh.calls[1].Env)
+	if !strings.Contains(args, "--network host") || !contains(sh.calls[1].Env, "PGHOST=127.0.0.1") {
+		t.Errorf("URL runner must use the host network, 127.0.0.1 unchanged: %s %v", args, sh.calls[1].Env)
 	}
 
 	r = ImageRunner{Shell: sh, Image: "postgres:17-alpine", Network: "container:shop-db"}
@@ -259,8 +254,40 @@ func TestFixRoleSQLByMajor(t *testing.T) {
 		t.Errorf("PG13: %q", got)
 	}
 	for _, m := range []int{0, 14, 18} {
-		if got := FixRoleSQL("b", m); !strings.Contains(got, "GRANT pg_read_all_data TO b") || strings.Contains(got, "SUPERUSER") {
+		if got := FixRoleSQL("b", m); !strings.Contains(got, "GRANT pg_read_all_data TO b") || !strings.Contains(got, "GRANT pg_read_all_settings TO b") || strings.Contains(got, "SUPERUSER") {
 			t.Errorf("PG%d: %q", m, got)
 		}
+	}
+}
+
+// spec init § Flow 1b: Postgres from apt runs as user postgres, so `ss -ltnp`
+// run by another user shows no process. Such ports are kept only when
+// SSLRequest answers; the rest (sshd, DNS…) are dropped without a warning.
+func TestDiscoverUnseenProcessNeedsSSLRequest(t *testing.T) {
+	hs := HostScan{
+		Listeners: []Listener{
+			{Addr: "127.0.0.1", Port: 5433}, // apt Postgres, process not visible
+			{Addr: "0.0.0.0", Port: 22},     // sshd (root)
+			{Addr: "127.0.0.53", Port: 53},  // resolver
+		},
+		Sockets: map[int]string{5433: "/var/run/postgresql/.s.PGSQL.5433"},
+	}
+	var mu sync.Mutex
+	probed := map[int]bool{}
+	probe := func(_ context.Context, _ string, port int) (bool, error) {
+		mu.Lock()
+		probed[port] = true
+		mu.Unlock()
+		return port == 5433, nil
+	}
+	d := Discover(context.Background(), nil, hs, probe)
+	if len(d.Candidates) != 1 || d.Candidates[0].Local == nil || d.Candidates[0].Local.Port != 5433 {
+		t.Fatalf("candidates: %+v", d.Candidates)
+	}
+	if len(probed) != 3 {
+		t.Errorf("every unseen port must be probed: %v", probed)
+	}
+	if len(d.Warnings) != 0 {
+		t.Errorf("warnings %v", d.Warnings)
 	}
 }

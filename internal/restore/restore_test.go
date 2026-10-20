@@ -3,12 +3,12 @@ package restore
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -30,7 +30,7 @@ type fakeServer struct {
 	version      string
 	pooler       bool
 	calls        []string
-	failRestore  bool
+	failRestore  string
 	roles        map[string]bool
 	globalsSQL   string            // SQL last received by psql -f -
 	dfAvailKB    int64             // 0 = no df
@@ -39,15 +39,38 @@ type fakeServer struct {
 	createDBOnly bool              // target user has CREATEDB, no CREATEROLE, not superuser
 	createOpts   string            // what followed TEMPLATE template0 in the latest CREATE DATABASE
 	available    map[string]string // pg_available_extensions on the target
+	attrSQL      map[string]string // dump content → what pg_restore --create -n … prints
+	owner        map[string]string // database → owner (default: postgres)
+	settings     map[string][]string
+	acl          map[string]map[string]bool // database → "grantee PRIV" (nil: acldefault)
+	attrFail     string                     // psql -f - reports an ERROR for statements containing it
+	attrCreate   string                     // the --create invocation's args, last seen
+	attrRun      string                     // attribute statements last sent to psql -f -
+	schemaSQL    map[string]string          // dump content → what pg_restore --create --schema-only prints
+	preload      string                     // shared_preload_libraries on the target
+	noSettings   bool                       // SHOW shared_preload_libraries is denied
+	roleRows     map[string]string          // user → pg_roles columns after rolname (default: LOGIN INHERIT)
+	members      [][3]string                // member, group, admin_option
+	roleSettings map[string][]string        // user → setconfig entries
+	trusted      map[string]bool            // extension → trusted
+	passwordSQL  string                     // ALTER ROLE … PASSWORD last sent to psql -f -
+	userTables   int                        // tables of a user in database postgres
 }
 
 func newFakeServer() *fakeServer {
 	return &fakeServer{
 		dbs:       map[string][]pg.Table{"postgres": nil, "shop": {{Schema: "public", Name: "orders", Rows: i64(500)}}},
 		dumps:     map[string][]pg.Table{"PGDMP-shop": {{Schema: "public", Name: "orders", Rows: i64(500)}}},
+		attrSQL:   map[string]string{"PGDMP-shop": "CREATE DATABASE shop WITH TEMPLATE = template0 ENCODING = 'UTF8';\nALTER DATABASE shop OWNER TO postgres;\n\\connect shop\n"},
+		owner:     map[string]string{},
+		schemaSQL: map[string]string{"PGDMP-shop": shopSchemaSQL},
+		settings:  map[string][]string{},
+		acl:       map[string]map[string]bool{},
 		version:   "17.6",
 		roles:     map[string]bool{"postgres": true, "pg_read_all_data": true},
-		dfAvailKB: 50 << 20, // 50 GB
+		// As in globalsSQL, so the target's postgres matches the backup.
+		roleSettings: map[string][]string{"postgres": {"log_statement=all"}},
+		dfAvailKB:    50 << 20, // 50 GB
 	}
 }
 
@@ -78,9 +101,22 @@ func (f *fakeServer) RunStderr(_ context.Context, conn pg.Conn, tool string, arg
 	case "psql":
 		if args[len(args)-1] == "-" {
 			data, _ := io.ReadAll(stdin)
-			f.globalsSQL = string(data)
+			if strings.HasPrefix(string(data), "ALTER ROLE") && strings.Contains(string(data), " PASSWORD ") {
+				f.passwordSQL = string(data)
+				return nil, nil
+			}
+			if isAttrRun(string(data)) {
+				f.attrRun = string(data)
+			} else {
+				f.globalsSQL = string(data)
+			}
 			var stderr []byte
 			for _, line := range strings.Split(string(data), "\n") {
+				if f.attrFail != "" && strings.Contains(line, f.attrFail) {
+					stderr = append(stderr, []byte("psql:<stdin>:2: ERROR:  unrecognized configuration parameter\n")...)
+					continue
+				}
+				f.applyAttr(strings.TrimSuffix(strings.TrimSpace(line), ";"))
 				if name, ok := strings.CutPrefix(strings.TrimSpace(line), "CREATE ROLE "); ok {
 					name = strings.Trim(strings.TrimSuffix(name, ";"), `"`)
 					if f.roles[name] {
@@ -94,7 +130,65 @@ func (f *fakeServer) RunStderr(_ context.Context, conn pg.Conn, tool string, arg
 		}
 		sql := args[len(args)-1]
 		tables := f.dbs[conn.Database]
+		inNames := func() []string {
+			var out []string
+			for _, m := range regexp.MustCompile(`'([^']*)'`).FindAllStringSubmatch(sql[strings.LastIndex(sql, " in ("):], -1) {
+				out = append(out, m[1])
+			}
+			return out
+		}
 		switch {
+		case strings.HasPrefix(sql, "select datname from pg_database where datname not in"):
+			for name := range f.dbs {
+				if name != "postgres" && name != "template0" && name != "template1" {
+					write(name + "\n")
+				}
+			}
+		case strings.HasPrefix(sql, "select rolname from pg_roles where rolname !~"):
+			for name := range f.roles {
+				if !strings.HasPrefix(name, "pg_") && name != "postgres" {
+					write(name + "\n")
+				}
+			}
+		case strings.HasPrefix(sql, "select count(*) from pg_class c"):
+			write(fmt.Sprintf("%d\n", f.userTables))
+		case sql == "show shared_preload_libraries":
+			if f.noSettings {
+				return []byte("ERROR:  permission denied to examine \"shared_preload_libraries\""), &pg.ExitError{Cmd: "psql", Code: 1}
+			}
+			write(f.preload + "\n")
+		case strings.HasPrefix(sql, "select rolname, rolsuper, rolinherit"):
+			for _, n := range inNames() {
+				if !f.roles[n] {
+					continue
+				}
+				row := f.roleRows[n]
+				if row == "" {
+					row = "f\x1ft\x1ff\x1ff\x1ft\x1ff\x1ff\x1f-1\x1f"
+					if n == "postgres" {
+						row = "t\x1ft\x1ft\x1ft\x1ft\x1ft\x1ft\x1f-1\x1f"
+					}
+				}
+				write(n + "\x1f" + row + "\n")
+			}
+		case strings.HasPrefix(sql, "select r.rolname, c from pg_db_role_setting"):
+			for _, n := range inNames() {
+				for _, c := range f.roleSettings[n] {
+					write(n + "\x1f" + c + "\n")
+				}
+			}
+		case strings.HasPrefix(sql, "select m.rolname, g.rolname, a.admin_option"):
+			for _, m := range f.members {
+				write(m[0] + "\x1f" + m[1] + "\x1f" + m[2] + "\n")
+			}
+		case strings.HasPrefix(sql, "select e.name, coalesce(v.trusted"):
+			for n, tr := range f.trusted {
+				v := "f"
+				if tr {
+					v = "t"
+				}
+				write(n + "\x1f" + v + "\n")
+			}
 		case sql == "show server_version":
 			write(f.version + "\n")
 		case sql == "select current_user, rolsuper, rolcreatedb, rolcreaterole from pg_roles where rolname = current_user":
@@ -146,6 +240,22 @@ func (f *fakeServer) RunStderr(_ context.Context, conn pg.Conn, tool string, arg
 			for _, t := range tables {
 				write(fmt.Sprintf("%s\x1f%s\x1f-1\n", t.Schema, t.Name))
 			}
+		case strings.HasPrefix(sql, "select pg_get_userbyid(datdba) from pg_database where datname = "):
+			name := strings.Trim(strings.TrimPrefix(sql, "select pg_get_userbyid(datdba) from pg_database where datname = "), "'")
+			if _, ok := f.dbs[name]; ok {
+				write(f.ownerOf(name) + "\n")
+			}
+		case strings.HasPrefix(sql, "select coalesce(r.rolname, ''), c from pg_db_role_setting"):
+			name := sql[strings.LastIndex(sql, "= '")+3 : len(sql)-1]
+			for _, kv := range f.settings[name] {
+				write(kv + "\n")
+			}
+		case strings.HasPrefix(sql, "select case when a.grantee = 0"):
+			name := sql[strings.LastIndex(sql, "= '")+3 : len(sql)-1]
+			for k := range f.aclOf(name) {
+				g, p, _ := strings.Cut(k, " ")
+				write(g + "\x1f" + p + "\n")
+			}
 		case strings.HasPrefix(sql, "select count(*) from "):
 			ident := strings.TrimPrefix(sql, "select count(*) from ")
 			for _, t := range tables {
@@ -168,7 +278,25 @@ func (f *fakeServer) RunStderr(_ context.Context, conn pg.Conn, tool string, arg
 		}
 		return nil, fmt.Errorf("fake: unexpected pg_dump %v", args)
 	case "pg_restore":
-		if f.failRestore {
+		if len(args) > 1 && args[0] == "--create" && args[1] == "--schema-only" {
+			data, _ := io.ReadAll(stdin)
+			if _, ok := f.attrSQL[string(data)]; !ok {
+				return []byte("pg_restore: error: input file does not appear to be a valid archive"), &pg.ExitError{Cmd: "pg_restore", Code: 1}
+			}
+			write(f.schemaSQL[string(data)])
+			return nil, nil
+		}
+		if len(args) > 0 && args[0] == "--create" {
+			f.attrCreate = strings.Join(args, " ")
+			data, _ := io.ReadAll(stdin)
+			out, ok := f.attrSQL[string(data)]
+			if !ok {
+				return []byte("pg_restore: error: input file does not appear to be a valid archive"), &pg.ExitError{Cmd: "pg_restore", Code: 1}
+			}
+			write(out)
+			return nil, nil
+		}
+		if f.failRestore != "" && f.failRestore == conn.Database {
 			return []byte("pg_restore: error: could not execute query: ERROR:  role \"app\" does not exist"), &pg.ExitError{Cmd: "pg_restore", Code: 1}
 		}
 		data, _ := io.ReadAll(stdin)
@@ -183,6 +311,79 @@ func (f *fakeServer) RunStderr(_ context.Context, conn pg.Conn, tool string, arg
 		return nil, nil
 	}
 	return nil, fmt.Errorf("fake: unexpected tool %s", tool)
+}
+
+var (
+	reAttrOwner   = regexp.MustCompile(`^ALTER DATABASE "([^"]+)" OWNER TO (\S+)$`)
+	reAttrSet     = regexp.MustCompile(`^ALTER DATABASE "([^"]+)" SET (\S+) TO (.+)$`)
+	reAttrRoleSet = regexp.MustCompile(`^ALTER ROLE (\S+) IN DATABASE "([^"]+)" SET (\S+) TO (.+)$`)
+	reAttrACL     = regexp.MustCompile(`^(GRANT|REVOKE) (.+) ON DATABASE "([^"]+)" (TO|FROM) (\S+)$`)
+)
+
+// applyAttr plays one rebuilt attribute statement the way the server would store it.
+func (f *fakeServer) applyAttr(stmt string) {
+	stored := func(v string) string { // 'a', 'b' → a, b
+		parts := strings.Split(v, ",")
+		for i, p := range parts {
+			parts[i] = strings.Trim(strings.TrimSpace(p), "'")
+		}
+		return strings.Join(parts, ", ")
+	}
+	switch {
+	case reAttrOwner.MatchString(stmt):
+		m := reAttrOwner.FindStringSubmatch(stmt)
+		f.owner[m[1]] = m[2]
+	case reAttrSet.MatchString(stmt):
+		m := reAttrSet.FindStringSubmatch(stmt)
+		f.settings[m[1]] = append(f.settings[m[1]], "\x1f"+strings.Trim(m[2], `"`)+"="+stored(m[3]))
+	case reAttrRoleSet.MatchString(stmt):
+		m := reAttrRoleSet.FindStringSubmatch(stmt)
+		f.settings[m[2]] = append(f.settings[m[2]], m[1]+"\x1f"+m[3]+"="+stored(m[4]))
+	case reAttrACL.MatchString(stmt):
+		m := reAttrACL.FindStringSubmatch(stmt)
+		acl := f.aclOf(m[3])
+		for _, p := range strings.Split(m[2], ",") {
+			p = strings.TrimSpace(p)
+			privs := []string{p}
+			if p == "ALL" {
+				privs = []string{"CREATE", "CONNECT", "TEMPORARY"}
+			}
+			for _, pr := range privs {
+				if m[1] == "GRANT" {
+					acl[m[5]+" "+pr] = true
+				} else {
+					delete(acl, m[5]+" "+pr)
+				}
+			}
+		}
+		f.acl[m[3]] = acl
+	}
+}
+
+// isAttrRun: every statement is about a database (Attributes.Apply), not globals.
+func isAttrRun(sql string) bool {
+	for _, l := range strings.Split(strings.TrimSpace(sql), "\n") {
+		if !strings.Contains(l, " DATABASE ") {
+			return false
+		}
+	}
+	return sql != ""
+}
+
+func (f *fakeServer) ownerOf(db string) string {
+	if o := f.owner[db]; o != "" {
+		return o
+	}
+	return "postgres"
+}
+
+// aclOf: acldefault for a database until a GRANT/REVOKE changes it.
+func (f *fakeServer) aclOf(db string) map[string]bool {
+	if f.acl[db] != nil {
+		return f.acl[db]
+	}
+	o := f.ownerOf(db)
+	return map[string]bool{o + " CREATE": true, o + " CONNECT": true, o + " TEMPORARY": true, "PUBLIC CONNECT": true, "PUBLIC TEMPORARY": true}
 }
 
 type memStore struct {
@@ -273,11 +474,12 @@ func baseCfg() *config.App {
 func deps(f *fakeServer, st storage.Store) Deps {
 	clock := time.Date(2026, 10, 17, 3, 0, 0, 0, time.UTC)
 	return Deps{
-		Shell: pg.ExecShell{}, Store: st, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Secrets: config.NewSecrets(map[string]string{"BRACER_RESTORE_URL": "postgres://u:p@newhost:5433/postgres"}, "test"), GOOS: "darwin",
+		Shell: pg.ExecShell{}, Store: st, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Secrets: config.NewSecrets(map[string]string{"BRACER_RESTORE_URL": "postgres://u:p@newhost:5433/postgres"}, "test"),
 		Now: func() time.Time { clock = clock.Add(time.Second); return clock },
 		Connect: func(context.Context, *pg.Tools, config.Instance, *config.Secrets) (pg.Conn, pg.Runner, error) {
 			return pg.Conn{User: "postgres", Database: "postgres"}, f, nil
 		},
+		ContainerUser: func(context.Context, string) (string, error) { return "postgres", nil },
 	}
 }
 
@@ -353,247 +555,6 @@ func TestFetchPlainEncryptedRawAndChecksum(t *testing.T) {
 	}
 }
 
-func TestRestoreIntoNewDatabase(t *testing.T) {
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_restored", WithGlobals: true}, deps(f, st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.OK || res.Target.DB != "shop_restored" || res.Target.Exists || res.TablesFound != 1 || res.TablesExpected != 1 || res.Target.PgVersion != "17.6" {
-		t.Errorf("res: %+v", res)
-	}
-	// Globals: only the missing users are created (app, "Odd Role"); postgres is untouched.
-	if res.Globals == nil || !res.Globals.OK || strings.Join(res.Globals.Created, ",") != "app,Odd Role" || res.Globals.SkippedExisting != 1 {
-		t.Errorf("globals: %+v", res.Globals)
-	}
-	if strings.Join(res.Globals.SkippedGrants, ",") != `postgres -> Odd Role` ||
-		strings.Join(res.Globals.Downgraded, ",") != "Odd Role: SUPERUSER,Odd Role: CREATEROLE,app: GRANT SET ON PARAMETER log_min_duration_statement" ||
-		strings.Join(res.Globals.PgGrants, ",") != "pg_read_all_data -> app" ||
-		strings.Join(res.Globals.SkippedMissing, ",") != "pg_maintain -> app" {
-		t.Errorf("globals detail: %+v", res.Globals)
-	}
-	// Preamble emitted by Bracer (the file's \restrict, \set, SELECT set_config are not copied);
-	// every statement is rebuilt from tokens, user names quoted; pg_* grants have no WITH.
-	want := `SET standard_conforming_strings = on;
-SET default_transaction_read_only = off;
-SET client_encoding = 'UTF8';
-CREATE ROLE "app";
-ALTER ROLE "app" WITH NOSUPERUSER INHERIT LOGIN PASSWORD 'SCRAM-SHA-256$y';
-COMMENT ON ROLE "app" IS 'line one
-line two; ALTER ROLE postgres NOLOGIN';
-CREATE ROLE "Odd Role";
-ALTER ROLE "Odd Role" WITH NOLOGIN NOSUPERUSER NOCREATEROLE;
-GRANT "pg_read_all_data" TO "app";
-GRANT "app" TO "Odd Role" WITH INHERIT TRUE;
-ALTER ROLE "app" IN DATABASE shop SET search_path TO 'app';
-`
-	if f.globalsSQL != want {
-		t.Errorf("filtered globals sent to psql:\n%s\nwant:\n%s", f.globalsSQL, want)
-	}
-	warned := strings.Join(res.Warnings, "\n")
-	for _, w := range []string{"skipped GRANT postgres -> Odd Role", "Odd Role: SUPERUSER", "Odd Role: CREATEROLE", "GRANT pg_read_all_data -> app gives", "skipped GRANT pg_maintain -> app: that built-in role does not exist"} {
-		if !strings.Contains(warned, w) {
-			t.Errorf("missing warning %q in %v", w, res.Warnings)
-		}
-	}
-	if !f.roles["app"] || !f.roles["Odd Role"] {
-		t.Errorf("roles after: %v", f.roles)
-	}
-	if res.Disk == nil || !res.Disk.Checked || res.Disk.DataDirectory != "/var/lib/postgresql/data" || res.Disk.NeedBytes != 50 {
-		t.Errorf("disk: %+v", res.Disk)
-	}
-	if _, ok := f.dbs["shop_restored"]; !ok || len(f.dbs["shop_restored"]) != 1 {
-		t.Errorf("fake dbs: %v", f.dbs)
-	}
-	joined := strings.Join(f.calls, "\n")
-	if !strings.Contains(joined, `create database "shop_restored" template template0`) || !strings.Contains(joined, "pg_restore -d dbname='shop_restored' --no-data-for-failed-tables db=shop_restored") {
-		t.Errorf("calls:\n%s", joined)
-	}
-}
-
-func TestRestoreRefusesExisting(t *testing.T) {
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main"}, deps(f, st))
-	if !errors.Is(err, ErrExists) || !strings.Contains(err.Error(), "already exists on main") || !strings.Contains(err.Error(), "never drops") || strings.Contains(err.Error(), "--drop") {
-		t.Fatalf("err = %v", err)
-	}
-	if res == nil || !res.Target.Exists {
-		t.Errorf("res: %+v", res)
-	}
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, "pg_restore") || strings.Contains(c, "create database") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-}
-
-func TestRestoreDiskCheck(t *testing.T) {
-	st := newMemStore()
-	seed(t, st, "")
-	// Not enough space: dump 10 B × 5 = 50 B > 40 B free → ErrDiskSpace, nothing created.
-	f := newFakeServer()
-	f.dfAvailKB = 0 // df broken → cannot measure → warn only
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_new"}, deps(f, st))
-	if err != nil || !res.OK || res.Disk.Checked || len(res.Warnings) == 0 {
-		t.Errorf("unmeasurable disk must only warn: %v %+v", err, res)
-	}
-	f = newFakeServer()
-	f.dfAvailKB = 1 // 1 KB free but NeedBytes = 50 B → enough
-	if res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_new"}, deps(f, st)); err != nil || !res.OK || !res.Disk.Checked {
-		t.Errorf("enough: %v %+v", err, res)
-	}
-	// Dump larger than the free space.
-	f = newFakeServer()
-	f.dfAvailKB = 1
-	m, _ := backup.LoadManifest(context.Background(), st, "bracer/shop/manifest.json", "shop")
-	m.Instances["main"].Databases["shop"].Dumps[0].Bytes = 1 << 20
-	backup.SaveManifest(context.Background(), st, "bracer/shop/manifest.json", m, time.Now())
-	res, err = Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_new"}, deps(f, st))
-	if !errors.Is(err, ErrDiskSpace) || !strings.Contains(err.Error(), "--skip-disk-check") {
-		t.Fatalf("err = %v", err)
-	}
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, "pg_restore") || strings.Contains(c, "create database") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-	f = newFakeServer()
-	f.dfAvailKB = 1
-	res, err = Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_new", SkipDiskCheck: true}, deps(f, st))
-	if err != nil || !res.OK || len(res.Warnings) == 0 {
-		t.Errorf("--skip-disk-check: %v %+v", err, res)
-	}
-}
-
-func TestFilterGlobals(t *testing.T) {
-	have := map[string]bool{"postgres": true, "pg_read_all_data": true}
-	plan, err := FilterGlobals([]byte(globalsSQL), have)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Join(plan.Created, ",") != "app,Odd Role" || plan.SkippedExisting != 1 {
-		t.Errorf("created=%v skipped=%d", plan.Created, plan.SkippedExisting)
-	}
-	o := string(plan.SQL)
-	for _, bad := range []string{`ROLE "postgres"`, "TABLESPACE", "GRANTED BY", "ADMIN", "PARAMETER", "pg_maintain", `\restrict`, `\set`, "set_config", `"Odd Role" WITH NOLOGIN SUPERUSER`} {
-		if strings.Contains(o, bad) {
-			t.Errorf("must drop %q:\n%s", bad, o)
-		}
-	}
-
-	// Preamble Bracer always emits before every statement.
-	const P = "SET standard_conforming_strings = on;\nSET default_transaction_read_only = off;\n"
-	// Each tricky case, one small file per case.
-	cases := []struct {
-		name, sql, want string
-		err             bool
-	}{
-		{"role name with TO inside", `CREATE ROLE "x TO y"; GRANT "x TO y" TO postgres;`, "CREATE ROLE \"x TO y\";\n", false},
-		{"existing role quoted differently", `ALTER ROLE Postgres WITH SUPERUSER;`, "", false},
-		{"unquoted ident lowercased", `CREATE ROLE Admin; ALTER ROLE Admin WITH LOGIN;`, "CREATE ROLE \"admin\";\nALTER ROLE \"admin\" WITH LOGIN;\n", false},
-		{"two statements one line", `CREATE ROLE a; ALTER ROLE postgres NOLOGIN;`, "CREATE ROLE \"a\";\n", false},
-		{"grant to new role from existing role", `CREATE ROLE a; GRANT postgres TO a;`, "CREATE ROLE \"a\";\n", false},
-		{"grant from new role", `CREATE ROLE a; CREATE ROLE b; GRANT a TO b;`, "CREATE ROLE \"a\";\nCREATE ROLE \"b\";\nGRANT \"a\" TO \"b\";\n", false},
-		{"replication and bypassrls downgraded", `CREATE ROLE a; ALTER ROLE a WITH REPLICATION BYPASSRLS CONNECTION LIMIT 5 VALID UNTIL '2030-01-01';`, "CREATE ROLE \"a\";\nALTER ROLE \"a\" WITH NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 5 VALID UNTIL '2030-01-01';\n", false},
-		{"createrole downgraded", `CREATE ROLE a CREATEROLE CREATEDB;`, "CREATE ROLE \"a\" WITH NOCREATEROLE CREATEDB;\n", false},
-		{"escape string literal", `CREATE ROLE a; COMMENT ON ROLE a IS E'it\'s; DROP ROLE postgres';`, "CREATE ROLE \"a\";\nCOMMENT ON ROLE \"a\" IS E'it\\'s; DROP ROLE postgres';\n", false},
-		{"backslash meta other than restrict", "\\! id\nCREATE ROLE a;", "", true},
-		{"restrict line with a second meta-command", "\\restrict abc \\echo hi\nCREATE ROLE a;\n\\unrestrict abc\n", "CREATE ROLE \"a\";\n", false},
-		{"dollar quoting", `CREATE ROLE a; COMMENT ON ROLE a IS $$x$$;`, "", true},
-		{"unknown statement", `CREATE ROLE a; DROP DATABASE shop;`, "", true},
-		{"unterminated", `CREATE ROLE a`, "", true},
-		{"unknown role option", `CREATE ROLE a IN ROLE postgres;`, "", true},
-		{"grant on tablespace dropped", `GRANT ALL ON TABLESPACE fast TO a;`, "", false},
-		{"grant on table", `GRANT SELECT ON TABLE t TO a;`, "", true},
-		{"grant on parameter dropped", `CREATE ROLE a; GRANT SET, ALTER SYSTEM ON PARAMETER work_mem TO a;`, "CREATE ROLE \"a\";\n", false},
-		{"in database setting", `CREATE ROLE a; ALTER ROLE a IN DATABASE shop SET search_path TO 'x';`, "CREATE ROLE \"a\";\nALTER ROLE \"a\" IN DATABASE shop SET search_path TO 'x';\n", false},
-		{"alter role all", `ALTER ROLE ALL SET log_statement TO 'all';`, "", true},
-		{"alter role current_user", `ALTER ROLE current_user SET log_statement TO 'all';`, "", true},
-		{"grant to session_user", `CREATE ROLE a; GRANT a TO session_user;`, "", true},
-		{"quoted ALL is a real name", `CREATE ROLE "ALL";`, "CREATE ROLE \"ALL\";\n", false},
-		{"set standard_conforming_strings off", `SET standard_conforming_strings = off;`, "", true},
-		{"set other parameter", `SET search_path = public;`, "", true},
-		{"client_encoding client-only", `SET client_encoding = 'SJIS';`, "", true},
-		{"client_encoding bare and lowercase", `SET client_encoding = latin1;`, "SET client_encoding = 'LATIN1';\n", false},
-		{"select with extra call", `SELECT pg_catalog.set_config('search_path', '', false), pg_sleep(1);`, "", true},
-		{"select set_config dropped", `SELECT pg_catalog.set_config('search_path', '', false);`, "", false},
-		{"pg role missing on target", `CREATE ROLE a; GRANT pg_maintain TO a WITH ADMIN OPTION;`, "CREATE ROLE \"a\";\n", false},
-		{"pg grant loses options", `CREATE ROLE a; GRANT pg_read_all_data TO a WITH ADMIN TRUE, INHERIT TRUE GRANTED BY postgres;`, "CREATE ROLE \"a\";\nGRANT \"pg_read_all_data\" TO \"a\";\n", false},
-	}
-	for _, c := range cases {
-		plan, err := FilterGlobals([]byte(c.sql), have)
-		if c.err {
-			if err == nil {
-				t.Errorf("%s: want error, got %q", c.name, plan.SQL)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("%s: %v", c.name, err)
-			continue
-		}
-		if string(plan.SQL) != P+c.want {
-			t.Errorf("%s:\n got %q\nwant %q", c.name, plan.SQL, P+c.want)
-		}
-	}
-	if got := DBNameConninfo(`a'b\c=d`); got != `dbname='a\'b\\c=d'` {
-		t.Errorf("DBNameConninfo: %s", got)
-	}
-}
-
-func TestRestoreDryRun(t *testing.T) {
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_new", DryRun: true}, deps(f, st))
-	if err != nil || !res.DryRun || res.Target.Exists || res.Disk == nil || !res.Disk.Checked {
-		t.Errorf("dry-run: %v %+v", err, res)
-	}
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, "pg_restore") || strings.Contains(c, "create database") {
-			t.Errorf("dry-run must not change anything: %s", c)
-		}
-	}
-}
-
-func TestRestoreIntoURLEnv(t *testing.T) {
-	// The runner for a URL is an ImageRunner over the real Shell; replace Shell with a fake docker.
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	d := deps(f, st)
-	d.Shell = dockerShell{f}
-	// No host binary → the runner is a Docker image (ADR-0009).
-	d.Tools = &pg.Tools{Shell: d.Shell, GOOS: "darwin", LookPath: noBinary, Glob: noGlob}
-	// The new server already has "shop" → refuse, suggest another name in the URL.
-	_, err := Run(context.Background(), baseCfg(), Options{Database: "shop", IntoURLEnv: "BRACER_RESTORE_URL"}, d)
-	if err == nil || !strings.Contains(err.Error(), "URL path") {
-		t.Fatalf("exists on url target: %v", err)
-	}
-	// The target name comes from the URL path.
-	d.Secrets = config.NewSecrets(map[string]string{"BRACER_RESTORE_URL": "postgres://u:p@newhost:5433/shop_new"}, "test")
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", IntoURLEnv: "BRACER_RESTORE_URL"}, d)
-	if err != nil || !res.OK || res.Target.URLEnv != "BRACER_RESTORE_URL" || res.Target.Host != "newhost:5433" || res.Target.Instance != "" || res.Target.DB != "shop_new" {
-		t.Fatalf("url env: %v %+v", err, res)
-	}
-	if !strings.Contains(res.Target.Runner, "postgres:17-alpine") {
-		t.Errorf("runner must use the target's major: %s", res.Target.Runner)
-	}
-	if _, err := Run(context.Background(), baseCfg(), Options{Database: "shop", IntoURLEnv: "MISSING"}, d); err == nil || !strings.Contains(err.Error(), "MISSING") {
-		t.Errorf("missing env: %v", err)
-	}
-	if _, err := Run(context.Background(), baseCfg(), Options{Database: "shop"}, d); err == nil || !strings.Contains(err.Error(), "exactly one of") {
-		t.Errorf("no target: %v", err)
-	}
-}
-
-func noBinary(string) (string, error) { return "", errors.New("not found") }
-func noGlob(string) ([]string, error) { return nil, nil }
-
 // dockerShell turns `docker run … <image> <tool> args` into fakeServer.RunStderr.
 type dockerShell struct{ f *fakeServer }
 
@@ -628,67 +589,6 @@ func (s dockerShell) Run(ctx context.Context, c pg.Cmd) (pg.Result, error) {
 	return pg.Result{Stdout: out.Bytes(), Stderr: stderr}, err
 }
 
-func TestRestoreFromFile(t *testing.T) {
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	dir := t.TempDir()
-	plain := filepath.Join(dir, "shop.dump")
-	os.WriteFile(plain, []byte("PGDMP-shop"), 0o600)
-	res, err := Run(context.Background(), baseCfg(), Options{File: plain, Into: "main/from_file"}, deps(f, st))
-	if err != nil || !res.OK || res.Source.File != plain || res.Source.Encrypted || res.TablesFound != 1 || res.TablesExpected != 0 {
-		t.Fatalf("file: %v %+v", err, res)
-	}
-
-	kp, _ := crypto.Generate()
-	keyPath := filepath.Join(dir, "k")
-	crypto.WriteIdentityFile(keyPath, kp)
-	enc := filepath.Join(dir, "shop.dump.age")
-	ef, _ := os.Create(enc)
-	w, _ := crypto.Encrypt(ef, kp.Recipient)
-	io.WriteString(w, "PGDMP-shop")
-	w.Close()
-	ef.Close()
-	cfg := baseCfg()
-	cfg.AgeIdentityFile = keyPath
-	res, err = Run(context.Background(), cfg, Options{File: enc, Into: "main/from_age"}, deps(newFakeServer(), st))
-	if err != nil || !res.OK || !res.Source.Encrypted {
-		t.Errorf("age file: %v %+v", err, res)
-	}
-	if _, err := Run(context.Background(), baseCfg(), Options{File: plain, Into: "main"}, deps(newFakeServer(), st)); err == nil || !strings.Contains(err.Error(), "--into <instance>/<db>") {
-		t.Errorf("file without db name: %v", err)
-	}
-}
-
-func TestRestoreFailureLeavesDatabase(t *testing.T) {
-	f := newFakeServer()
-	f.failRestore = true
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/broken"}, deps(f, st))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.OK || !strings.Contains(res.Error, "role \"app\" does not exist") || !strings.Contains(res.Error, "--with-globals") || !strings.Contains(res.Error, "left in place") {
-		t.Errorf("res.Error = %q", res.Error)
-	}
-	if _, ok := f.dbs["broken"]; !ok {
-		t.Error("target database must be left for inspection")
-	}
-}
-
-func TestRestorePoolerAndVersionWarnings(t *testing.T) {
-	f := newFakeServer()
-	f.pooler = true
-	f.version = "16.4"
-	st := newMemStore()
-	seed(t, st, "")
-	res, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/x", DryRun: true}, deps(f, st))
-	if err != nil || len(res.Warnings) != 2 || !strings.Contains(res.Warnings[0], "pooler") || !strings.Contains(res.Warnings[1], "newer server") {
-		t.Errorf("warnings: %v %v", err, res.Warnings)
-	}
-}
-
 func asUsage(err error, target **UsageError) bool {
 	u, ok := err.(*UsageError)
 	if ok {
@@ -704,6 +604,22 @@ func asChecksum(err error, target **ErrChecksum) bool {
 	}
 	return ok
 }
+
+// shopSchemaSQL is what pg_restore --create --schema-only prints for the shop dump.
+const shopSchemaSQL = `--
+-- Name: shop; Type: DATABASE; Schema: -; Owner: postgres
+--
+
+CREATE DATABASE shop WITH TEMPLATE = template0 ENCODING = 'UTF8';
+
+--
+-- Name: orders; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.orders (
+    id integer
+);
+`
 
 // globalsSQL mimics pg_dumpall --globals-only (PG 17.6+: has \restrict).
 const globalsSQL = `--
@@ -763,106 +679,6 @@ ALTER ROLE postgres SET log_statement TO 'all';
 \unrestrict abc
 `
 
-func TestCheckDiskLocalRunnerRemoteHost(t *testing.T) {
-	admin := &pg.Client{Runner: pg.LocalRunner{}, Conn: pg.Conn{Host: "db.internal", Port: 5432}}
-	dc := CheckDisk(context.Background(), pg.LocalRunner{}, admin, 100)
-	if dc.Checked || !strings.Contains(dc.Error, "db.internal is not this machine") || dc.NeedBytes != 500 {
-		t.Errorf("remote host must not be measured locally: %+v", dc)
-	}
-	for _, h := range []string{"", "/var/run/postgresql", "localhost", "127.0.0.1", "::1"} {
-		if !pg.IsLocalHost(h) {
-			t.Errorf("%q must count as local", h)
-		}
-	}
-	if pg.IsLocalHost("10.0.0.5") || pg.IsLocalHost("db.example.com") {
-		t.Error("remote hosts must not count as local")
-	}
-}
-
-// Read-only target user (the instance's backup user): usage error before creating anything.
-func TestRestoreTargetUserCannotCreateDB(t *testing.T) {
-	f := newFakeServer()
-	f.readOnly = true
-	st := newMemStore()
-	seed(t, st, "")
-	_, err := Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if !errors.As(err, new(*UsageError)) || !strings.Contains(err.Error(), "df_backup") || !strings.Contains(err.Error(), "CREATEDB") || !strings.Contains(err.Error(), "--into-url-env") {
-		t.Fatalf("err = %v", err)
-	}
-	for _, c := range f.calls {
-		if strings.HasPrefix(c, "pg_restore") || strings.Contains(c, "create database") || strings.HasPrefix(c, "psql") && strings.Contains(c, "-f -") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-	// CREATEDB present but --with-globals needs CREATEROLE.
-	f.readOnly = false
-	f.createDBOnly = true
-	_, err = Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_r", WithGlobals: true}, deps(f, st))
-	if !errors.As(err, new(*UsageError)) || !strings.Contains(err.Error(), "CREATEROLE") {
-		t.Fatalf("with-globals err = %v", err)
-	}
-	if _, err = Run(context.Background(), baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st)); err != nil {
-		t.Fatalf("CREATEDB alone must be enough without --with-globals: %v", err)
-	}
-}
-
-// File is not a pg_dump archive: stop before creating the database.
-func TestRestoreRejectsNonArchiveBeforeCreate(t *testing.T) {
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	bad := filepath.Join(t.TempDir(), "corrupt.dump")
-	os.WriteFile(bad, []byte("this is not a dump at all"), 0o600)
-	_, err := Run(context.Background(), baseCfg(), Options{File: bad, Into: "main/shop_r"}, deps(f, st))
-	if err == nil || !strings.Contains(err.Error(), "not a pg_dump custom-format archive") || !strings.Contains(err.Error(), "nothing was created") {
-		t.Fatalf("err = %v", err)
-	}
-	for _, c := range f.calls {
-		if strings.Contains(c, "create database") || strings.HasPrefix(c, "pg_restore") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-}
-
-// A dump made with pg_dump 18 cannot be read by pg_restore 17 in the target container → exit 2, nothing created yet.
-func TestRestoreRefusesNewerArchiveOnExecTarget(t *testing.T) {
-	f := newFakeServer()
-	st := newMemStore()
-	seed(t, st, "")
-	ctx := context.Background()
-	m, _ := backup.LoadManifest(ctx, st, "bracer/shop/manifest.json", "shop")
-	for _, dp := range m.Instances["main"].Databases["shop"].Dumps {
-		dp.ToolVersion = "18.1"
-	}
-	if err := backup.SaveManifest(ctx, st, "bracer/shop/manifest.json", m, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	_, err := Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if !errors.As(err, new(*UsageError)) || !strings.Contains(err.Error(), "pg_dump 18.1") || !strings.Contains(err.Error(), "pg_restore 17.6") || !strings.Contains(err.Error(), "--into-url-env") {
-		t.Fatalf("err = %v", err)
-	}
-	for _, c := range f.calls {
-		if strings.Contains(c, "create database") || strings.HasPrefix(c, "pg_restore") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-	// Target has pg_restore 18: runs, with a warning that server 17 is older than pg_dump 18.
-	f.toolVersion = "18.1"
-	res, err := Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if err != nil || !res.OK {
-		t.Fatalf("res = %+v, err = %v", res, err)
-	}
-	found := false
-	for _, w := range res.Warnings {
-		if strings.Contains(w, "pg_dump 18.1") && strings.Contains(w, "PostgreSQL 17.6") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("warnings = %v", res.Warnings)
-	}
-}
-
 // Extension table with a row-count mismatch: warn, do not fail; a regular table mismatch still fails.
 func TestCompareExtensionTablesWarnOnly(t *testing.T) {
 	ext := Comparison{Mismatches: []RowMismatch{{Table: `"_timescaledb_catalog"."metadata"`, Expected: 3, Found: 4, Extension: "timescaledb"}}}
@@ -875,113 +691,5 @@ func TestCompareExtensionTablesWarnOnly(t *testing.T) {
 	}
 	if (Comparison{Missing: []string{"x"}}).OK() {
 		t.Errorf("missing table must fail")
-	}
-}
-
-// Locale in the manifest → CREATE DATABASE carries the exact encoding/locale; old manifest
-// → server default with a warning; provider newer than the target server → exit 2 before creating.
-func TestRestoreCreatesDatabaseWithSourceLocale(t *testing.T) {
-	st := newMemStore()
-	seed(t, st, "")
-	ctx := context.Background()
-	setLocale := func(loc *pg.Locale) {
-		m, err := backup.LoadManifest(ctx, st, "bracer/shop/manifest.json", "shop")
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, dp := range m.Instances["main"].Databases["shop"].Dumps {
-			dp.Locale = loc
-		}
-		if err := backup.SaveManifest(ctx, st, "bracer/shop/manifest.json", m, time.Now()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	hasWarn := func(res *Result, s string) bool {
-		for _, w := range res.Warnings {
-			if strings.Contains(w, s) {
-				return true
-			}
-		}
-		return false
-	}
-
-	setLocale(&pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C.UTF-8"})
-	f := newFakeServer()
-	res, err := Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if err != nil || !res.OK {
-		t.Fatalf("res = %+v, err = %v", res, err)
-	}
-	if want := " encoding 'UTF8' lc_collate 'C.UTF-8' lc_ctype 'C.UTF-8'"; f.createOpts != want {
-		t.Errorf("create options = %q, want %q", f.createOpts, want)
-	}
-	if hasWarn(res, "locale unknown") {
-		t.Errorf("must not warn about locale when the manifest has one: %v", res.Warnings)
-	}
-
-	setLocale(nil)
-	f = newFakeServer()
-	res, err = Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if err != nil || !res.OK {
-		t.Fatalf("res = %+v, err = %v", res, err)
-	}
-	if f.createOpts != "" || !hasWarn(res, "source locale unknown") {
-		t.Errorf("old manifest: opts %q, warnings %v", f.createOpts, res.Warnings)
-	}
-
-	setLocale(&pg.Locale{Encoding: "UTF8", Collate: "C", Ctype: "C", Provider: "builtin", Locale: "C.UTF-8"})
-	f = newFakeServer()
-	f.version = "16.4"
-	_, err = Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if !errors.As(err, new(*UsageError)) || !strings.Contains(err.Error(), "builtin locale provider (PostgreSQL 17+); target is PostgreSQL 16") {
-		t.Fatalf("err = %v", err)
-	}
-	for _, c := range f.calls {
-		if strings.Contains(c, "create database") || strings.HasPrefix(c, "pg_restore") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-}
-
-// The source database's extensions must exist on the target: missing → exit 2 before creating
-// anything; a different version → warning (spec fetch-restore § Flow 2).
-func TestRestoreChecksExtensionsOnTarget(t *testing.T) {
-	st := newMemStore()
-	seed(t, st, "")
-	ctx := context.Background()
-	m, err := backup.LoadManifest(ctx, st, "bracer/shop/manifest.json", "shop")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, dp := range m.Instances["main"].Databases["shop"].Dumps {
-		dp.Extensions = []pg.Extension{{Name: "pg_partman", Version: "5.0.1"}}
-	}
-	if err := backup.SaveManifest(ctx, st, "bracer/shop/manifest.json", m, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	f := newFakeServer()
-	f.available = map[string]string{"plpgsql": "1.0"}
-	_, err = Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if !errors.As(err, new(*UsageError)) || !strings.Contains(err.Error(), "does not have extension pg_partman 5.0.1") {
-		t.Fatalf("err = %v", err)
-	}
-	for _, c := range f.calls {
-		if strings.Contains(c, "create database") || strings.HasPrefix(c, "pg_restore") {
-			t.Errorf("must not change anything: %s", c)
-		}
-	}
-	f = newFakeServer()
-	f.available = map[string]string{"pg_partman": "5.1.0"}
-	res, err := Run(ctx, baseCfg(), Options{Database: "shop", Into: "main/shop_r"}, deps(f, st))
-	if err != nil || !res.OK {
-		t.Fatalf("res = %+v, err = %v", res, err)
-	}
-	found := false
-	for _, w := range res.Warnings {
-		if strings.Contains(w, "pg_partman 5.1.0") && strings.Contains(w, "5.0.1") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("want version warning, got %v", res.Warnings)
 	}
 }

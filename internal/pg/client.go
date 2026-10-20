@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Client runs queries and checks through Runner using psql.
@@ -31,6 +33,18 @@ func (c *Client) Query(ctx context.Context, sql string) ([][]string, error) {
 		rows = append(rows, strings.Split(line, "\x1f"))
 	}
 	return rows, nil
+}
+
+// scalarOrEmpty is scalar where an empty value is a valid answer.
+func (c *Client) scalarOrEmpty(ctx context.Context, sql string) (string, error) {
+	rows, err := c.Query(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 || len(rows[0]) == 0 {
+		return "", nil
+	}
+	return rows[0][0], nil
 }
 
 func (c *Client) scalar(ctx context.Context, sql string) (string, error) {
@@ -61,6 +75,32 @@ func (c *Client) ServerVersionNum(ctx context.Context) (num, major int, err erro
 		return 0, 0, fmt.Errorf("unexpected server_version_num: %q", s)
 	}
 	return num, num / 10000, nil
+}
+
+// SystemIdentifier returns system_identifier from pg_control_system(): set at
+// initdb, unchanged by restarts, container recreation on the same volume and
+// physical failover, so it tells whether the Postgres at a place is still the
+// same cluster (spec backup § Flow 3a2). Callable by any role on PG14–18.
+func (c *Client) SystemIdentifier(ctx context.Context) (string, error) {
+	s, err := c.scalar(ctx, "select system_identifier from pg_control_system()")
+	if err != nil {
+		return "", err
+	}
+	s = strings.TrimSpace(s)
+	if _, err := strconv.ParseUint(s, 10, 64); err != nil {
+		return "", fmt.Errorf("unexpected system_identifier: %q", s)
+	}
+	return s, nil
+}
+
+// InitdbTime decodes the time of initdb from the high 32 bits of a
+// system_identifier (seconds since the epoch); zero if it cannot be parsed.
+func InitdbTime(systemID string) time.Time {
+	n, err := strconv.ParseUint(systemID, 10, 64)
+	if err != nil || n>>32 == 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(n>>32), 0).UTC()
 }
 
 // ListDatabases lists dumpable databases: not templates, connections allowed.
@@ -140,6 +180,22 @@ func (c *Client) ToolVersion(ctx context.Context) (version string, major int, er
 	return v, m, nil
 }
 
+var reVersion = regexp.MustCompile(`\(PostgreSQL\) (\d+)(?:\.(\d+))?`)
+
+// ParseToolVersion parses the `--version` output of a Postgres tool.
+func ParseToolVersion(out string) (version string, major int, ok bool) {
+	m := reVersion.FindStringSubmatch(out)
+	if m == nil {
+		return "", 0, false
+	}
+	major, _ = strconv.Atoi(m[1])
+	version = m[1]
+	if m[2] != "" {
+		version += "." + m[2]
+	}
+	return version, major, true
+}
+
 // MajorOf extracts the major from a version string "17.11" / "17.11 (Debian…)"; 0 if unparsable.
 func MajorOf(version string) int {
 	f := strings.FieldsFunc(version, func(r rune) bool { return r == '.' || r == ' ' })
@@ -190,7 +246,26 @@ func FixRoleSQL(role string, major int) string {
 	if major > 0 && major < 14 {
 		return fmt.Sprintf("-- PostgreSQL %d has no pg_read_all_data (added in 14): the backup user must be a superuser\nCREATE ROLE %s LOGIN PASSWORD '<password>' SUPERUSER;", major, role)
 	}
-	return fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '<password>' BYPASSRLS;\nGRANT pg_read_all_data TO %s;", role, role)
+	return fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '<password>' BYPASSRLS;\nGRANT pg_read_all_data TO %s;\nGRANT pg_read_all_settings TO %s;", role, role, role)
+}
+
+// PreloadLibraries reads shared_preload_libraries ("pg_stat_statements,timescaledb"
+// → both names). Only a superuser or a member of pg_read_all_settings may read it;
+// anyone else gets an error.
+func (c *Client) PreloadLibraries(ctx context.Context) (string, error) {
+	return c.scalarOrEmpty(ctx, "show shared_preload_libraries")
+}
+
+// SplitLibraries splits a shared_preload_libraries value into names.
+func SplitLibraries(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.Trim(strings.TrimSpace(p), `"`)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // IsAuthError recognizes a psql authentication error so the password can be asked for.

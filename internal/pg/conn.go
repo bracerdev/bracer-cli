@@ -80,17 +80,6 @@ func (c Conn) EnvNames() []string {
 	return envNames(c.Env())
 }
 
-// IsLocalHost reports whether Host points at this machine: empty or a socket
-// directory (Unix socket), localhost, 127.0.0.0/8, ::1.
-func IsLocalHost(host string) bool {
-	switch {
-	case host == "", strings.HasPrefix(host, "/"), host == "localhost", host == "::1", host == "[::1]":
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
 // ParseURL parses postgres://user:pass@host:port/db?sslmode=… into a Conn.
 // Unknown parameters are an error so a misspelled sslmode is not silently ignored.
 func ParseURL(raw string) (Conn, error) {
