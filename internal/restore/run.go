@@ -30,6 +30,7 @@ type Options struct {
 	SocketDir     string   // --socket-dir, with --into-local
 	IntoURL       bool     // --into-url: ask for the URL
 	IntoURLEnv    string   // --into-url-env NAME
+	PasswordEnv   string   // --password-env NAME: the target superuser's password (container, local)
 	Preview       bool     // --preview: data to look at only
 	DryRun        bool     // --dry-run
 	SQLDir        string   // --sql-dir; default ./bracer-restore-<app>-<instance>-<ts>
@@ -52,6 +53,9 @@ type Deps struct {
 	ContainerUser func(ctx context.Context, container string) (string, error)
 	// AskURL asks for the target URL without echo (--into-url); nil: no terminal.
 	AskURL func() (string, error)
+	// AskPassword asks for the password of a container or local target whose
+	// socket asks for one; nil: no terminal.
+	AskPassword func() (string, error)
 	// AskAppURL asks for the app's URL without echo (--app-url); nil: no terminal.
 	AskAppURL func() (string, error)
 	// Timeout for pg_restore; 0 = DefaultDrillTimeout (shares the drill.timeout setting).
@@ -229,6 +233,9 @@ func Run(ctx context.Context, cfg *config.App, o Options, d Deps) (*Result, erro
 	}
 	plan := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: res.Mode, Now: d.Now()})
 	res.Checks, res.Notes = plan.Checks, plan.Notes
+	if spec.Password {
+		res.Notes = append(res.Notes, "the target asks for a password: set PGPASSWORD to it in your shell before applying the files")
+	}
 	res.Apply = applyCommand(spec, conn, tgt.Major)
 	for i, dp := range plan.DBs {
 		res.Databases = append(res.Databases, &DBResult{SourceDB: dp.Source, TargetDB: dp.Target, State: dp.State, TS: rp.TS,
@@ -396,24 +403,24 @@ func connectTarget(ctx context.Context, o Options, d Deps, res *Result) (pg.Conn
 			return pg.Conn{}, nil, TargetSpec{}, usagef("--into-container: %v", err)
 		}
 		in := config.Instance{Name: o.IntoContainer, Container: o.IntoContainer, User: user}
-		conn, runner, err := d.Connect(ctx, d.Tools, in, d.Secrets)
+		conn, runner, err := connectSocket(ctx, o, d, in, "container "+o.IntoContainer)
 		if err != nil {
-			return conn, nil, TargetSpec{}, fmt.Errorf("connect to container %s: %w", o.IntoContainer, err)
+			return conn, nil, TargetSpec{}, err
 		}
 		conn.Database = "postgres"
 		res.Target.Container = o.IntoContainer
 		res.Target.Runner = runner.Describe()
-		return conn, runner, TargetSpec{Kind: "container", Container: o.IntoContainer, Shell: d.Shell}, nil
+		return conn, runner, TargetSpec{Kind: "container", Container: o.IntoContainer, Shell: d.Shell, Password: conn.Password != ""}, nil
 	case o.IntoLocal != 0:
 		in := config.Instance{Name: "local", Local: &config.Local{Port: o.IntoLocal, SocketDir: o.SocketDir}}
-		conn, runner, err := d.Connect(ctx, d.Tools, in, d.Secrets)
+		conn, runner, err := connectSocket(ctx, o, d, in, fmt.Sprintf("the local Postgres on port %d", o.IntoLocal))
 		if err != nil {
-			return conn, nil, TargetSpec{}, fmt.Errorf("connect to the local Postgres on port %d: %w", o.IntoLocal, err)
+			return conn, nil, TargetSpec{}, err
 		}
 		l := &pg.Local{Dir: socketDir(o), Port: o.IntoLocal}
 		res.Target.Local = l.SocketPath()
 		res.Target.Runner = runner.Describe()
-		return conn, runner, TargetSpec{Kind: "local", Local: l, Shell: d.Shell}, nil
+		return conn, runner, TargetSpec{Kind: "local", Local: l, Shell: d.Shell, Password: conn.Password != ""}, nil
 	}
 	var raw string
 	if o.IntoURL {
@@ -449,17 +456,65 @@ func connectTarget(ctx context.Context, o Options, d Deps, res *Result) (pg.Conn
 	return conn, runner, TargetSpec{Kind: "url"}, nil
 }
 
-// applyCommand is how the customer applies a file to this target.
+// passwordPrompt is how psql asks when the socket wants a password.
+var passwordPrompt = []string{"no password supplied", "password authentication failed", "Password for user"}
+
+// connectSocket connects to a container or local target: peer or trust
+// first, then the password from --password-env or the terminal.
+func connectSocket(ctx context.Context, o Options, d Deps, in config.Instance, what string) (pg.Conn, pg.Runner, error) {
+	const typed = "BRACER_TARGET_PASSWORD"
+	secrets := d.Secrets
+	in.PasswordEnv = o.PasswordEnv
+	conn, runner, err := d.Connect(ctx, d.Tools, in, secrets)
+	if err == nil || o.PasswordEnv != "" || !containsAny(err.Error(), passwordPrompt) {
+		if err != nil {
+			return conn, nil, fmt.Errorf("connect to %s: %w", what, err)
+		}
+		return conn, runner, nil
+	}
+	if d.AskPassword == nil {
+		return conn, nil, usagef("%s asks for a password; pass it in an environment variable with --password-env <NAME>, or run restore in a terminal", what)
+	}
+	v, aerr := d.AskPassword()
+	if aerr != nil {
+		return conn, nil, usagef("password: %v", aerr)
+	}
+	in.PasswordEnv = typed
+	conn, runner, err = d.Connect(ctx, d.Tools, in, secrets.With(typed, v, "terminal"))
+	if err != nil {
+		return conn, nil, fmt.Errorf("connect to %s: %w", what, err)
+	}
+	return conn, runner, nil
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, x := range subs {
+		if strings.Contains(s, x) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyCommand is how the customer applies a file to this target. When the
+// target asked for a password, psql takes it from PGPASSWORD in their shell.
 func applyCommand(spec TargetSpec, conn pg.Conn, major int) string {
 	switch spec.Kind {
 	case "container":
-		return fmt.Sprintf("docker exec -i %s psql -U %s -d postgres -v ON_ERROR_STOP=1 < <file>", spec.Container, conn.User)
+		env := ""
+		if spec.Password {
+			env = " -e PGPASSWORD"
+		}
+		return fmt.Sprintf("docker exec -i%s %s psql -U %s -d postgres -v ON_ERROR_STOP=1 < <file>", env, spec.Container, conn.User)
 	case "local":
-		h := ""
+		h, env := "", ""
 		if spec.Local.Dir != config.DefaultSocketDir {
 			h = " -h " + spec.Local.Dir
 		}
-		return fmt.Sprintf("sudo -u postgres psql%s -p %d -d postgres -v ON_ERROR_STOP=1 < <file>", h, spec.Local.Port)
+		if spec.Password {
+			env = " --preserve-env=PGPASSWORD"
+		}
+		return fmt.Sprintf("sudo -u postgres%s psql%s -p %d -d postgres -v ON_ERROR_STOP=1 < <file>", env, h, spec.Local.Port)
 	}
 	return fmt.Sprintf(`PGURL='<target URL>' docker run --rm -i --network host -e PGURL %s sh -c 'psql "$PGURL" -v ON_ERROR_STOP=1' < <file>`, pg.ImageForMajor(major))
 }

@@ -151,10 +151,15 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, cfg *config.App
 	cur := before
 	var again *restore.Plan
 	for round := 1; ; round++ {
-		plan := restore.MakePlan(restore.PlanInput{Src: src, Tgt: cur, Mode: mode, Now: d.Now()})
+		plan := restore.MakePlan(restore.PlanInput{Src: src, Tgt: cur, Mode: mode, Now: d.Now(), OwnUser: t.user})
 		var noteTo *InstanceResult
 		if round == 1 {
-			ir.Notes = append(ir.Notes, plan.Notes...)
+			for _, n := range plan.Notes {
+				// checkImage already said which preload libraries the image left out
+				if !strings.HasPrefix(n, "the source also preloads") {
+					ir.Notes = append(ir.Notes, n)
+				}
+			}
 			noteTo = ir
 		}
 		failed := drillFailed(plan, noteTo)
@@ -226,7 +231,7 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, cfg *config.App
 		if err != nil {
 			return fail("read the temporary Postgres after the load: %v", err)
 		}
-		check := restore.MakePlan(restore.PlanInput{Src: src, Tgt: after, Mode: mode, Loaded: loaded, Now: d.Now()})
+		check := restore.MakePlan(restore.PlanInput{Src: src, Tgt: after, Mode: mode, Loaded: loaded, Now: d.Now(), OwnUser: t.user})
 		if left := drillFailed(check, nil); len(left) > 0 {
 			ir.Checks = left
 			ir.Error = "after the load the target no longer matches the backup: " + describe(left)

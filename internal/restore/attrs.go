@@ -160,6 +160,8 @@ func ParseDatabaseSQL(sql []byte, target string, roles map[string]bool) (*Attrib
 				}
 				a.Settings = append(a.Settings, s)
 			case len(toks) >= 5 && toks[3].isKeyword("CONNECTION") && toks[4].isKeyword("LIMIT"):
+			case toks[3].isKeyword("IS_TEMPLATE") && a.SourceDB == "template1" && target == "template1":
+				// template1 restored into template1 stays the template it is.
 			case toks[3].isKeyword("IS_TEMPLATE"), toks[3].isKeyword("ALLOW_CONNECTIONS"):
 				skip("the restored copy is not made a template nor closed to connections; set it yourself if needed", toks)
 				continue

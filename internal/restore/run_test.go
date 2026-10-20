@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"bracer.dev/bracer/internal/backup"
+	"bracer.dev/bracer/internal/config"
 	"bracer.dev/bracer/internal/pg"
 )
 
@@ -214,5 +215,37 @@ func TestSideName(t *testing.T) {
 	name, _ = SideName(long, "preview", at, func(string) (bool, error) { return false, nil })
 	if len(name) > 63 || !strings.HasSuffix(name, "_preview_20261016_0300") || !bytes.HasPrefix([]byte(name), []byte("éé")) || strings.ContainsRune(name, '\uFFFD') {
 		t.Errorf("long name = %q (%d bytes)", name, len(name))
+	}
+}
+
+// A container target whose socket asks for a password (Bitnami): the password
+// comes from --password-env or the terminal, and the apply command passes PGPASSWORD.
+func TestConnectSocketPassword(t *testing.T) {
+	fake := func(_ context.Context, _ *pg.Tools, in config.Instance, s *config.Secrets) (pg.Conn, pg.Runner, error) {
+		if in.PasswordEnv == "" {
+			return pg.Conn{}, nil, errors.New(`psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: fe_sendauth: no password supplied`)
+		}
+		v, err := s.Require(in.PasswordEnv)
+		if err != nil {
+			return pg.Conn{}, nil, err
+		}
+		return pg.Conn{User: in.User, Password: v}, nil, nil
+	}
+	in := config.Instance{Name: "db", Container: "db", User: "postgres"}
+	d := Deps{Connect: fake, Secrets: config.NewSecrets(map[string]string{"TGT_PW": "from-env"}, "test")}
+	if _, _, err := connectSocket(context.Background(), Options{}, d, in, "container db"); err == nil || !strings.Contains(err.Error(), "--password-env") {
+		t.Errorf("no terminal: %v", err)
+	}
+	conn, _, err := connectSocket(context.Background(), Options{PasswordEnv: "TGT_PW"}, d, in, "container db")
+	if err != nil || conn.Password != "from-env" {
+		t.Errorf("--password-env: %v %+v", err, conn)
+	}
+	d.AskPassword = func() (string, error) { return "typed", nil }
+	conn, _, err = connectSocket(context.Background(), Options{}, d, in, "container db")
+	if err != nil || conn.Password != "typed" {
+		t.Errorf("terminal: %v %+v", err, conn)
+	}
+	if got := applyCommand(TargetSpec{Kind: "container", Container: "db", Password: true}, conn, 17); !strings.HasPrefix(got, "docker exec -i -e PGPASSWORD db psql -U postgres") {
+		t.Errorf("apply: %s", got)
 	}
 }

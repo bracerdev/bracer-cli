@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,10 @@ type Env struct {
 	PreloadLibraries   *string   `json:"shared_preload_libraries,omitempty"`
 	HasFileSettings    bool      `json:"has_file_settings"`
 	Settings           []Setting `json:"settings"`
+	// Modules are the settings of loaded modules (dotted names: cron.database_name),
+	// server-level. A backup keeps those not at their default; a target reads all,
+	// so restore compares those whose module the target has loaded.
+	Modules []Setting `json:"module_settings,omitempty"`
 	// DBSettings are the values in effect in each database for the connected
 	// user (server + database + role): what a URL source can tell (data mode).
 	DBSettings     map[string][]Setting `json:"db_settings,omitempty"`
@@ -90,9 +95,44 @@ type Package struct {
 
 // SettingsFilter is the pg_settings rows compared (ADR-0015 § 2): statement
 // behaviour, locale and formatting, compatibility. client_encoding is set by
-// every client, allow_alter_system is not about queries, and dotted names are
-// options of a loaded module (preload covers them).
-const SettingsFilter = `(category in ('Client Connection Defaults / Statement Behavior', 'Client Connection Defaults / Locale and Formatting') or category like 'Version and Platform Compatibility%') and name not in ('client_encoding', 'allow_alter_system') and name not like '%.%'`
+// every client, allow_alter_system is not about queries, transaction_* only
+// mirror default_transaction_* inside a session (ALTER SYSTEM refuses them),
+// and dotted names are options of a loaded module (preload covers them).
+const SettingsFilter = `(category in ('Client Connection Defaults / Statement Behavior', 'Client Connection Defaults / Locale and Formatting') or category like 'Version and Platform Compatibility%') and name not in ('client_encoding', 'allow_alter_system', 'transaction_isolation', 'transaction_read_only', 'transaction_deferrable') and name not like '%.%'`
+
+// SessionOnly: parameters that mirror default_transaction_* inside a session.
+// Backups made before they were filtered out still list them.
+func SessionOnly(name string) bool {
+	switch strings.ToLower(name) {
+	case "transaction_isolation", "transaction_read_only", "transaction_deferrable":
+		return true
+	}
+	return false
+}
+
+const moduleSettingsSQL = "select name, setting, coalesce(unit, ''), vartype, source, coalesce(boot_val, ''), context from pg_settings where name like '%.%' order by name"
+
+// NonDefaultModules keeps the module settings a backup records: those the
+// server does not have at their built-in value.
+func NonDefaultModules(all []Setting) []Setting {
+	var out []Setting
+	for _, s := range all {
+		if s.Source != "default" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// Module returns the named module setting, nil if the module is not loaded.
+func (e *Env) Module(name string) *Setting {
+	for i := range e.Modules {
+		if strings.EqualFold(e.Modules[i].Name, name) {
+			return &e.Modules[i]
+		}
+	}
+	return nil
+}
 
 const settingsSQL = "select name, setting, coalesce(unit, ''), vartype, source, coalesce(boot_val, ''), context from pg_settings where " + SettingsFilter + " order by name"
 
@@ -154,9 +194,9 @@ func CollectEnv(ctx context.Context, c *Client, src EnvSource, dbs []string) (*E
 	}
 	file, ferr := fileSettings(ctx, c)
 	e.HasFileSettings = ferr == nil
-	for _, r := range rows {
+	serverLevel := func(r []string) (Setting, error) {
 		if len(r) != 7 {
-			return nil, nil, fmt.Errorf("unexpected pg_settings row %q", r)
+			return Setting{}, fmt.Errorf("unexpected pg_settings row %q", r)
 		}
 		s := Setting{Name: r[0], Value: r[1], Unit: r[2], Vartype: r[3], Source: r[4], Context: r[6]}
 		if !serverSources[r[4]] {
@@ -170,7 +210,28 @@ func CollectEnv(ctx context.Context, c *Client, src EnvSource, dbs []string) (*E
 				s.Value = r[5]
 			}
 		}
+		return s, nil
+	}
+	for _, r := range rows {
+		s, err := serverLevel(r)
+		if err != nil {
+			return nil, nil, err
+		}
 		e.Settings = append(e.Settings, s)
+	}
+	rows, err = c.Query(ctx, moduleSettingsSQL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read module settings: %w", err)
+	}
+	for _, r := range rows {
+		s, err := serverLevel(r)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(r) == 7 && s.Value == r[5] {
+			s.Source = "default"
+		}
+		e.Modules = append(e.Modules, s)
 	}
 	if ferr == nil {
 		known := map[string]bool{}
@@ -457,32 +518,100 @@ func osRelease() string {
 	return strings.TrimSpace(kv["ID"] + " " + kv["VERSION_ID"])
 }
 
-// ExtensionPackages finds the Debian package holding each extension's control
-// file of a local cluster of this major (dpkg-query -S). Core packages
-// (postgresql-<N>, postgresql-contrib) are left out: the server image has them.
+// ExtensionPackages finds the Debian packages an extension needs on a local
+// cluster of this major (dpkg-query -S): the one holding its control file and
+// the one holding the library its module_pathname names ($libdir/postgis-3),
+// which Debian may ship apart (postgresql-18-postgis-3-scripts and
+// postgresql-18-postgis-3). Core packages (postgresql-<N>, postgresql-contrib)
+// are left out: the server image has them. A file reached through
+// update-alternatives (postgis) is looked up at its real path. Every extension
+// is tried; the error names those not found.
 func ExtensionPackages(ctx context.Context, sh Shell, major int, exts []string) ([]Package, error) {
 	var out []Package
+	var missing []string
 	for _, ext := range exts {
-		path := fmt.Sprintf("/usr/share/postgresql/%d/extension/%s.control", major, ext)
-		res, err := sh.Run(ctx, Cmd{Name: "dpkg-query", Args: []string{"-S", path}})
+		control := fmt.Sprintf("/usr/share/postgresql/%d/extension/%s.control", major, ext)
+		paths := []string{control}
+		res, err := sh.Run(ctx, Cmd{Name: "cat", Args: []string{control}})
 		if err != nil {
-			return out, fmt.Errorf("dpkg-query -S %s: %w", path, err)
-		}
-		pkg, _, ok := strings.Cut(strings.TrimSpace(string(res.Stdout)), ":")
-		if !ok {
-			return out, fmt.Errorf("dpkg-query -S %s: unexpected output", path)
-		}
-		pkg = strings.TrimSpace(strings.Split(pkg, ",")[0])
-		if pkg == fmt.Sprintf("postgresql-%d", major) || strings.HasPrefix(pkg, "postgresql-contrib") {
+			missing = append(missing, ext)
 			continue
 		}
-		p := Package{Extension: ext, Package: pkg}
-		if r, err := sh.Run(ctx, Cmd{Name: "dpkg-query", Args: []string{"-W", "-f", "${Version}", pkg}}); err == nil {
-			p.Version = strings.TrimSpace(string(r.Stdout))
+		if lib := modulePathname(string(res.Stdout)); lib != "" {
+			paths = append(paths, fmt.Sprintf("/usr/lib/postgresql/%d/lib/%s", major, lib))
 		}
-		out = append(out, p)
+		var pkgs []string
+		for _, path := range paths {
+			pkg, ok := packageOf(ctx, sh, path)
+			if !ok {
+				pkgs = nil
+				break
+			}
+			if !slices.Contains(pkgs, pkg) {
+				pkgs = append(pkgs, pkg)
+			}
+		}
+		if len(pkgs) == 0 {
+			missing = append(missing, ext)
+			continue
+		}
+		for _, pkg := range pkgs {
+			if pkg == fmt.Sprintf("postgresql-%d", major) || strings.HasPrefix(pkg, "postgresql-contrib") {
+				continue
+			}
+			p := Package{Extension: ext, Package: pkg}
+			if r, err := sh.Run(ctx, Cmd{Name: "dpkg-query", Args: []string{"-W", "-f", "${Version}", pkg}}); err == nil {
+				p.Version = strings.TrimSpace(string(r.Stdout))
+			}
+			out = append(out, p)
+		}
+	}
+	if len(missing) > 0 {
+		return out, fmt.Errorf("no Debian package holds the control file or library of %s", strings.Join(missing, ", "))
 	}
 	return out, nil
+}
+
+// packageOf is the package dpkg-query -S names for a file, following an
+// update-alternatives symlink to its real path.
+func packageOf(ctx context.Context, sh Shell, path string) (string, bool) {
+	res, err := sh.Run(ctx, Cmd{Name: "dpkg-query", Args: []string{"-S", path}})
+	if err != nil {
+		if r, rerr := sh.Run(ctx, Cmd{Name: "readlink", Args: []string{"-f", path}}); rerr == nil {
+			if real := strings.TrimSpace(string(r.Stdout)); real != "" && real != path {
+				res, err = sh.Run(ctx, Cmd{Name: "dpkg-query", Args: []string{"-S", real}})
+			}
+		}
+	}
+	if err != nil {
+		return "", false
+	}
+	pkg, _, ok := strings.Cut(strings.TrimSpace(string(res.Stdout)), ":")
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(strings.Split(pkg, ",")[0]), true
+}
+
+// modulePathname is the library file a control file's module_pathname names
+// under $libdir ("postgis-3.so"); empty when it names none.
+func modulePathname(control string) string {
+	for _, l := range strings.Split(control, "\n") {
+		k, v, ok := strings.Cut(l, "=")
+		if !ok || strings.TrimSpace(k) != "module_pathname" {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), "'")
+		name, ok := strings.CutPrefix(v, "$libdir/")
+		if !ok || name == "" || strings.Contains(name, "/") {
+			return ""
+		}
+		if !strings.HasSuffix(name, ".so") {
+			name += ".so"
+		}
+		return name
+	}
+	return ""
 }
 
 // Setting returns the named setting, nil if absent.

@@ -28,6 +28,7 @@ type RoleSpec struct {
 	Password   string          // the hash literal as written, '…'; "": none
 	Settings   map[string]roleSetting
 	MemberOf   map[string]Membership
+	Comment    *string // COMMENT ON ROLE; nil: none
 }
 
 type roleSetting struct {
@@ -66,7 +67,7 @@ func newRole(name string) *RoleSpec {
 }
 
 // ParseGlobals reads the users out of pg_dumpall --globals-only. Statements it
-// does not need (SET, tablespaces, comments) are skipped.
+// does not need (SET, tablespaces) are skipped.
 func ParseGlobals(data []byte) (*RoleGlobals, error) {
 	stmts, err := splitStatements(string(data))
 	if err != nil {
@@ -134,6 +135,9 @@ func ParseGlobals(data []byte) (*RoleGlobals, error) {
 				at = indexPunct(toks[4:], "=")
 			}
 			r.Settings[strings.ToLower(s.Name)] = roleSetting{Name: s.Name, Value: s.Value, SQL: rebuild(toks[4+at+1:])}
+		case kw(0, "COMMENT") && kw(1, "ON") && kw(2, "ROLE") && isName(3) && kw(4, "IS") && len(toks) > 5 && toks[5].kind == tokLiteral:
+			c := unquoteLiteral(toks[5].val)
+			role(toks[3].ident()).Comment = &c
 		case kw(0, "GRANT") && isName(1) && kw(2, "TO") && isName(3):
 			r := role(toks[3].ident())
 			r.MemberOf[toks[1].ident()] = parseGrantOptions(toks[4:])
@@ -283,6 +287,16 @@ func ReadTargetRoles(ctx context.Context, admin *pg.Client, major int) (*TargetR
 			if len(r) == 2 && tr.Roles[r[0]] != nil && r[1] != "" {
 				tr.Roles[r[0]].Password = pg.QuoteLiteral(r[1])
 			}
+		}
+	}
+	rows, err = admin.Query(ctx, "select rolname, shobj_description(oid, 'pg_authid') from pg_roles where shobj_description(oid, 'pg_authid') is not null")
+	if err != nil {
+		return nil, fmt.Errorf("read user comments: %w", err)
+	}
+	for _, r := range rows {
+		if len(r) == 2 && tr.Roles[r[0]] != nil {
+			c := r[1]
+			tr.Roles[r[0]].Comment = &c
 		}
 	}
 	rows, err = admin.Query(ctx, "select r.rolname, c from pg_db_role_setting s join pg_roles r on r.oid = s.setrole, unnest(s.setconfig) c where s.setdatabase = 0")

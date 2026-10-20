@@ -192,6 +192,10 @@ func TestPlanRecreatesEmptyDatabaseWithOtherLocale(t *testing.T) {
 	if index(p.Down, `CREATE DATABASE "shop" TEMPLATE template0 encoding 'UTF8' lc_collate 'C' lc_ctype 'C' OWNER "postgres";`) < 0 {
 		t.Errorf("env-down:\n%s", strings.Join(p.Down, "\n"))
 	}
+	// env-down drops the restored database once, then builds the old one.
+	if n := strings.Count(strings.Join(p.Down, "\n"), `DROP DATABASE IF EXISTS "shop"`); n != 1 {
+		t.Errorf("env-down drops shop %d times:\n%s", n, strings.Join(p.Down, "\n"))
+	}
 }
 
 // A URL run is data only: the database is created owned by the connecting
@@ -241,5 +245,90 @@ func TestPlanReloadAfterReset(t *testing.T) {
 	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
 	if p.Restart || p.Up[len(p.Up)-1] != "SELECT pg_reload_conf();" || p.Down[len(p.Down)-1] != "SELECT pg_reload_conf();" || index(p.Down, "ALTER SYSTEM RESET DateStyle") < 0 {
 		t.Errorf("up:\n%s\ndown:\n%s", strings.Join(p.Up, "\n"), strings.Join(p.Down, "\n"))
+	}
+}
+
+// Role comments come back: a new user gets its comment, an existing one with
+// another comment is changed and env-down puts the old one back.
+func TestPlanRoleComments(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	src.Globals = mustGlobals(t, superGlobals+"CREATE ROLE app;\nALTER ROLE app WITH LOGIN;\nCOMMENT ON ROLE app IS 'owns ''shop''';\nCOMMENT ON ROLE postgres IS 'admin';\n")
+	old := "old"
+	tgt.Roles.Roles["postgres"].Comment = &old
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	for _, s := range []string{`COMMENT ON ROLE "app" IS 'owns ''shop''';`, `COMMENT ON ROLE "postgres" IS 'admin';`} {
+		if !has(p.Up, s) {
+			t.Errorf("env-up lacks %s:\n%s", s, strings.Join(p.Up, "\n"))
+		}
+	}
+	if !has(p.Down, `COMMENT ON ROLE "postgres" IS 'old';`) {
+		t.Errorf("env-down:\n%s", strings.Join(p.Down, "\n"))
+	}
+	if index(p.Up, `CREATE ROLE "app"`) > index(p.Up, `COMMENT ON ROLE "app"`) {
+		t.Errorf("comment before the role exists:\n%s", strings.Join(p.Up, "\n"))
+	}
+}
+
+// transaction_isolation mirrors default_transaction_isolation in a session:
+// a backup that recorded it must not make env-up ALTER SYSTEM it.
+func TestPlanSkipsSessionOnlySettings(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	src.Env.Settings = append(src.Env.Settings, pg.Setting{Name: "transaction_isolation", Value: "repeatable read", Vartype: "enum"})
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	if _, ok := failed(p)["setting transaction_isolation"]; ok || strings.Contains(strings.Join(p.Up, "\n"), "transaction_isolation") {
+		t.Errorf("session-only setting compared:\n%s", strings.Join(p.Up, "\n"))
+	}
+}
+
+// lc_messages ” (Bitnami) cannot be ALTER SYSTEM SET and changes no query
+// result: a warning, no SQL.
+func TestPlanLcMessagesWarnsOnly(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	src.Env.Settings = append(src.Env.Settings, pg.Setting{Name: "lc_messages", Value: "", Vartype: "string"})
+	tgt.Env.Settings = append(tgt.Env.Settings, pg.Setting{Name: "lc_messages", Value: "en_US.utf8", Vartype: "string", Source: "configuration file", Context: "superuser"})
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	if _, ok := failed(p)["setting lc_messages"]; ok || strings.Contains(strings.Join(p.Up, "\n"), "lc_messages") {
+		t.Errorf("lc_messages blocks or has SQL:\n%s", strings.Join(p.Up, "\n"))
+	}
+}
+
+// A loaded module's setting follows the backup (pg_cron's cron.database_name);
+// a module the target has not loaded (neon) is not compared.
+func TestPlanModuleSettings(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	src.Env.Modules = []pg.Setting{{Name: "cron.database_name", Value: "shop", Vartype: "string"}, {Name: "neon.timeline_id", Value: "x", Vartype: "string"}}
+	tgt.Env.Modules = []pg.Setting{{Name: "cron.database_name", Value: "postgres", Vartype: "string", Source: "default", Context: "postmaster"}}
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	if c, ok := failed(p)["setting cron.database_name"]; !ok || c.Fix != FixSQL || !p.Restart {
+		t.Errorf("cron.database_name: %+v restart %v", c, p.Restart)
+	}
+	up := strings.Join(p.Up, "\n")
+	if !strings.Contains(up, "ALTER SYSTEM SET cron.database_name = 'shop';") || strings.Contains(up, "neon") {
+		t.Errorf("env-up:\n%s", up)
+	}
+	if !has(p.Down, "ALTER SYSTEM RESET cron.database_name;") {
+		t.Errorf("env-down:\n%s", strings.Join(p.Down, "\n"))
+	}
+}
+
+// A local target without an extension is told every package the source
+// cluster had for it: postgis ships its scripts and its library apart.
+func TestPlanExtensionHintNamesEveryPackage(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	src.Env.Local = &pg.LocalEnv{Packages: []pg.Package{
+		{Extension: "postgis", Package: "postgresql-17-postgis-3-scripts"},
+		{Extension: "postgis", Package: "postgresql-17-postgis-3"},
+		{Extension: "vector", Package: "postgresql-17-pgvector"}}}
+	src.DBs[0].Dump.Extensions = append(src.DBs[0].Dump.Extensions, pg.Extension{Name: "postgis", Version: "3.6.4", Schema: "public"})
+	tgt.Kind = "local"
+	tgt.Env.ServerVersionNum, tgt.Major = 180001, 18
+	var hint string
+	for k, c := range failed(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})) {
+		if strings.HasPrefix(k, "extension ") && strings.Contains(k, "postgis") {
+			hint = c.Manual
+		}
+	}
+	if want := "sudo apt install postgresql-18-postgis-3-scripts postgresql-18-postgis-3, then run restore again"; hint != want {
+		t.Errorf("hint %q, want %q", hint, want)
 	}
 }

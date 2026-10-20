@@ -461,6 +461,7 @@ func collectEnv(ctx context.Context, in config.Instance, client *pg.Client, kind
 	if err != nil {
 		return nil, fmt.Errorf("read the environment: %w", err)
 	}
+	env.Modules = pg.NonDefaultModules(env.Modules)
 	if kind.Full() && !env.HasFileSettings {
 		return nil, fmt.Errorf("read the environment: pg_file_settings is not readable; a full backup needs a superuser")
 	}

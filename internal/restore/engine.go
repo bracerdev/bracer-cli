@@ -108,14 +108,17 @@ type AppCheck struct {
 	Database string `json:"database,omitempty"`
 	Network  string `json:"network,omitempty"`
 	// Tables are the manifest tables; Readable those the app's user has
-	// SELECT on (privileges came with the dump), each read once.
+	// SELECT on, in a schema it has USAGE on (privileges came with the dump),
+	// each read once.
 	Tables   int    `json:"tables"`
 	Readable int    `json:"readable"`
 	Error    string `json:"error,omitempty"`
 }
 
 // CheckApp connects with the app's URL from network (a container's network,
-// or host) and reads every manifest table its user has SELECT on.
+// or host) and reads every manifest table its user can read: SELECT on the
+// table and USAGE on its schema (pg_cron grants SELECT on cron.job to PUBLIC
+// but no USAGE on cron).
 func CheckApp(ctx context.Context, sh pg.Shell, image, network, rawURL string, loaded map[string]*backup.Dump) *AppCheck {
 	ac := &AppCheck{Network: network}
 	conn, err := pg.ParseURL(rawURL)
@@ -136,9 +139,9 @@ func CheckApp(ctx context.Context, sh pg.Shell, image, network, rawURL string, l
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		sql.WriteString("(" + pg.QuoteLiteral(t.Ident()) + ")")
+		sql.WriteString("(" + pg.QuoteLiteral(t.Ident()) + ", " + pg.QuoteLiteral(t.Schema) + ")")
 	}
-	sql.WriteString(") v(t) where has_table_privilege(t, 'SELECT')")
+	sql.WriteString(") v(t, s) where has_schema_privilege(s, 'USAGE') and has_table_privilege(t, 'SELECT')")
 	query := "select 1"
 	if len(dp.Tables) > 0 {
 		query = sql.String()

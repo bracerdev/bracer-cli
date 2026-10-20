@@ -64,6 +64,7 @@ type TargetSpec struct {
 	Container string
 	Local     *pg.Local
 	Shell     pg.Shell
+	Password  bool // the socket asked for a password: the printed commands pass PGPASSWORD
 }
 
 // ReadTarget reads the target through admin (connected to its maintenance

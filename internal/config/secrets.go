@@ -27,6 +27,21 @@ func NewSecrets(values map[string]string, source string) *Secrets {
 	return s
 }
 
+// With returns a copy that also holds name (a value typed at a prompt).
+func (s *Secrets) With(name, value, source string) *Secrets {
+	c := &Secrets{values: map[string]string{}, Source: map[string]string{}}
+	if s != nil {
+		for k, v := range s.values {
+			c.values[k] = v
+		}
+		for k, v := range s.Source {
+			c.Source[k] = v
+		}
+	}
+	c.values[name], c.Source[name] = value, source
+	return c
+}
+
 // Lookup returns the variable's value; ok=false if it is in none of the sources.
 func (s *Secrets) Lookup(name string) (string, bool) {
 	v, ok := s.values[name]

@@ -14,9 +14,13 @@ func notExtensionMember(cls, oid string) string {
 
 // userObjectsSQL counts what makes a database not empty (ADR-0015): relations,
 // functions, types and schemas that do not belong to an extension. The public
-// schema and extension members do not count.
+// schema and extension members do not count. A schema that a script created
+// next to an extension (postgis image: topology, tiger) counts: the dump
+// creates it again, which would fail.
 var userObjectsSQL = "select " +
-	"(select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m','S','f','c') and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast' and " + notExtensionMember("pg_class", "c.oid") + ")" +
+	"(select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m','S','f','c') and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast' and " + notExtensionMember("pg_class", "c.oid") +
+	// a composite type's membership is recorded on its pg_type row
+	" and (c.relkind <> 'c' or " + notExtensionMember("pg_type", "c.reltype") + "))" +
 	" + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname not in ('pg_catalog','information_schema') and " + notExtensionMember("pg_proc", "p.oid") + ")" +
 	" + (select count(*) from pg_type t join pg_namespace n on n.oid = t.typnamespace where n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast' and t.typtype in ('b','d','e','r','m') and t.typcategory <> 'A' and " + notExtensionMember("pg_type", "t.oid") + ")" +
 	" + (select count(*) from pg_namespace n where n.nspname not in ('public','information_schema') and n.nspname !~ '^pg_' and " + notExtensionMember("pg_namespace", "n.oid") + ")"

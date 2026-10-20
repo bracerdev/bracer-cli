@@ -124,6 +124,9 @@ type PlanInput struct {
 	Loaded map[string]string
 	// Now names a side database when no run ts can be read.
 	Now time.Time
+	// OwnUser is a user the caller created on the target itself (drill's
+	// superuser): its password is the caller's, not worth a note.
+	OwnUser string
 }
 
 // planner accumulates the checks and the SQL in the groups env-up runs in.
@@ -290,7 +293,8 @@ func (pl *planner) databases() {
 				pl.createDB(sdb, dp.Target)
 				pl.up[gCreateDB] = append(pl.up[gCreateDB], afterCreate(dp.Target)...)
 				// env-down: drop what env-up created (createDB), then bring the old one back.
-				pl.down[gCreateDB] = append(pl.down[gCreateDB], recreateDB(td, pl.targetMajor())[1:]...)
+				// createDB's down already drops it: only build the old one again.
+				pl.down[gCreateDB] = append(pl.down[gCreateDB], recreateDB(td, pl.targetMajor())[1+len(dropStmts(td.Name, pl.targetMajor(), true)):]...)
 				pl.sql("database", sdb.Name, fmt.Sprintf("%s is empty but its locale is %s, the backup's is %s; env-up recreates it", dp.Target, td.Locale, loc))
 			} else if dp.State == StateHasData {
 				pl.ok("database", sdb.Name, fmt.Sprintf("%s has data; restoring into %s (empty) next to it", sdb.Name, dp.Target))
@@ -470,10 +474,14 @@ func (pl *planner) extensions() {
 
 func (pl *planner) extensionHint(e pg.Extension) string {
 	if pl.tgt.Kind == "local" && pl.src.Env.Local != nil {
+		var pkgs []string
 		for _, p := range pl.src.Env.Local.Packages {
 			if p.Extension == e.Name {
-				return "sudo apt install " + retargetPackage(p.Package, pl.sourceMajor(), pl.targetMajor()) + ", then run restore again"
+				pkgs = append(pkgs, retargetPackage(p.Package, pl.sourceMajor(), pl.targetMajor()))
 			}
+		}
+		if len(pkgs) > 0 {
+			return "sudo apt install " + strings.Join(pkgs, " ") + ", then run restore again"
 		}
 	}
 	return pl.rebuildHint(fmt.Sprintf("extension %s %s or newer", e.Name, e.Version))
@@ -496,6 +504,24 @@ func (pl *planner) preload() {
 		exts = append(exts, sdb.Dump.Extensions...)
 	}
 	needed, _ := pg.PreloadNeeds(*src, exts)
+	if pl.tgt.Env.PreloadLibraries != nil {
+		need, have := map[string]bool{}, map[string]bool{}
+		for _, l := range needed {
+			need[l] = true
+		}
+		for _, l := range pg.SplitLibraries(*pl.tgt.Env.PreloadLibraries) {
+			have[l] = true
+		}
+		var other []string
+		for _, l := range pg.SplitLibraries(*src) {
+			if !need[l] && !have[l] {
+				other = append(other, l)
+			}
+		}
+		if len(other) > 0 {
+			pl.p.Notes = append(pl.p.Notes, fmt.Sprintf("the source also preloads %s, which no database's extension needs (statistics, logging, auditing); restore does not load it: add it to shared_preload_libraries on the target if you rely on it", strings.Join(other, ", ")))
+		}
+	}
 	if len(needed) == 0 {
 		return
 	}
@@ -598,6 +624,9 @@ func (pl *planner) locales() {
 // server level; ALTER SYSTEM fixes them.
 func (pl *planner) serverSettings() {
 	for _, s := range pl.src.Env.Settings {
+		if pg.SessionOnly(s.Name) {
+			continue
+		}
 		t := pl.tgt.Env.Setting(s.Name)
 		switch {
 		case t != nil && pg.SameValue(s.Name, s.Vartype, s.Value, t.Value):
@@ -614,6 +643,12 @@ func (pl *planner) serverSettings() {
 			have = t.Value
 		}
 		detail := fmt.Sprintf("target %s, backup %s", have, s.Value)
+		if strings.EqualFold(s.Name, "lc_messages") {
+			// The language of server messages: no query result depends on it,
+			// and '' (inherit from the environment) cannot be set back.
+			pl.warn("setting", s.Name, detail+"; only the language of server messages")
+			continue
+		}
 		if pl.cmdLineSetting(s.Name) {
 			pl.manual("setting", s.Name, detail+" (set on the server's command line)", fmt.Sprintf("change -c %s in the container's command to %s, recreate it, then run restore again", s.Name, s.Value))
 			continue
@@ -627,6 +662,31 @@ func (pl *planner) serverSettings() {
 	}
 	if n := len(pl.src.Env.Settings); n > 0 {
 		pl.ok("setting", "server settings", fmt.Sprintf("%d compared", n))
+	}
+	pl.moduleSettings()
+}
+
+// moduleSettings: a loaded module's settings equal the backup's (pg_cron
+// needs cron.database_name to create its extension). Only modules the target
+// has loaded are compared; preload() loads the ones an extension needs, and
+// the next run compares their settings.
+func (pl *planner) moduleSettings() {
+	for _, s := range pl.src.Env.Modules {
+		t := pl.tgt.Env.Module(s.Name)
+		if t == nil || pg.SameValue(s.Name, s.Vartype, s.Value, t.Value) {
+			continue
+		}
+		detail := fmt.Sprintf("target %s, backup %s", t.Value, s.Value)
+		if pl.cmdLineSetting(s.Name) {
+			pl.manual("setting", s.Name, detail+" (set on the server's command line)", fmt.Sprintf("change -c %s in the container's command to %s, recreate it, then run restore again", s.Name, s.Value))
+			continue
+		}
+		pl.up[gSystem] = append(pl.up[gSystem], "ALTER SYSTEM SET "+settingName(s.Name)+" = "+valueSQL(s.Name, s.Value)+";")
+		pl.down[gSystem] = append(pl.down[gSystem], pl.systemRevert(settingName(s.Name)))
+		if t.Context == "postmaster" {
+			pl.p.Restart = true
+		}
+		pl.sql("setting", s.Name, detail)
 	}
 }
 
@@ -690,7 +750,7 @@ func (pl *planner) dataSettings() {
 		diffs := 0
 		for _, s := range want {
 			t, ok := have[strings.ToLower(s.Name)]
-			if !ok {
+			if !ok || pg.SessionOnly(s.Name) {
 				continue
 			}
 			// A database setting of the archive takes over the value once loaded.
@@ -806,11 +866,14 @@ func (pl *planner) roles() {
 				s := spec.Settings[k]
 				pl.up[gRoleSet] = append(pl.up[gRoleSet], fmt.Sprintf("ALTER ROLE %s SET %s TO %s;", q, settingName(s.Name), s.SQL))
 			}
+			if spec.Comment != nil {
+				pl.up[gAlterRole] = append(pl.up[gAlterRole], roleCommentSQL(q, spec.Comment))
+			}
 			pl.sql("role", n, "missing; env-up creates it with the backup's attributes"+passwordNote(spec))
 			pl.hba(n, spec)
 			continue
 		}
-		if spec.Password != "" && strings.Trim(t.Password, "'") != strings.Trim(spec.Password, "'") {
+		if spec.Password != "" && n != pl.in.OwnUser && strings.Trim(t.Password, "'") != strings.Trim(spec.Password, "'") {
 			existing = append(existing, n)
 		}
 		var diffs []string
@@ -819,6 +882,11 @@ func (pl *planner) roles() {
 			pl.up[gAlterRole] = append(pl.up[gAlterRole], "ALTER ROLE "+q+" WITH "+up+";")
 			pl.down[gAlterRole] = append(pl.down[gAlterRole], "ALTER ROLE "+q+" WITH "+down+";")
 			diffs = append(diffs, up)
+		}
+		if !sameComment(spec.Comment, t.Comment) {
+			pl.up[gAlterRole] = append(pl.up[gAlterRole], roleCommentSQL(q, spec.Comment))
+			pl.down[gAlterRole] = append(pl.down[gAlterRole], roleCommentSQL(q, t.Comment))
+			diffs = append(diffs, "comment")
 		}
 		// More than the backup is fine, except bypassing row security when the data relies on it.
 		if rls {
@@ -914,7 +982,7 @@ func (pl *planner) roles() {
 		pl.sql("role", pgr.Grantee, fmt.Sprintf("missing %s on parameter %s", pgr.Privilege, pgr.Param))
 	}
 	if len(existing) > 0 {
-		pl.p.Notes = append(pl.p.Notes, fmt.Sprintf("users %s already exist on the target with another password, which restore leaves as it is: the app must connect with the target's password", strings.Join(existing, ", ")))
+		pl.p.Notes = append(pl.p.Notes, fmt.Sprintf("users %s already exist on the target and keep the target's password (its hash differs from the backup's; restore never changes it): an app that connects as one of them uses the target's password", strings.Join(existing, ", ")))
 	}
 	var extra []string
 	for _, n := range sortedKeys(tr.Roles) {
@@ -925,6 +993,17 @@ func (pl *planner) roles() {
 	if len(extra) > 0 {
 		pl.p.Notes = append(pl.p.Notes, "users on the target that the backup does not have (left as they are): "+listFirst(extra, 8))
 	}
+}
+
+func roleCommentSQL(q string, c *string) string {
+	if c == nil {
+		return "COMMENT ON ROLE " + q + " IS NULL;"
+	}
+	return "COMMENT ON ROLE " + q + " IS " + pg.QuoteLiteral(*c) + ";"
+}
+
+func sameComment(a, b *string) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
 }
 
 func passwordNote(spec *RoleSpec) string {

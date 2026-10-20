@@ -44,9 +44,10 @@ func runRestore(ctx context.Context, args []string, d backupDeps) int {
 	fs.StringVar(&o.SocketDir, "socket-dir", "", "with --into-local: socket directory (default /var/run/postgresql)")
 	fs.BoolVar(&o.IntoURL, "into-url", false, "target: ask for a postgres:// URL (not echoed, not stored)")
 	fs.StringVar(&o.IntoURLEnv, "into-url-env", "", "target: name of an environment variable holding a postgres:// URL")
+	fs.StringVar(&o.PasswordEnv, "password-env", "", "with --into-container or --into-local: environment variable holding the target superuser's password, when its socket asks for one")
 	fs.BoolVar(&o.Preview, "preview", false, "restore the data to look at only: no owners, privileges or users; CREATEDB is enough")
 	fs.StringVar(&o.SQLDir, "sql-dir", "", "directory for the env-up/env-down/data-down SQL (default ./bracer-restore-<app>-<instance>-<ts>)")
-	fs.BoolVar(&o.AppURL, "app-url", false, "after the load, ask for the app's URL and check it connects and reads the tables it has SELECT on")
+	fs.BoolVar(&o.AppURL, "app-url", false, "after the load, ask for the app's URL and check it connects and reads the tables it can read (SELECT on the table, USAGE on its schema)")
 	fs.StringVar(&o.AppURLEnv, "app-url-env", "", "as --app-url, from an environment variable")
 	fs.BoolVar(&o.DryRun, "dry-run", false, "show source, target and the comparison; write and change nothing")
 	removedInto := fs.String("into", "", "removed: use --into-container, --into-local or --into-url")
@@ -92,8 +93,9 @@ func runRestore(ctx context.Context, args []string, d backupDeps) int {
 	d = d.withRuntime(cfg)
 	started := false
 	deps := restore.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, Timeout: cfg.DrillTimeout(),
-		AskURL:    askHidden(d.stdin, d.stderr, "Target URL (postgres://user:password@host:port/postgres, not shown, not stored): "),
-		AskAppURL: askHidden(d.stdin, d.stderr, "The app's URL, exactly as the app uses it (not shown, not stored): ")}
+		AskURL:      askHidden(d.stdin, d.stderr, "Target URL (postgres://user:password@host:port/postgres, not shown, not stored): "),
+		AskAppURL:   askHidden(d.stdin, d.stderr, "The app's URL, exactly as the app uses it (not shown, not stored): "),
+		AskPassword: askHidden(d.stdin, d.stderr, "The target asks for a password. Password of its superuser (not shown, not stored): ")}
 	if !*asJSON {
 		deps.Started = func(res *restore.Result) {
 			started = true
@@ -474,7 +476,7 @@ func printRestoreResult(w io.Writer, res *restore.Result, args []string) {
 	}
 	if ac := res.AppCheck; ac != nil {
 		if ac.OK {
-			fmt.Fprintf(w, "✓ the app's URL connects as %s (network %s) to %s and reads the %d of %d tables it has SELECT on\n", ac.User, ac.Network, ac.Database, ac.Readable, ac.Tables)
+			fmt.Fprintf(w, "✓ the app's URL connects as %s (network %s) to %s and reads %d of %d tables (those it has SELECT on, in schemas it has USAGE on)\n", ac.User, ac.Network, ac.Database, ac.Readable, ac.Tables)
 		} else {
 			fmt.Fprintf(w, "✗ the app's URL: %s\n", strings.ReplaceAll(ac.Error, "\n", "\n    "))
 		}

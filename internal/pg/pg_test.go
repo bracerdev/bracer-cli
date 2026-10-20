@@ -291,3 +291,36 @@ func TestDiscoverUnseenProcessNeedsSSLRequest(t *testing.T) {
 		t.Errorf("warnings %v", d.Warnings)
 	}
 }
+
+// postgis.control is an update-alternatives symlink: looked up at its real
+// path. Its library ships in another package than its scripts: both are
+// listed. One extension without a package does not hide the others.
+func TestExtensionPackagesFollowsAlternatives(t *testing.T) {
+	d := "/usr/share/postgresql/18/extension/"
+	lib := "/usr/lib/postgresql/18/lib/"
+	sh := &fakeShell{
+		fail: map[string]string{"dpkg-query -S " + d + "postgis.control": "no path found", "dpkg-query -S " + d + "mine.control": "no path found"},
+		out: map[string]string{
+			"cat " + d + "postgis.control":             "comment = 'PostGIS'\nmodule_pathname = '$libdir/postgis-3'\nrelocatable = false\n",
+			"cat " + d + "mine.control":                "comment = 'mine'\n",
+			"cat " + d + "vector.control":              "module_pathname = '$libdir/vector'\n",
+			"readlink -f " + d + "postgis.control":     d + "postgis-3.control\n",
+			"readlink -f " + d + "mine.control":        d + "mine.control\n",
+			"dpkg-query -S " + d + "postgis-3.control": "postgresql-18-postgis-3-scripts: " + d + "postgis-3.control\n",
+			"dpkg-query -S " + lib + "postgis-3.so":    "postgresql-18-postgis-3: " + lib + "postgis-3.so\n",
+			"dpkg-query -S " + d + "vector.control":    "postgresql-18-pgvector: " + d + "vector.control\n",
+			"dpkg-query -S " + lib + "vector.so":       "postgresql-18-pgvector: " + lib + "vector.so\n",
+			"dpkg-query -W":                            "1.0",
+		}}
+	pkgs, err := ExtensionPackages(context.Background(), sh, 18, []string{"mine", "postgis", "vector"})
+	if err == nil || !strings.Contains(err.Error(), "mine") || strings.Contains(err.Error(), "postgis") {
+		t.Errorf("err %v", err)
+	}
+	var got []string
+	for _, p := range pkgs {
+		got = append(got, p.Extension+"="+p.Package)
+	}
+	if want := "postgis=postgresql-18-postgis-3-scripts postgis=postgresql-18-postgis-3 vector=postgresql-18-pgvector"; strings.Join(got, " ") != want {
+		t.Errorf("pkgs %v, want %s", got, want)
+	}
+}
