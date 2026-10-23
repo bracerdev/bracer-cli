@@ -4,19 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
+	"bracer.dev/bracer/internal/drill"
 	"bracer.dev/bracer/internal/pg"
 	"bracer.dev/bracer/internal/storage"
 )
@@ -26,7 +27,7 @@ type backupDeps struct {
 	shell    pg.Shell
 	newStore func(storage.S3Config) (storage.Store, error)
 	http     *http.Client
-	stdin    io.Reader // restore --drop asks for confirmation
+	stdin    io.Reader // restore asks for confirmation
 	stdout   io.Writer
 	stderr   io.Writer
 }
@@ -47,77 +48,39 @@ func (d backupDeps) tools() *pg.Tools {
 	return pg.NewTools(d.shell)
 }
 
-// withRuntime applies app.yaml's runtime: to the real shell: the absolute docker
-// path, and PATH/DOCKER_HOST as defaults the process environment overrides
-// (spec init § Data model). Fake shells in tests are left alone.
-func (d backupDeps) withRuntime(cfg *config.App) backupDeps {
+// withRuntime applies app.yaml's runtime: to the real shell: the absolute
+// docker path, PATH and DOCKER_HOST, over the process environment
+// (ADR-0022). Docker missing at that path is an error, never a lookup in
+// PATH. Fake shells in tests are left alone.
+func (d backupDeps) withRuntime(cfg *config.App) (backupDeps, error) {
 	sh, ok := d.shell.(pg.ExecShell)
-	if !ok || cfg.Runtime == nil {
-		return d
+	if !ok {
+		return d, nil
 	}
 	rt := cfg.Runtime
+	if _, err := os.Stat(rt.Docker); err != nil {
+		return d, fmt.Errorf("docker not found at %s (runtime.docker)\nFix: %s", rt.Docker, backup.FixReinit(cfg.App))
+	}
 	sh.Docker = rt.Docker
-	if rt.Docker != "" {
-		if _, err := os.Stat(rt.Docker); err != nil {
-			// app.yaml copied to another machine (restore elsewhere): use PATH.
-			fmt.Fprintf(d.stderr, "warning: runtime.docker %s not found on this machine; using docker from PATH\n", rt.Docker)
-			sh.Docker = ""
-		}
-	}
-	sh.Env = nil
-	if rt.Path != "" {
-		sh.Env = append(sh.Env, "PATH="+rt.Path)
-	}
+	sh.Env = []string{"PATH=" + rt.Path}
 	if rt.DockerHost != "" {
 		sh.Env = append(sh.Env, "DOCKER_HOST="+rt.DockerHost)
 	}
 	d.shell = sh
-	return d
+	return d, nil
 }
 
-// absPath is the absolute form of app.yaml's path for `Fix: bracer init -c …`.
-func absPath(p string) string {
-	if a, err := filepath.Abs(p); err == nil {
-		return a
-	}
-	return p
-}
-
-// runBackup is `bracer backup` (spec backup/backup).
-func runBackup(ctx context.Context, args []string, d backupDeps) int {
-	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
-	fs.SetOutput(d.stderr)
-	cfgPath := fs.String("c", "app.yaml", "path of app.yaml")
-	envFile := fs.String("env-file", "", "dotenv file with secrets (overrides secrets_file, overridden by the environment)")
-	dryRun := fs.Bool("dry-run", false, "check config, connections and bucket; dump nothing")
-	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
-	verbose := fs.Bool("verbose", false, "log every docker and pg_* command")
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	logger := slog.New(slog.NewTextHandler(d.stderr, &slog.HandlerOptions{Level: level}))
-	slog.SetDefault(logger)
-	if sh, ok := d.shell.(pg.ExecShell); ok {
-		sh.Verbose = *verbose
-		d.shell = sh
-	}
-	fail := func(code int, format string, a ...interface{}) int {
-		fmt.Fprintf(d.stderr, "bracer backup: "+format+"\n", a...)
-		return code
-	}
-
-	cfg, err := config.Load(*cfgPath)
+// loadApp reads app.yaml (or the draft) of a job, applies runtime: and
+// loads its secrets: what every job does before it touches anything.
+// A config that cannot be read is exitUsage; Docker missing is exitError.
+func loadApp(path string, d backupDeps, logger *slog.Logger) (*config.App, *config.Secrets, backupDeps, int, error) {
+	cfg, err := config.Load(path)
 	if err != nil {
-		return fail(exitUsage, "%v", err)
+		return nil, nil, d, exitUsage, err
 	}
-	d = d.withRuntime(cfg)
-	secrets, warns, err := config.LoadSecrets(cfg, *envFile)
+	secrets, warns, err := config.LoadSecrets(cfg)
 	if err != nil {
-		return fail(exitUsage, "%v", err)
+		return nil, nil, d, exitUsage, fmt.Errorf("%v\nFix: %s", err, backup.FixReinit(cfg.App))
 	}
 	for _, w := range warns {
 		logger.Warn(w)
@@ -132,147 +95,419 @@ func runBackup(ctx context.Context, args []string, d backupDeps) int {
 			}
 		}
 	}
-	st, err := openStore(cfg, secrets, d, *cfgPath, missing)
+	for _, name := range []string{cfg.Storage.AccessKeyEnv, cfg.Storage.SecretKeyEnv} {
+		if _, err := secrets.Require(name); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	if cfg.Hosted != nil {
+		if _, err := secrets.Require(cfg.Hosted.TokenEnv); err != nil {
+			missing = append(missing, cfg.Hosted.TokenEnv)
+		}
+	}
+	if name := cfg.HeartbeatURLEnv; name != "" {
+		if _, err := secrets.Require(name); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, nil, d, exitUsage, fmt.Errorf("missing in %s: %s\nFix: %s", cfg.SecretsFile, strings.Join(missing, ", "), backup.FixReinit(cfg.App))
+	}
+	d, err = d.withRuntime(cfg)
 	if err != nil {
-		return fail(exitUsage, "%v", err)
+		return nil, nil, d, exitError, err
+	}
+	return cfg, secrets, d, exitOK, nil
+}
+
+// runBackup is `bracer backup` (spec backup/backup): one run folder, its
+// drill, run.json, retention.
+func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	fs.SetOutput(d.stderr)
+	dryRun := fs.Bool("dry-run", false, "check everything a backup needs; dump the schema only, into memory")
+	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
+	verbose := fs.Bool("verbose", false, "log every docker and pg_* command")
+	initDraft := fs.Bool("init-draft", false, "internal (bracer init): read the app's draft instead of its app.yaml")
+	cfgPath, code, err := selectAppOrDraft(fs, args, userHome(), "backup", initDraft)
+	if code != exitOK {
+		if err != nil {
+			fmt.Fprintf(d.stderr, "bracer backup: %v\n", err)
+		}
+		return code
+	}
+	// name is the app's app.yaml (Fix lines, locks, the place); cfgPath what is read.
+	name := cfgPath
+	if *initDraft {
+		cfgPath = draftPath(name)
+	}
+	logger := newLogger(d.stderr, *verbose)
+	d = d.verbose(*verbose)
+	fail := func(code int, format string, a ...interface{}) int {
+		fmt.Fprintf(d.stderr, "bracer backup: "+format+"\n", a...)
+		return code
 	}
 
-	if *dryRun {
-		return dryRunBackup(ctx, cfg, secrets, st, d, *cfgPath, logger)
+	cfg, secrets, d, code, err := loadApp(cfgPath, d, logger)
+	if err != nil {
+		return fail(code, "%v", err)
 	}
-
-	lock, err := backup.Acquire(*cfgPath)
+	// The one signal of the night: /start now, /<exit> at the end, the drill
+	// included (ADR-0025, ADR-0026).
+	var warnings []string
+	if !*dryRun {
+		hb := newHeartbeat(cfg, secrets, d, logger)
+		hb.send(ctx, "start", "")
+		defer func() { hb.finish(ctx, exit, warnings) }()
+	}
+	here, err := backup.Here(cfg.Storage.Folder, name)
+	if err != nil {
+		return fail(exitError, "%v", err)
+	}
+	// init's first real run starts the folder; it has no app.yaml yet (ADR-0023).
+	_, statErr := os.Stat(name)
+	create := *initDraft && os.IsNotExist(statErr)
+	// One lock for the whole run, the drill included; the preflight takes it
+	// too, since its drill removes the app's leftover temporary containers.
+	lock, err := backup.Acquire(name)
 	if err != nil {
 		return fail(exitError, "%v", err)
 	}
 	defer lock.Release()
+	st, err := openStore(cfg, secrets, d)
+	if err != nil {
+		return fail(exitError, "%v", err)
+	}
 
-	res, err := backup.Run(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, ConfigPath: absPath(*cfgPath)})
+	if *dryRun {
+		return dryRunBackup(ctx, cfg, secrets, st, d, here, create, *asJSON, logger)
+	}
+
+	var dres *drill.Result
+	step := drill.Step(cfg, drillDeps(d, st, logger), func(r *drill.Result) { dres = r })
+	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, Here: here, Create: create, Drill: step})
 	if err != nil {
 		report(ctx, cfg, secrets, d, logger, failureReport("backup", cfg.App, err))
 		return fail(exitError, "%v", err)
 	}
+	warnings = res.Warnings
 	if *asJSON {
-		enc := json.NewEncoder(d.stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(res)
+		printJSON(d.stdout, res)
 	} else {
-		printResult(d.stdout, res)
+		printResult(d.stdout, res, dres)
 	}
 	report(ctx, cfg, secrets, d, logger, res)
-	if !res.OK {
+	return exitOf(res.Status)
+}
+
+// drillDeps is the drill step's view of the world.
+func drillDeps(d backupDeps, st storage.Store, logger *slog.Logger) drill.Deps {
+	return drill.Deps{Shell: d.shell, Tools: d.tools(), Store: st, Log: logger}
+}
+
+// exitOf is the exit code of a run result (ADR-0022, ADR-0029).
+func exitOf(status string) int {
+	if status == backup.ResultOK {
+		return exitOK
+	}
+	return exitError
+}
+
+// newLogger logs to w, every command with verbose.
+func newLogger(w io.Writer, verbose bool) *slog.Logger {
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+	return logger
+}
+
+// verbose turns on command logging of the real shell.
+func (d backupDeps) verbose(on bool) backupDeps {
+	if sh, ok := d.shell.(pg.ExecShell); ok {
+		sh.Verbose = on
+		d.shell = sh
+	}
+	return d
+}
+
+// openStore opens the bucket of app.yaml; loadApp has checked its keys.
+func openStore(cfg *config.App, secrets *config.Secrets, d backupDeps) (storage.Store, error) {
+	ak, _ := secrets.Require(cfg.Storage.AccessKeyEnv)
+	sk, _ := secrets.Require(cfg.Storage.SecretKeyEnv)
+	return d.newStore(storage.S3Config{Endpoint: cfg.Storage.Endpoint, Bucket: cfg.Storage.Bucket, Region: cfg.Storage.Region, AccessKey: ak, SecretKey: sk, PathStyle: cfg.Storage.PathStyle})
+}
+
+// preflightResult is `backup --dry-run` (spec backup AC --dry-run, ADR-0019):
+// one line per check, grouped by section. init reads it as JSON to tell which
+// instance's drill failed.
+type preflightResult struct {
+	Kind  string          `json:"kind"`
+	App   string          `json:"app"`
+	OK    bool            `json:"ok"`
+	Lines []preflightLine `json:"lines"`
+}
+
+// preflightLine is one line; Mark is ✓ ✗ ! - or empty (information).
+type preflightLine struct {
+	Section  string `json:"section"`            // storage, encryption, instance <name>, drill
+	Instance string `json:"instance,omitempty"` // the instance the line is about
+	Area     string `json:"area,omitempty"`     // bucket, age, connect, database, env, drill
+	Mark     string `json:"mark,omitempty"`
+	Text     string `json:"text"`
+	Fix      string `json:"fix,omitempty"`
+}
+
+func (p *preflightResult) add(l preflightLine) {
+	if l.Mark == "✗" {
+		p.OK = false
+	}
+	p.Lines = append(p.Lines, l)
+}
+
+// drillFailed lists the instances whose drill failed in the preflight.
+func (p *preflightResult) drillFailed() []string {
+	var out []string
+	for _, l := range p.Lines {
+		if l.Area == "drill" && l.Mark == "✗" && l.Instance != "" && !containsStr(out, l.Instance) {
+			out = append(out, l.Instance)
+		}
+	}
+	return out
+}
+
+// otherFailed reports a failed line that is not the drill of one instance.
+func (p *preflightResult) otherFailed() bool {
+	for _, l := range p.Lines {
+		if l.Mark == "✗" && (l.Area != "drill" || l.Instance == "") {
+			return true
+		}
+	}
+	return false
+}
+
+func printPreflight(w io.Writer, p *preflightResult) {
+	fmt.Fprintf(w, "app %s\n", p.App)
+	section := ""
+	for _, l := range p.Lines {
+		if l.Section != section {
+			section = l.Section
+			fmt.Fprintf(w, "\n%s\n", section)
+		}
+		if l.Mark == "" {
+			fmt.Fprintf(w, "  %s\n", indentMore(l.Text))
+		} else {
+			fmt.Fprintf(w, "  %s %s\n", l.Mark, indentMore(l.Text))
+		}
+		if l.Fix != "" {
+			fmt.Fprintf(w, "    Fix: %s\n", l.Fix)
+		}
+	}
+	fmt.Fprintf(w, "\nDry run: only the schema was dumped, into memory; nothing was uploaded or pinged.\n")
+}
+
+// dryRunBackup is the preflight: everything a backup needs except the data.
+// It writes, reads and deletes the probe object, round-trips the age key,
+// makes a schema-only run into memory and drills it. Nothing else is written
+// to the bucket; nothing is pinged.
+func dryRunBackup(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create, asJSON bool, logger *slog.Logger) int {
+	p := runPreflight(ctx, cfg, secrets, st, d, here, create, logger)
+	if asJSON {
+		printJSON(d.stdout, p)
+	} else {
+		printPreflight(d.stdout, p)
+	}
+	if !p.OK {
 		return exitError
 	}
 	return exitOK
 }
 
-// openStore checks storage: and the bucket keys, then opens the Store. missing is
-// the other secrets already missing, merged into the same message.
-func openStore(cfg *config.App, secrets *config.Secrets, d backupDeps, cfgPath string, missing []string) (storage.Store, error) {
-	if cfg.Storage == nil {
-		return nil, fmt.Errorf("storage: is not set in %s; run bracer init", cfgPath)
-	}
-	ak, err := secrets.Require(cfg.Storage.AccessKeyEnv)
-	if err != nil {
-		missing = append(missing, cfg.Storage.AccessKeyEnv)
-	}
-	sk, err := secrets.Require(cfg.Storage.SecretKeyEnv)
-	if err != nil {
-		missing = append(missing, cfg.Storage.SecretKeyEnv)
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing secret(s): %s\nProvide them as environment variables, with --env-file <path>, or via secrets_file in %s", strings.Join(missing, ", "), cfgPath)
-	}
-	return d.newStore(storage.S3Config{Endpoint: cfg.Storage.Endpoint, Bucket: cfg.Storage.Bucket, Region: cfg.Storage.Region, AccessKey: ak, SecretKey: sk, PathStyle: cfg.Storage.PathStyle})
-}
-
-// dryRunBackup checks the config, connects to each instance, HEADs the bucket, prints the plan.
-func dryRunBackup(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, cfgPath string, logger *slog.Logger) int {
-	w := d.stdout
-	ok := true
-	fmt.Fprintf(w, "app %s (%s)\n", cfg.App, cfgPath)
-	if cfg.SecretsFile != "" {
-		fmt.Fprintf(w, "secrets_file %s\n", cfg.SecretsFile)
-	}
-	fmt.Fprintf(w, "\nstorage: %s\n", st.Describe())
+func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create bool, logger *slog.Logger) *preflightResult {
+	p := &preflightResult{Kind: "backup-dry-run", App: cfg.App, OK: true}
+	sec := "storage: " + st.Describe()
+	p.add(preflightLine{Section: sec, Text: "secrets_file " + cfg.SecretsFile})
+	// The folder first: nothing is written, not even the probe, to a folder
+	// that has no run or another place's (ADR-0023).
+	folder := preflightLine{Section: sec, Area: "folder", Mark: "✓"}
+	var newest *backup.Run
 	if err := st.Check(ctx); err != nil {
-		fmt.Fprintf(w, "  ✗ %v\n", err)
-		ok = false
-	} else {
-		fmt.Fprintf(w, "  ✓ bucket reachable\n")
+		folder.Mark, folder.Text = "✗", err.Error()
+		p.add(folder)
+		return p
 	}
+	if create {
+		folder.Text = "folder " + cfg.Storage.Folder + ": started by the first backup"
+	} else if prev, _, err := backup.OpenFolder(ctx, st, cfg, here, false); err != nil {
+		folder.Mark, folder.Text = "✗", err.Error()
+		p.add(folder)
+		return p
+	} else {
+		newest = prev
+		folder.Text = "folder " + backup.Root(cfg) + ", written from here; newest run " + prev.TS
+	}
+	p.add(folder)
+	probe := backup.ProbeKey(cfg.Storage.Folder)
+	bucket := preflightLine{Section: sec, Area: "bucket", Mark: "✗"}
+	if err := backup.Probe(ctx, st, probe, time.Now()); errors.Is(err, backup.ErrNoDelete) {
+		bucket.Text, bucket.Fix = err.Error(), "allow the access key to delete objects in the bucket (s3:DeleteObject)"
+	} else if err != nil {
+		bucket.Text, bucket.Fix = err.Error(), "allow the access key to write and read objects under "+backup.Root(cfg)
+	} else {
+		bucket.Mark, bucket.Text = "✓", "wrote, read back and deleted "+probe
+	}
+	p.add(bucket)
 	for _, name := range []string{cfg.Storage.AccessKeyEnv, cfg.Storage.SecretKeyEnv} {
-		fmt.Fprintf(w, "  %s from %s\n", name, secrets.Source[name])
+		p.add(preflightLine{Section: sec, Text: name + " from " + secrets.Source[name]})
 	}
 	switch cfg.Encryption {
 	case "age":
-		fmt.Fprintf(w, "\nencryption: age, recipient %s, identity %s\n", cfg.AgeRecipient, cfg.AgeIdentityFile)
+		sec = fmt.Sprintf("encryption: age, recipient %s, identity %s", cfg.AgeRecipient, cfg.AgeIdentityFile)
+		l := preflightLine{Section: sec, Area: "age", Mark: "✓", Text: "a sample encrypted to the recipient decrypts with age_identity_file"}
+		if err := backup.AgeRoundTrip(cfg); err != nil {
+			l.Mark, l.Text, l.Fix = "✗", err.Error(), "put the private key of "+cfg.AgeRecipient+" back into "+cfg.AgeIdentityFile
+		}
+		p.add(l)
 	default:
-		fmt.Fprintf(w, "\nencryption: none (backups stored in clear)\n")
+		p.add(preflightLine{Section: "encryption: none", Text: "backups stored in clear"})
 	}
-	manifestKey := storage.Join(cfg.Storage.Prefix, cfg.App, "manifest.json")
-	manifest, err := backup.LoadManifest(ctx, st, manifestKey, cfg.App)
-	if err != nil {
-		fmt.Fprintf(w, "manifest: %v\n", err)
-	} else {
+	if newest != nil {
 		var orphans []string
-		for name := range manifest.Instances {
+		for name := range newest.Instances {
 			if cfg.FindInstance(name) == nil {
 				orphans = append(orphans, name)
 			}
 		}
 		sort.Strings(orphans)
 		if len(orphans) > 0 {
-			logger.Warn("manifest has instances that are not in app.yaml (renamed or removed); their dumps stay untouched", "instances", strings.Join(orphans, ", "))
+			logger.Warn("the newest run has instances that are not in app.yaml (renamed or removed); their old runs stay until retention", "instances", strings.Join(orphans, ", "))
 		}
 	}
-	tools := d.tools()
-	for _, in := range cfg.Instances {
-		fmt.Fprintf(w, "\ninstance %s\n", in.Name)
+
+	// The run itself, schema only, into memory, drilled like a real one.
+	mem := storage.NewMemory(backup.PreflightMaxBytes)
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var dres *drill.Result
+	step := func(ctx context.Context, run *backup.Run, res *backup.Result) {
+		// An instance whose backup failed above is not drilled.
+		var skip []string
+		for _, ir := range res.Instances {
+			if !ir.OK {
+				skip = append(skip, ir.Name)
+			}
+		}
+		dd := drill.Deps{Shell: d.shell, Tools: d.tools(), Store: mem, Log: quiet, SkipInstances: skip}
+		drill.Step(cfg, dd, func(r *drill.Result) { dres = r })(ctx, run, res)
+	}
+	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: mem, Secrets: secrets, Tools: d.tools(), Log: quiet, SchemaOnly: true, Drill: step})
+	if err != nil {
+		p.add(preflightLine{Section: "backup", Area: "backup", Mark: "✗", Text: err.Error()})
+		return p
+	}
+	var drillOn []string
+	for _, ir := range res.Instances {
+		in := cfg.FindInstance(ir.Name)
+		sec := "instance " + ir.Name
+		add := func(area, mark, format string, a ...interface{}) {
+			p.add(preflightLine{Section: sec, Instance: ir.Name, Area: area, Mark: mark, Text: fmt.Sprintf(format, a...)})
+		}
 		for _, name := range []string{in.PasswordEnv, in.URLEnv} {
 			if name != "" {
-				fmt.Fprintf(w, "  %s from %s\n", name, secrets.Source[name])
+				add("", "", "%s from %s", name, secrets.Source[name])
 			}
 		}
-		conn, runner, err := backup.Connect(ctx, tools, in, secrets)
-		if err != nil {
-			fmt.Fprintf(w, "  ✗ %v\n", err)
-			ok = false
+		if ir.Runner != "" {
+			add("", "", "runner: %s", ir.Runner)
+		}
+		if ir.Error != "" {
+			add("connect", "✗", "%s", ir.Error)
 			continue
 		}
-		fmt.Fprintf(w, "  runner: %s\n", runner.Describe())
-		client := &pg.Client{Runner: runner, Conn: conn}
-		if err := client.Ping(ctx); err != nil {
-			fmt.Fprintf(w, "  ✗ connect: %v\n", err)
-			ok = false
-			continue
+		add("connect", "✓", "PostgreSQL %s, %d database(s)", ir.PgVersion, len(ir.Databases))
+		for _, dr := range ir.Databases {
+			if dr.OK {
+				add("database", "✓", "%s: schema dumped (%s)", dr.Name, humanBytes(dr.Bytes))
+			} else {
+				add("database", "✗", "%s: %s", dr.Name, dr.Error)
+			}
 		}
-		ver, _ := client.ServerVersion(ctx)
-		if in.Databases.All {
-			dbs, err := client.ListDatabases(ctx)
-			if err != nil {
-				fmt.Fprintf(w, "  ✗ list databases: %v\n", err)
-				ok = false
-				continue
+		if e := ir.Env; e != nil && !e.OK {
+			add("env", "✗", "environment: %s", e.Error)
+		}
+		if g := ir.Globals; g != nil && !g.OK {
+			add("env", "✗", "globals: %s", g.Error)
+		}
+		if ir.Env != nil && ir.Env.OK && (ir.Globals == nil || ir.Globals.OK) {
+			what := "environment"
+			if ir.Globals != nil {
+				what += " and globals"
 			}
-			fmt.Fprintf(w, "  ✓ PostgreSQL %s, all databases (%d now: %s)\n", ver, len(dbs), strings.Join(dbs, ", "))
-		} else {
-			names := make([]string, 0, len(in.Databases.List))
-			for _, db := range in.Databases.List {
-				names = append(names, db.Name)
-			}
-			fmt.Fprintf(w, "  ✓ PostgreSQL %s, %d database(s): %s\n", ver, len(names), strings.Join(names, ", "))
+			add("env", "✓", "%s read", what)
+		}
+
+		switch {
+		case in.DrillOff():
+			add("drill", "-", "drill: off for this instance (not test-restored)")
+		case ir.OK:
+			drillOn = append(drillOn, ir.Name)
+		default:
+			add("drill", "-", "drill: not tried (the backup above fails)")
 		}
 	}
-	fmt.Fprintf(w, "\nDry run: nothing was dumped, uploaded or pinged.\n")
-	if !ok {
-		return exitError
+	preflightDrill(cfg, res, dres, drillOn, p)
+	for _, msg := range res.Warnings {
+		p.add(preflightLine{Section: "warnings", Mark: "!", Text: msg})
 	}
-	return exitOK
+	return p
 }
 
-// printResult prints one line per database (NFR observability).
-func printResult(w io.Writer, res *backup.Result) {
+// preflightDrill adds the drill of the schema-only run, one line per
+// instance drilled (spec backup AC preflight).
+func preflightDrill(cfg *config.App, res *backup.Result, dres *drill.Result, names []string, p *preflightResult) {
+	const sec = "drill (the schema-only run, in a temporary Postgres)"
+	for _, name := range names {
+		ir := res.Instance(name)
+		var x *drill.InstanceResult
+		if dres != nil {
+			x = dres.Instance(name)
+		}
+		l := preflightLine{Section: sec, Instance: name, Area: "drill", Mark: "✓"}
+		switch {
+		case len(ir.DrillFailed) > 0:
+			image := "-"
+			if x != nil {
+				image = orDash(x.Image)
+			}
+			l.Mark, l.Text = "✗", fmt.Sprintf("%s (image %s): %s", name, image, strings.Join(ir.DrillFailed, "; "))
+			l.Fix = "choose an image that has it for instance " + name + ", or turn its drill off: " + backup.FixReinit(cfg.App)
+		case x != nil:
+			l.Text = fmt.Sprintf("%s: image %s, %d database(s) loaded", name, x.Image, len(x.Databases))
+			for _, n := range x.Notes {
+				l.Text += "\nnote: " + n
+			}
+		default:
+			l.Text = name + ": test-restored"
+		}
+		p.add(l)
+	}
+}
+
+func indentMore(s string) string { return strings.ReplaceAll(s, "\n", "\n    ") }
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// printResult prints one line per database of the backup and of the drill
+// (NFR observability).
+func printResult(w io.Writer, res *backup.Result, dres *drill.Result) {
 	for _, ir := range res.Instances {
 		if ir.Error != "" {
 			fmt.Fprintf(w, "✗ %s: %s\n", ir.Name, ir.Error)
@@ -296,18 +531,47 @@ func printResult(w io.Writer, res *backup.Result) {
 				fmt.Fprintf(w, "✗ %s/globals: %s\n", ir.Name, g.Error)
 			}
 		}
-		if len(ir.Added) > 0 {
-			fmt.Fprintf(w, "  new database(s) since last run: %s\n", strings.Join(ir.Added, ", "))
-		}
-		if len(ir.Removed) > 0 {
-			fmt.Fprintf(w, "  database(s) gone since last run: %s\n", strings.Join(ir.Removed, ", "))
+		if len(ir.Missing) > 0 {
+			fmt.Fprintf(w, "✗ %s: this run is missing %s\n", ir.Name, strings.Join(ir.Missing, ", "))
 		}
 	}
-	if res.OldKeyDumps > 0 {
-		fmt.Fprintf(w, "%d dump(s) in the bucket still use a previous age key\n", res.OldKeyDumps)
+	printDrill(w, res, dres)
+	if res.Error != "" {
+		fmt.Fprintf(w, "✗ %s\n", res.Error)
 	}
 	for _, wmsg := range res.Warnings {
 		fmt.Fprintf(w, "warning: %s\n", wmsg)
+	}
+}
+
+// printDrill prints the drill of each instance: one line per database
+// restored, or why it failed.
+func printDrill(w io.Writer, res *backup.Result, dres *drill.Result) {
+	for _, ir := range res.Instances {
+		var x *drill.InstanceResult
+		if dres != nil {
+			x = dres.Instance(ir.Name)
+		}
+		switch {
+		case len(ir.DrillFailed) > 0:
+			fmt.Fprintf(w, "✗ %s: backup uploaded; drill failed: %s\n", ir.Name, indentMore(strings.Join(ir.DrillFailed, "; ")))
+			if x != nil {
+				for _, n := range x.Notes {
+					fmt.Fprintf(w, "  note: %s\n", n)
+				}
+			}
+		case x == nil:
+			if ir.Error == "" {
+				fmt.Fprintf(w, "- %s: not test-restored (drill off)\n", ir.Name)
+			}
+		default:
+			for _, dr := range x.Databases {
+				fmt.Fprintf(w, "✓ %s/%s: restored %s in %.1f s, %d/%d tables\n", ir.Name, dr.DB, humanBytes(dr.Bytes), dr.RestoreSeconds, dr.TablesFound, dr.TablesExpected)
+			}
+			for _, n := range x.Notes {
+				fmt.Fprintf(w, "  note: %s\n", n)
+			}
+		}
 	}
 }
 
@@ -325,7 +589,7 @@ func humanBytes(n int64) string {
 }
 
 // report sends POST /report when app.yaml has hosted: (contract in spec ping).
-// body is the Result of backup/drill; if the run could not start, failureReport is sent.
+// body is the Result of the run; if it could not start, failureReport is sent.
 // Network errors only warn, they do not change the exit code.
 func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d backupDeps, logger *slog.Logger, body any) {
 	h := cfg.Hosted
@@ -365,5 +629,5 @@ func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d bac
 
 // failureReport is the minimal body when the command could not start.
 func failureReport(kind, app string, err error) map[string]any {
-	return map[string]any{"kind": kind, "app": app, "ok": false, "error": err.Error()}
+	return map[string]any{"kind": kind, "app": app, "status": backup.ResultFailed, "ok": false, "error": err.Error()}
 }

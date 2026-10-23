@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,179 +19,271 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
-// App is the whole of app.yaml.
+// App is the whole of app.yaml. Every field is written by init and
+// read strictly: an unknown field is a parse error (ADR-0022).
 type App struct {
 	App             string     `yaml:"app"`
-	SecretsFile     string     `yaml:"secrets_file,omitempty"`
+	SecretsFile     string     `yaml:"secrets_file"`
 	Instances       []Instance `yaml:"instances"`
-	Storage         *Storage   `yaml:"storage,omitempty"`
-	Encryption      string     `yaml:"encryption,omitempty"` // "", none, age
+	Storage         *Storage   `yaml:"storage"`
+	Encryption      string     `yaml:"encryption"` // none, age
 	AgeRecipient    string     `yaml:"age_recipient,omitempty"`
 	AgeIdentityFile string     `yaml:"age_identity_file,omitempty"`
-	Retention       *Retention `yaml:"retention,omitempty"`
-	RowCounts       string     `yaml:"row_counts,omitempty"`     // "", auto, exact, estimate
-	ExactMaxRows    int64      `yaml:"exact_max_rows,omitempty"` // auto: reltuples threshold below which count(*) is used
-	Hosted          *Hosted    `yaml:"hosted,omitempty"`
-	Backup          *Backup    `yaml:"backup,omitempty"`
-	Drill           *Drill     `yaml:"drill,omitempty"`
-	Runtime         *Runtime   `yaml:"runtime,omitempty"`
+	// HeartbeatURLEnv names the secret holding a Healthchecks-style URL: one
+	// signal per backup run, no details (ADR-0025, ADR-0026).
+	HeartbeatURLEnv string  `yaml:"heartbeat_url_env,omitempty"`
+	Hosted          *Hosted `yaml:"hosted,omitempty"`
+	Drill           *Drill  `yaml:"drill,omitempty"`
+	// Schedule is when backup runs and how long runs are kept (ADR-0029);
+	// the drill runs inside each backup.
+	Schedule *Schedule `yaml:"schedule"`
+	Runtime  *Runtime  `yaml:"runtime"`
 }
 
-// Runtime is the context init ran in successfully on this machine, so backup,
-// drill, fetch and restore (by hand, timer or cron) call the same docker the
-// same way without reading the shell's variables (spec init § Data model).
+// Schedule is the schedule: block of app.yaml (ADR-0029): one rhythm, one
+// or more times of day, and how many periods of that rhythm to keep every
+// backup of. Only init writes it; backup reads Every and Keep for
+// retention, the schedule install turns it into OnCalendar lines.
+type Schedule struct {
+	Every string   `yaml:"every"` // daily, weekly, monthly
+	At    []string `yaml:"at"`    // HH:MM, machine time
+	Days  []string `yaml:"days"`  // weekly: mon…sun; monthly: 1–28 or last; daily: empty
+	Keep  int      `yaml:"keep"`  // every backup of the last Keep periods that have one
+}
+
+// The rhythms of Schedule.Every.
+const (
+	EveryDaily   = "daily"
+	EveryWeekly  = "weekly"
+	EveryMonthly = "monthly"
+)
+
+// Weekdays are the values of Schedule.Days for a weekly schedule, Monday first.
+var Weekdays = []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+
+// LastDay is the value of Schedule.Days for the last day of every month.
+const LastDay = "last"
+
+// reClock is a time of day, HH:MM.
+var reClock = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
+
+// ValidClock: s is HH:MM.
+func ValidClock(s string) bool { return reClock.MatchString(s) }
+
+// DefaultKeep is how many periods init offers to keep for a rhythm.
+func DefaultKeep(every string) int {
+	switch every {
+	case EveryWeekly:
+		return 4
+	case EveryMonthly:
+		return 3
+	}
+	return 7
+}
+
+// DefaultSchedule is what init offers.
+var DefaultSchedule = Schedule{Every: EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7}
+
+// Validate checks the values, one problem per line.
+func (s Schedule) Validate() error {
+	if p := s.problems(); len(p) > 0 {
+		return errors.New(strings.Join(p, "; "))
+	}
+	return nil
+}
+
+func (s Schedule) problems() []string {
+	var errs []string
+	switch s.Every {
+	case EveryDaily, EveryWeekly, EveryMonthly:
+	default:
+		errs = append(errs, "every: must be daily, weekly or monthly")
+	}
+	if len(s.At) == 0 {
+		errs = append(errs, "at: at least one time of day (HH:MM)")
+	}
+	seen := map[string]bool{}
+	for _, a := range s.At {
+		switch {
+		case !ValidClock(a):
+			errs = append(errs, fmt.Sprintf("at: %q is not HH:MM", a))
+		case seen[a]:
+			errs = append(errs, fmt.Sprintf("at: %s twice", a))
+		}
+		seen[a] = true
+	}
+	switch s.Every {
+	case EveryDaily:
+		if len(s.Days) > 0 {
+			errs = append(errs, "days: must be empty for a daily schedule")
+		}
+	case EveryWeekly:
+		if len(s.Days) == 0 {
+			errs = append(errs, "days: at least one day of the week (mon…sun)")
+		}
+		for _, d := range s.Days {
+			if !slices.Contains(Weekdays, d) {
+				errs = append(errs, fmt.Sprintf("days: %q is not a day of the week (mon…sun)", d))
+			}
+		}
+	case EveryMonthly:
+		if len(s.Days) == 0 {
+			errs = append(errs, "days: at least one day of the month (1–28 or last)")
+		}
+		for _, d := range s.Days {
+			if n, err := strconv.Atoi(d); d != LastDay && (err != nil || n < 1 || n > 28) {
+				errs = append(errs, fmt.Sprintf("days: %q is not a day of the month (1–28 or last)", d))
+			}
+		}
+	}
+	seen = map[string]bool{}
+	for _, d := range s.Days {
+		if seen[d] {
+			errs = append(errs, fmt.Sprintf("days: %s twice", d))
+		}
+		seen[d] = true
+	}
+	if s.Keep < 1 {
+		errs = append(errs, "keep: must be ≥ 1")
+	}
+	return errs
+}
+
+// Period names the unit of Every: day, week or month.
+func (s Schedule) Period() string {
+	switch s.Every {
+	case EveryWeekly:
+		return "week"
+	case EveryMonthly:
+		return "month"
+	}
+	return "day"
+}
+
+// Runtime is the context init ran in successfully on this machine, so backup
+// and drill (by hand or timer) call the same docker the same way without
+// reading the shell's variables (spec init § Data model).
 type Runtime struct {
-	User       string `yaml:"user,omitempty"`        // user that ran init; schedule runs jobs as this user
-	Path       string `yaml:"path,omitempty"`        // PATH for child processes (docker credential helpers)
-	Docker     string `yaml:"docker,omitempty"`      // absolute path of the docker CLI
+	User       string `yaml:"user"`                  // user that ran init; schedule runs jobs as this user
+	Path       string `yaml:"path"`                  // PATH for child processes (docker credential helpers)
+	Docker     string `yaml:"docker"`                // absolute path of the docker CLI
 	DockerHost string `yaml:"docker_host,omitempty"` // resolved endpoint (DOCKER_HOST > DOCKER_CONTEXT > current context)
 }
 
-// Backup is the `bracer backup` configuration (spec backup § Data model). Every field is optional.
-type Backup struct {
-	Timeout     string `yaml:"timeout,omitempty"`      // per database: count + pg_dump + upload; default 6h
-	LockTimeout string `yaml:"lock_timeout,omitempty"` // maximum lock wait (pg_dump --lock-wait-timeout, session lock_timeout); default 1m
-}
-
-// DefaultBackupTimeout and DefaultLockTimeout apply when backup.* is empty.
+// What init does not ask is a constant, not a field (ADR-0022).
 const (
-	DefaultBackupTimeout = 6 * time.Hour
-	DefaultLockTimeout   = time.Minute
+	// BackupTimeout bounds one database: count + pg_dump + upload.
+	BackupTimeout = 6 * time.Hour
+	// LockTimeout is pg_dump --lock-wait-timeout and the lock_timeout of the
+	// row-count session.
+	LockTimeout = time.Minute
+	// DrillTimeout bounds the load of one database in a drill or a restore.
+	DrillTimeout = 6 * time.Hour
+	// ExactMaxRows: a table whose reltuples is below it is counted exactly.
+	ExactMaxRows int64 = 1_000_000
 )
-
-// BackupTimeout returns backup.timeout with the default applied; a malformed string is already rejected by Validate.
-func (a *App) BackupTimeout() time.Duration {
-	if a.Backup == nil {
-		return DefaultBackupTimeout
-	}
-	return durationOr(a.Backup.Timeout, DefaultBackupTimeout)
-}
-
-// BackupLockTimeout returns backup.lock_timeout with the default applied.
-func (a *App) BackupLockTimeout() time.Duration {
-	if a.Backup == nil {
-		return DefaultLockTimeout
-	}
-	return durationOr(a.Backup.LockTimeout, DefaultLockTimeout)
-}
-
-func durationOr(s string, def time.Duration) time.Duration {
-	if s == "" {
-		return def
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil || d <= 0 {
-		return def
-	}
-	return d
-}
 
 var reDockerMem = regexp.MustCompile(`^[0-9]+[bkmgBKMG]?$`)
 
-// Drill is the `bracer drill` configuration (spec drill § Data model). Every field is optional.
+// ValidDockerMemory is the form `docker run --memory` takes (512m, 2g).
+func ValidDockerMemory(s string) bool { return reDockerMem.MatchString(s) }
+
+// Drill is the app-wide drill configuration (spec drill § Data model). The
+// image and whether drill runs at all are per instance (InstanceDrill).
 type Drill struct {
-	Runtime string  `yaml:"runtime,omitempty"` // "", docker, none: none turns drill off (init --no-drill)
-	Image   string  `yaml:"image,omitempty"`   // default postgres:<major from the manifest>-alpine
-	Timeout string  `yaml:"timeout,omitempty"` // per database, time.Duration; default 6h
-	Memory  string  `yaml:"memory,omitempty"`  // docker run --memory, e.g. 2g
-	CPUs    string  `yaml:"cpus,omitempty"`    // docker run --cpus, e.g. "1"
-	Checks  []Check `yaml:"checks,omitempty"`
-	// Namespace is drill.namespace from before ADR-0013, decoded only to report it clearly.
-	Namespace string `yaml:"namespace,omitempty"`
+	Memory string `yaml:"memory,omitempty"` // docker run --memory, e.g. 2g
 }
 
-// Drill runtimes (drill.runtime).
-const (
-	DrillRuntimeDocker = "docker"
-	DrillRuntimeNone   = "none"
-)
+// InstanceDrill is the drill of one instance (ADR-0019).
+type InstanceDrill struct {
+	Runtime string `yaml:"runtime,omitempty"` // "", none: none turns drill off for this instance
+	Image   string `yaml:"image,omitempty"`   // default: like the source (spec drill § Flow 3b)
+}
 
-// DrillOff reports drill.runtime: none.
+// DrillRuntimeNone turns drill off for an instance.
+const DrillRuntimeNone = "none"
+
+// DrillOff reports that no instance is drilled: every one has drill.runtime: none.
 func (a *App) DrillOff() bool {
-	return a.Drill != nil && a.Drill.Runtime == DrillRuntimeNone
-}
-
-// Check is one SQL statement run on the restored database; ≥ 1 row is a pass.
-type Check struct {
-	Name      string   `yaml:"name"`
-	SQL       string   `yaml:"sql"`
-	Databases []string `yaml:"databases,omitempty"` // empty: every database
-}
-
-// DefaultDrillTimeout is the per-database restore timeout when drill.timeout is empty.
-const DefaultDrillTimeout = 6 * time.Hour
-
-// DrillTimeout returns drill.timeout with the default applied; a malformed string is already rejected by Validate.
-func (a *App) DrillTimeout() time.Duration {
-	if a.Drill == nil || a.Drill.Timeout == "" {
-		return DefaultDrillTimeout
-	}
-	d, err := time.ParseDuration(a.Drill.Timeout)
-	if err != nil || d <= 0 {
-		return DefaultDrillTimeout
-	}
-	return d
-}
-
-// AppliesTo reports whether the check runs on this database.
-func (c Check) AppliesTo(db string) bool {
-	if len(c.Databases) == 0 {
-		return true
-	}
-	for _, d := range c.Databases {
-		if d == db {
-			return true
+	for _, in := range a.Instances {
+		if !in.DrillOff() {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
-// row_counts values (spec backup).
-const (
-	RowCountsAuto     = "auto"
-	RowCountsExact    = "exact"
-	RowCountsEstimate = "estimate"
-
-	DefaultExactMaxRows int64 = 1_000_000
-)
-
-// RowCountsMode returns row_counts with the default applied.
-func (a *App) RowCountsMode() string {
-	if a.RowCounts == "" {
-		return RowCountsAuto
+// DrillMemory is drill.memory, "" for no limit.
+func (a *App) DrillMemory() string {
+	if a.Drill == nil {
+		return ""
 	}
-	return a.RowCounts
+	return a.Drill.Memory
 }
 
-// ExactMaxRowsOrDefault returns exact_max_rows with the default applied.
-func (a *App) ExactMaxRowsOrDefault() int64 {
-	if a.ExactMaxRows <= 0 {
-		return DefaultExactMaxRows
+// DrillOff reports drill.runtime: none on this instance.
+func (in Instance) DrillOff() bool {
+	return in.Drill != nil && in.Drill.Runtime == DrillRuntimeNone
+}
+
+// DrillImage is drill.image of this instance, "" when drill picks it.
+func (in Instance) DrillImage() string {
+	if in.Drill == nil {
+		return ""
 	}
-	return a.ExactMaxRows
+	return in.Drill.Image
 }
 
-// Instance is one Postgres server and how to connect to it. Exactly one of
-// Container | Local | URLEnv must be set. → ADR-0013, ADR-0015
+// SetDrillOff turns drill off (or back on) for this instance.
+func (in *Instance) SetDrillOff(off bool) {
+	if in.Drill == nil {
+		in.Drill = &InstanceDrill{}
+	}
+	in.Drill.Runtime = ""
+	if off {
+		in.Drill.Runtime, in.Drill.Image = DrillRuntimeNone, ""
+	}
+	if *in.Drill == (InstanceDrill{}) {
+		in.Drill = nil
+	}
+}
+
+// SetDrillImage sets drill.image of this instance (drill on).
+func (in *Instance) SetDrillImage(image string) {
+	in.Drill = &InstanceDrill{Image: image}
+	if image == "" {
+		in.Drill = nil
+	}
+}
+
+// Instance is one Postgres server: how to reach it (Connection, written by
+// init) and what the customer chose to back up (ADR-0018).
 type Instance struct {
-	Name        string    `yaml:"name"`
-	Container   string    `yaml:"container,omitempty"`
-	Local       *Local    `yaml:"local,omitempty"`
-	URLEnv      string    `yaml:"url_env,omitempty"`
-	User        string    `yaml:"user,omitempty"`         // container and local
-	PasswordEnv string    `yaml:"password_env,omitempty"` // container and local, when the socket asks for a password (Bitnami, pg_hba md5)
-	PgMajor     int       `yaml:"pg_major,omitempty"`
-	SystemID    string    `yaml:"system_id,omitempty"` // system_identifier of the cluster (pg_control_system()), written by init
-	Databases   Databases `yaml:"databases"`
-
-	// Connection fields from before ADR-0013, decoded only so Validate can name
-	// them and init can offer to pick the instance again.
-	Pod          string `yaml:"pod,omitempty"`
-	Socket       string `yaml:"socket,omitempty"`
-	Host         string `yaml:"host,omitempty"`
-	Port         int    `yaml:"port,omitempty"`
-	PasswordFile string `yaml:"password_file,omitempty"`
+	Name       string `yaml:"name"`
+	Connection `yaml:"connection"`
+	Databases  Databases `yaml:"databases"`
+	// Drill is how this instance is drilled (ADR-0019).
+	Drill *InstanceDrill `yaml:"drill,omitempty"`
 }
+
+// Connection is how bracer reaches an instance. init writes it whole and
+// replaces it whole when the instance is picked again (ADR-0018). Exactly one
+// of Container | Local | URLEnv must be set. → ADR-0013, ADR-0015
+type Connection struct {
+	Container   string `yaml:"container,omitempty"`
+	Local       *Local `yaml:"local,omitempty"`
+	URLEnv      string `yaml:"url_env,omitempty"`
+	User        string `yaml:"user,omitempty"`         // container and local
+	PasswordEnv string `yaml:"password_env,omitempty"` // container and local, when the socket asks for a password (Bitnami, pg_hba md5)
+	PgMajor     int    `yaml:"pg_major"`
+	// SystemID is the system_identifier of the cluster (pg_control_system()),
+	// or SystemIDNone when the server does not let it be read (managed).
+	SystemID string `yaml:"system_id"`
+}
+
+// SystemIDNone is system_id of a server that does not let pg_control_system()
+// be read: backup does not compare identities for it (ADR-0022).
+const SystemIDNone = "none"
 
 // Local is Postgres installed on this machine (apt, PGDG), reached over its
 // Unix socket by the tools in a postgres image (ADR-0015).
@@ -210,33 +303,50 @@ func (l *Local) Dir() string {
 	return l.SocketDir
 }
 
-// Databases is `all` or a list of databases.
-type Databases struct {
-	All  bool
-	List []Database
+// Databases is the list of databases of an instance: always a list, every
+// entry `- name: X` (ADR-0016, ADR-0018).
+type Databases []Database
+
+// Names lists the database names.
+func (ds Databases) Names() []string {
+	out := make([]string, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, d.Name)
+	}
+	return out
 }
 
-// Database is the unit of pg_dump, with an optional retention override.
+// Database is the unit of pg_dump.
 type Database struct {
-	Name      string     `yaml:"name"`
-	Retention *Retention `yaml:"retention,omitempty"`
+	Name string `yaml:"name"`
+	// AcceptedExternal lists what depends on something outside Postgres
+	// (external of run.json) that the customer accepted at init (ADR-0019,
+	// ADR-0029).
+	AcceptedExternal []string `yaml:"accepted_external,omitempty"`
 }
 
-// Storage is the customer's S3-compatible bucket.
+// BucketPrefix is where bracer lives in any bucket: every app's folder is
+// BucketPrefix/<folder>/ (ADR-0027).
+const BucketPrefix = "bracer"
+
+// Storage is the customer's S3-compatible bucket and the app's folder in it.
+// None of the three (endpoint, bucket, folder) ever changes for an app:
+// another place is another app (ADR-0023).
 type Storage struct {
 	Endpoint     string `yaml:"endpoint"`
 	Bucket       string `yaml:"bucket"`
-	Prefix       string `yaml:"prefix,omitempty"`
+	Folder       string `yaml:"folder"`
 	Region       string `yaml:"region,omitempty"`
 	AccessKeyEnv string `yaml:"access_key_env"`
 	SecretKeyEnv string `yaml:"secret_key_env"`
 	PathStyle    bool   `yaml:"path_style,omitempty"`
 }
 
-// Retention is the number of backups kept per database.
-type Retention struct {
-	Keep int `yaml:"keep"`
-}
+// reFolder is <app>-<6 random [a-z0-9]> (ADR-0023).
+var reFolder = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*-[a-z0-9]{6}$`)
+
+// ValidFolder reports whether s has the form init gives storage.folder.
+func ValidFolder(s string) bool { return reFolder.MatchString(s) }
 
 // Hosted is the server receiving POST /report; when absent, run offline. There
 // is no heartbeat_id: the server treats (app, kind) as an implicit heartbeat (spec ping).
@@ -255,7 +365,7 @@ const (
 	KindLocal
 )
 
-// String is the kind as written in the manifest and the environment file.
+// String is the kind as written in run.json and the environment file.
 func (k Kind) String() string {
 	switch k {
 	case KindContainer:
@@ -272,12 +382,8 @@ func (k Kind) String() string {
 // and environment) for this kind; a URL gives databases only (ADR-0015).
 func (k Kind) Full() bool { return k == KindContainer || k == KindLocal }
 
-// Kind returns the connection method; KindInvalid unless exactly one is set
-// and no field from before ADR-0013 is present.
+// Kind returns the connection method; KindInvalid unless exactly one is set.
 func (in Instance) Kind() Kind {
-	if in.Legacy() != "" {
-		return KindInvalid
-	}
 	n := 0
 	for _, set := range []bool{in.Container != "", in.Local != nil, in.URLEnv != ""} {
 		if set {
@@ -295,79 +401,6 @@ func (in Instance) Kind() Kind {
 	return KindURL
 }
 
-// Legacy names the fields from before ADR-0013 that the instance still has
-// (pod, socket, host/port, password_file); "" when there is none.
-func (in Instance) Legacy() string {
-	var f []string
-	if in.Pod != "" {
-		f = append(f, "pod")
-	}
-	if in.Socket != "" {
-		f = append(f, "socket")
-	}
-	if in.Host != "" || in.Port != 0 {
-		f = append(f, "host/port")
-	}
-	if in.PasswordFile != "" {
-		f = append(f, "password_file")
-	}
-	return strings.Join(f, ", ")
-}
-
-// databaseEntry accepts both the short form (string) and the full form (map).
-type databaseEntry Database
-
-func (d *databaseEntry) UnmarshalYAML(b []byte) error {
-	var s string
-	if err := yaml.Unmarshal(b, &s); err == nil {
-		*d = databaseEntry{Name: s}
-		return nil
-	}
-	var full struct {
-		Name      string     `yaml:"name"`
-		Retention *Retention `yaml:"retention,omitempty"`
-	}
-	if err := yaml.UnmarshalWithOptions(b, &full, yaml.Strict()); err != nil {
-		return err
-	}
-	*d = databaseEntry(full)
-	return nil
-}
-
-// UnmarshalYAML accepts `all` or a list.
-func (ds *Databases) UnmarshalYAML(b []byte) error {
-	if strings.TrimSpace(string(b)) == "all" {
-		*ds = Databases{All: true}
-		return nil
-	}
-	var list []databaseEntry
-	if err := yaml.Unmarshal(b, &list); err != nil {
-		return fmt.Errorf("databases: expected `all` or a list: %w", err)
-	}
-	ds.All = false
-	ds.List = ds.List[:0]
-	for _, e := range list {
-		ds.List = append(ds.List, Database(e))
-	}
-	return nil
-}
-
-// MarshalYAML writes `all`, or a list using the short form when there is no override.
-func (ds Databases) MarshalYAML() (interface{}, error) {
-	if ds.All {
-		return "all", nil
-	}
-	out := make([]interface{}, 0, len(ds.List))
-	for _, d := range ds.List {
-		if d.Retention == nil {
-			out = append(out, d.Name)
-		} else {
-			out = append(out, d)
-		}
-	}
-	return out, nil
-}
-
 // ValidationError collects every error of one file, each with its field path.
 // Fix, when set, is printed as the last line (conventions § error handling).
 type ValidationError struct {
@@ -383,15 +416,6 @@ func (e *ValidationError) Error() string {
 	return msg
 }
 
-func (e *ValidationError) legacy() bool {
-	for _, m := range e.Errs {
-		if strings.Contains(m, "ADR-0013") {
-			return true
-		}
-	}
-	return false
-}
-
 var (
 	reName   = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 	reEnvVar = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -405,13 +429,17 @@ func Parse(data []byte) (*App, error) {
 	}
 	var app App
 	if err := yaml.UnmarshalWithOptions(data, &app, yaml.Strict()); err != nil {
-		return nil, fmt.Errorf("app.yaml: %s", yaml.FormatError(err, false, true))
+		return nil, &ValidationError{Errs: []string{yaml.FormatError(err, false, true)}}
 	}
 	if err := app.Validate(); err != nil {
 		return nil, err
 	}
 	return &app, nil
 }
+
+// ParseRun reads the copy of app.yaml a backup run left in the bucket
+// (<ts>/app.yaml): the same strict format, nothing older (ADR-0022).
+func ParseRun(data []byte) (*App, error) { return Parse(data) }
 
 // rejectPlaintextSecrets catches `password:` / `url:` before the strict decode, so
 // the real reason is reported instead of "unknown field".
@@ -424,9 +452,22 @@ func rejectPlaintextSecrets(data []byte) error {
 	}
 	var errs []string
 	for i, in := range raw.Instances {
-		for _, k := range []string{"password", "url"} {
-			if _, ok := in[k]; ok {
-				errs = append(errs, fmt.Sprintf("instances[%d].%s: secrets must not be written to app.yaml, use %s_env", i, k, k))
+		p := fmt.Sprintf("instances[%d]", i)
+		maps := []struct {
+			path string
+			m    map[string]interface{}
+		}{{p, in}}
+		if c, ok := in["connection"].(map[string]interface{}); ok {
+			maps = append(maps, struct {
+				path string
+				m    map[string]interface{}
+			}{p + ".connection", c})
+		}
+		for _, x := range maps {
+			for _, k := range []string{"password", "url"} {
+				if _, ok := x.m[k]; ok {
+					errs = append(errs, fmt.Sprintf("%s.%s: secrets must not be written to app.yaml, use %s_env", x.path, k, k))
+				}
 			}
 		}
 	}
@@ -447,6 +488,11 @@ func (a *App) Validate() error {
 	} else if !reName.MatchString(a.App) {
 		add("app: lowercase letters, digits, `-`, `_` only")
 	}
+	if a.SecretsFile == "" {
+		add("secrets_file: required")
+	} else if !filepath.IsAbs(a.SecretsFile) {
+		add("secrets_file: must be an absolute path")
+	}
 	if len(a.Instances) == 0 {
 		add("instances: at least one instance is required")
 	}
@@ -463,28 +509,29 @@ func (a *App) Validate() error {
 		} else {
 			names[in.Name] = i
 		}
-		if legacy := in.Legacy(); legacy != "" {
-			add("%s: %s %s no longer supported; only container, local or url_env (ADR-0013, ADR-0015); pick this instance again with bracer init", p, legacy, isAre(legacy))
-		} else {
-			switch in.Kind() {
-			case KindInvalid:
-				add("%s: exactly one of container | local | url_env is required", p)
-			case KindURL:
-				if in.PasswordEnv != "" || in.User != "" {
-					add("%s: url_env already carries user/password; drop user/password_env", p)
-				}
-			case KindLocal:
-				if in.Local.Port < 1 || in.Local.Port > 65535 {
-					add("%s.local.port: must be 1–65535", p)
-				}
-				if in.Local.SocketDir != "" && !filepath.IsAbs(in.Local.SocketDir) {
-					add("%s.local.socket_dir: must be an absolute path", p)
-				}
+		c := p + ".connection"
+		switch in.Kind() {
+		case KindInvalid:
+			add("%s: exactly one of container | local | url_env is required", c)
+		case KindURL:
+			if in.PasswordEnv != "" || in.User != "" {
+				add("%s: url_env already carries user/password; drop user/password_env", c)
+			}
+		case KindLocal:
+			if in.Local.Port < 1 || in.Local.Port > 65535 {
+				add("%s.local.port: must be 1–65535", c)
+			}
+			if in.Local.SocketDir != "" && !filepath.IsAbs(in.Local.SocketDir) {
+				add("%s.local.socket_dir: must be an absolute path", c)
 			}
 		}
-		if in.SystemID != "" {
+		switch in.SystemID {
+		case "":
+			add("%s.system_id: required (the decimal system_identifier, or none)", c)
+		case SystemIDNone:
+		default:
 			if _, err := strconv.ParseUint(in.SystemID, 10, 64); err != nil {
-				add("%s.system_id: expected the decimal system_identifier", p)
+				add("%s.system_id: expected the decimal system_identifier, or none", c)
 			}
 		}
 		for field, v := range map[string]string{"password_env": in.PasswordEnv, "url_env": in.URLEnv} {
@@ -492,22 +539,22 @@ func (a *App) Validate() error {
 				continue
 			}
 			if !reEnvVar.MatchString(v) {
-				add("%s.%s: invalid environment variable name", p, field)
+				add("%s.%s: invalid environment variable name", c, field)
 			}
 			if owner, dup := envOwner[v]; dup {
-				add("%s.%s: variable %s is already used by %s (two instances cannot share a variable)", p, field, v, owner)
+				add("%s.%s: variable %s is already used by %s (two instances cannot share a variable)", c, field, v, owner)
 			} else {
 				envOwner[v] = p
 			}
 		}
-		if in.PgMajor != 0 && (in.PgMajor < 10 || in.PgMajor > 30) {
-			add("%s.pg_major: implausible value", p)
+		if in.PgMajor < 10 || in.PgMajor > 30 {
+			add("%s.pg_major: required, the major version of the server", c)
 		}
-		if !in.Databases.All && len(in.Databases.List) == 0 {
-			add("%s.databases: expected `all` or at least one database", p)
+		if len(in.Databases) == 0 {
+			add("%s.databases: expected at least one database", p)
 		}
 		dbNames := map[string]bool{}
-		for j, d := range in.Databases.List {
+		for j, d := range in.Databases {
 			dp := fmt.Sprintf("%s.databases[%d]", p, j)
 			if d.Name == "" {
 				add("%s.name: required", dp)
@@ -515,13 +562,24 @@ func (a *App) Validate() error {
 				add("%s.name: duplicated within the instance", dp)
 			}
 			dbNames[d.Name] = true
-			if d.Retention != nil && d.Retention.Keep < 1 {
-				add("%s.retention.keep: must be ≥ 1", dp)
+		}
+		if dr := in.Drill; dr != nil {
+			switch dr.Runtime {
+			case "":
+			case DrillRuntimeNone:
+				if dr.Image != "" {
+					add("%s.drill: runtime is none but image is set", p)
+				}
+			default:
+				add("%s.drill.runtime: must be none, or absent", p)
+			}
+			if IsBitnamiImage(dr.Image) {
+				add("%s.drill.image: %s", p, bitnamiDrill(dr.Image))
 			}
 		}
 	}
 	switch a.Encryption {
-	case "", "none":
+	case "none":
 		if a.AgeRecipient != "" || a.AgeIdentityFile != "" {
 			add("encryption: is none but age_recipient/age_identity_file are set")
 		}
@@ -529,15 +587,27 @@ func (a *App) Validate() error {
 		if !strings.HasPrefix(a.AgeRecipient, "age1") {
 			add("age_recipient: expected an age1… public key")
 		}
+		if a.AgeIdentityFile == "" {
+			add("age_identity_file: required with encryption: age")
+		} else if !filepath.IsAbs(a.AgeIdentityFile) {
+			add("age_identity_file: must be an absolute path")
+		}
+	case "":
+		add("encryption: required (none | age)")
 	default:
 		add("encryption: must be none | age")
 	}
-	if s := a.Storage; s != nil {
+	if s := a.Storage; s == nil {
+		add("storage: required")
+	} else {
 		if s.Endpoint == "" {
 			add("storage.endpoint: required")
 		}
 		if s.Bucket == "" {
 			add("storage.bucket: required")
+		}
+		if !ValidFolder(s.Folder) {
+			add("storage.folder: required, <app>-<6 letters or digits> as init writes it")
 		}
 		for field, v := range map[string]string{"access_key_env": s.AccessKeyEnv, "secret_key_env": s.SecretKeyEnv} {
 			if v == "" {
@@ -547,61 +617,11 @@ func (a *App) Validate() error {
 			}
 		}
 	}
-	if a.Retention != nil && a.Retention.Keep < 1 {
-		add("retention.keep: must be ≥ 1")
+	if dr := a.Drill; dr != nil && dr.Memory != "" && !reDockerMem.MatchString(dr.Memory) {
+		add("drill.memory: must look like 512m or 2g")
 	}
-	switch a.RowCounts {
-	case "", RowCountsAuto, RowCountsExact, RowCountsEstimate:
-	default:
-		add("row_counts: must be auto, exact or estimate")
-	}
-	if a.ExactMaxRows < 0 {
-		add("exact_max_rows: must be ≥ 0")
-	}
-	if b := a.Backup; b != nil {
-		for name, v := range map[string]string{"timeout": b.Timeout, "lock_timeout": b.LockTimeout} {
-			if v != "" {
-				if d, err := time.ParseDuration(v); err != nil || d <= 0 {
-					add("backup.%s: must be a positive duration such as 30s, 1m or 6h", name)
-				}
-			}
-		}
-	}
-	if dr := a.Drill; dr != nil {
-		switch dr.Runtime {
-		case "", DrillRuntimeDocker, DrillRuntimeNone:
-		case "kube":
-			add("drill.runtime: kube is no longer supported (ADR-0013); drill runs its temporary Postgres with Docker, or set none to turn drill off")
-		default:
-			add("drill.runtime: must be docker or none")
-		}
-		if dr.Namespace != "" {
-			add("drill.namespace: no longer used (drill does not run Kubernetes pods since ADR-0013); remove it")
-		}
-		if IsBitnamiImage(dr.Image) {
-			add("drill.image: %s is not supported as the drill image: Bitnami's entrypoint runs a temporary server that already listens on TCP, so Bracer cannot tell when the real server is up; use the official postgres image or one built on it (postgis/postgis, timescale/timescaledb)", dr.Image)
-		}
-		if dr.Memory != "" && !reDockerMem.MatchString(dr.Memory) {
-			add("drill.memory: must look like 512m or 2g")
-		}
-		if dr.CPUs != "" {
-			if f, err := strconv.ParseFloat(dr.CPUs, 64); err != nil || f <= 0 {
-				add("drill.cpus: must be a positive number such as 1 or 0.5")
-			}
-		}
-		if dr.Timeout != "" {
-			if d, err := time.ParseDuration(dr.Timeout); err != nil || d <= 0 {
-				add("drill.timeout: must be a positive duration such as 30m or 6h")
-			}
-		}
-		for i, c := range dr.Checks {
-			if c.Name == "" {
-				add("drill.checks[%d].name: required", i)
-			}
-			if strings.TrimSpace(c.SQL) == "" {
-				add("drill.checks[%d].sql: required", i)
-			}
-		}
+	if v := a.HeartbeatURLEnv; v != "" && !reEnvVar.MatchString(v) {
+		add("heartbeat_url_env: invalid environment variable name")
 	}
 	if h := a.Hosted; h != nil {
 		if h.Server == "" {
@@ -611,9 +631,24 @@ func (a *App) Validate() error {
 			add("hosted.token_env: required")
 		}
 	}
-	if rt := a.Runtime; rt != nil {
-		if rt.Docker != "" && !filepath.IsAbs(rt.Docker) {
-			add("runtime.docker: must be an absolute path")
+	if sc := a.Schedule; sc == nil {
+		add("schedule: required")
+	} else {
+		for _, p := range sc.problems() {
+			add("schedule.%s", p)
+		}
+	}
+	if rt := a.Runtime; rt == nil {
+		add("runtime: required")
+	} else {
+		if rt.User == "" {
+			add("runtime.user: required")
+		}
+		if rt.Path == "" {
+			add("runtime.path: required")
+		}
+		if !filepath.IsAbs(rt.Docker) {
+			add("runtime.docker: required, an absolute path")
 		}
 	}
 	if len(errs) > 0 {
@@ -622,16 +657,9 @@ func (a *App) Validate() error {
 	return nil
 }
 
-func isAre(list string) string {
-	if strings.Contains(list, ",") || strings.Contains(list, "/") {
-		return "are"
-	}
-	return "is"
-}
-
-// Load reads and validates app.yaml from disk. When an instance still uses a
-// connection from before ADR-0013, the error ends with the Fix line naming init
-// on this very file (conventions § error handling).
+// Load reads and validates app.yaml from disk. app.yaml is written only by
+// init, so a file that does not read is made again: the error ends
+// with `Fix: bracer remove <app>, then bracer init <app>` (ADR-0022, ADR-0023).
 func Load(path string) (*App, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -639,55 +667,11 @@ func Load(path string) (*App, error) {
 	}
 	a, err := Parse(data)
 	var ve *ValidationError
-	if errors.As(err, &ve) && ve.legacy() {
-		abs, aerr := filepath.Abs(path)
-		if aerr != nil {
-			abs = path
-		}
-		ve.Fix = "bracer init -c " + abs
+	if errors.As(err, &ve) {
+		app := AppOf(path)
+		ve.Fix = "bracer remove " + app + ", then bracer init " + app
 	}
 	return a, err
-}
-
-// LoadForInit reads app.yaml for `bracer init -c`: instances from before
-// ADR-0013 are taken out (returned apart, to be picked again) and the rest is
-// validated as usual.
-func LoadForInit(path string) (*App, []Instance, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := rejectPlaintextSecrets(data); err != nil {
-		return nil, nil, err
-	}
-	var app App
-	if err := yaml.UnmarshalWithOptions(data, &app, yaml.Strict()); err != nil {
-		return nil, nil, fmt.Errorf("app.yaml: %s", yaml.FormatError(err, false, true))
-	}
-	var legacy []Instance
-	kept := app.Instances[:0]
-	for _, in := range app.Instances {
-		if in.Legacy() != "" {
-			legacy = append(legacy, in)
-			continue
-		}
-		kept = append(kept, in)
-	}
-	app.Instances = kept
-	if app.Drill != nil {
-		app.Drill.Namespace = ""
-		if app.Drill.Runtime == "kube" {
-			app.Drill.Runtime = ""
-		}
-	}
-	if len(app.Instances) == 0 {
-		// Validate requires one instance; init adds one before saving.
-		app.Instances = []Instance{{Name: "placeholder", Container: "x", Databases: Databases{All: true}}}
-		err := app.Validate()
-		app.Instances = nil
-		return &app, legacy, err
-	}
-	return &app, legacy, app.Validate()
 }
 
 // Marshal writes App as YAML.
@@ -779,7 +763,7 @@ func ExpandHome(p string) (string, error) {
 	return p, nil
 }
 
-// ErrMissingSecret reports a variable missing from all three sources.
+// ErrMissingSecret reports a variable missing from secrets_file.
 var ErrMissingSecret = errors.New("missing secret")
 
 // FindInstance returns the instance by name, nil if there is none.
@@ -790,6 +774,11 @@ func (a *App) FindInstance(name string) *Instance {
 		}
 	}
 	return nil
+}
+
+// bitnamiDrill says why a Bitnami image cannot be the drill image.
+func bitnamiDrill(image string) string {
+	return image + " is not supported as the drill image: Bitnami's entrypoint runs a temporary server that already listens on TCP, so Bracer cannot tell when the real server is up; use the official postgres image or one built on it (postgis/postgis, timescale/timescaledb)"
 }
 
 // IsBitnamiImage recognises Bitnami images (`bitnami/postgresql*`,
@@ -809,4 +798,18 @@ func IsBitnamiImage(image string) bool {
 	}
 	org, repo := parts[len(parts)-2], parts[len(parts)-1]
 	return (org == "bitnami" || org == "bitnamilegacy") && strings.HasPrefix(repo, "postgresql")
+}
+
+// SaveDraft writes app.yaml as a draft next to the real one (mode 600):
+// init proves it before it replaces app.yaml (ADR-0019).
+func SaveDraft(path string, a *App) error {
+	if err := a.Validate(); err != nil {
+		return err
+	}
+	data, err := Marshal(a)
+	if err != nil {
+		return err
+	}
+	_ = os.Remove(path)
+	return writeAtomic(path, data, 0o600)
 }

@@ -42,7 +42,7 @@ func (p scriptedPsql) Run(_ context.Context, _ Conn, tool string, _ []string, st
 		default:
 			lastErr = ""
 			if ans != "" {
-				io.WriteString(stdout, ans+"\n")
+				io.WriteString(stdout, ans+"\x00")
 			}
 		}
 	}
@@ -57,6 +57,7 @@ func TestSessionExecAndErrors(t *testing.T) {
 		"select count(*) from \"public\".\"orders\"": "500",
 		"select 1/0":                                 "ERR:ERROR:  division by zero",
 		"commit":                                     "",
+		"select comments":                            "a\x1fline one\nline two\x00b\x1f",
 	}}
 	s, err := StartSession(context.Background(), r, Conn{})
 	if err != nil {
@@ -78,6 +79,10 @@ func TestSessionExecAndErrors(t *testing.T) {
 	if n, err := s.Scalar(`select count(*) from "public"."orders"`); err != nil || n != "500" {
 		t.Errorf("after error: %q %v", n, err)
 	}
+	// A value may hold newlines (a multi-line comment): rows end with NUL.
+	if rows, err := s.Exec("select comments"); err != nil || len(rows) != 2 || rows[0][1] != "line one\nline two" || rows[1][0] != "b" || rows[1][1] != "" {
+		t.Errorf("multi-line rows: %q %v", rows, err)
+	}
 	if _, err := s.Exec("commit"); err != nil {
 		t.Fatal(err)
 	}
@@ -86,5 +91,15 @@ func TestSessionExecAndErrors(t *testing.T) {
 	}
 	if _, err := s.Exec("select 1"); err == nil {
 		t.Error("exec after close must fail")
+	}
+}
+
+func TestParseRows(t *testing.T) {
+	got := parseRows("web\x1fline one\nline two\x00app\x1f\x00\x00")
+	if len(got) != 2 || got[0][1] != "line one\nline two" || got[1][0] != "app" || got[1][1] != "" {
+		t.Errorf("rows: %q", got)
+	}
+	if got := parseRows(""); got != nil {
+		t.Errorf("no rows: %q", got)
 	}
 }

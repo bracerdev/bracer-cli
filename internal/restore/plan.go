@@ -2,7 +2,6 @@ package restore
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,23 +12,14 @@ import (
 
 // Restore modes (ADR-0015).
 const (
-	ModeFull    = "full"    // container or local source: users, settings, data
-	ModeData    = "data"    // URL source: databases only, owned by the connecting user
-	ModePreview = "preview" // --preview: data to look at, nothing guaranteed
-)
-
-// Database states on the target before a load.
-const (
-	StateAbsent  = "absent"
-	StateEmpty   = "empty"
-	StateHasData = "has_data"
+	ModeFull = "full" // container or local source: users, settings, data
+	ModeData = "data" // URL source: databases only, owned by the connecting user
 )
 
 // Fix kinds of a check that is not ok.
 const (
 	FixSQL    = "sql"    // env-up has it
 	FixManual = "manual" // outside SQL: image, package, configuration, restart
-	FixRerun  = "rerun"  // checked once env-up has run
 )
 
 // Check is one item compared between the backup run and the target.
@@ -71,13 +61,14 @@ func (s *SourceDB) RLS() bool {
 	return false
 }
 
-// DBPlan is where one source database goes.
+// DBPlan is where one source database goes: always a new database, which
+// the load creates; never one the target already has (ADR-0022).
 type DBPlan struct {
-	Source string `json:"source_db"`
-	Target string `json:"target_db"`
-	State  string `json:"state"` // before env-up: absent | empty | has_data (of the source name)
-	// Recreate: the empty database's locale differs; env-up drops and recreates it.
-	Recreate bool `json:"recreate,omitempty"`
+	Source string
+	Target string
+	// Create makes Target with the source's locale, owner and attributes; it
+	// runs in the maintenance database right before the load.
+	Create []string
 }
 
 // Plan is the comparison and the SQL that closes the gaps.
@@ -133,23 +124,23 @@ type PlanInput struct {
 type planner struct {
 	in   PlanInput
 	p    *Plan
-	up   [9][]string
-	down [9][]string
+	up   [nGroups][]string
+	down [nGroups][]string
 	tgt  *TargetState
 	src  *SourceRun
 }
 
 // SQL groups, in the order env-up runs them; env-down runs them backwards.
+// env-up holds only what is server-wide: the new databases are the load's.
 const (
 	gCreateRole = iota
 	gAlterRole
 	gGrant
 	gRoleSet
 	gParam
-	gCreateDB
-	gDBAttr
 	gSystem
 	gReload
+	nGroups
 )
 
 func (pl *planner) add(c Check) { pl.p.Checks = append(pl.p.Checks, c) }
@@ -180,16 +171,19 @@ func MakePlan(in PlanInput) *Plan {
 	pl.extensions()
 	pl.preload()
 	pl.locales()
+	pl.needs()
+	pl.locks()
 	if in.Mode == ModeFull {
 		pl.serverSettings()
 		pl.ssl()
 		pl.tablespaces()
 		pl.roles()
-	} else {
-		pl.dataSettings()
 	}
 	pl.dbAttributes()
-	pl.outOfScope()
+	if in.Mode == ModeData {
+		pl.dataSettings()
+	}
+	pl.external()
 	if pl.p.Restart {
 		pl.up[gReload] = nil
 	} else if len(pl.up[gSystem]) > 0 {
@@ -215,11 +209,11 @@ func (pl *planner) sourceMajor() int { return pl.src.Env.ServerVersionNum / 1000
 func (pl *planner) rebuildHint(what string) string {
 	switch pl.tgt.Kind {
 	case "container":
-		return fmt.Sprintf("use an image with %s for container %s (image: in the compose file), recreate it, then run restore again", what, pl.tgt.Container)
+		return fmt.Sprintf("use an image with %s for container %s (image: in the compose file), recreate it", what, pl.tgt.Container)
 	case "local":
-		return fmt.Sprintf("install %s on this machine, then run restore again", what)
+		return fmt.Sprintf("install %s on this machine", what)
 	}
-	return fmt.Sprintf("use a server with %s, then run restore again", what)
+	return fmt.Sprintf("use a server with %s", what)
 }
 
 func (pl *planner) restartCmd() string {
@@ -243,82 +237,44 @@ func (pl *planner) version() {
 	pl.ok("version", name, "target is "+pl.tgt.Env.ServerVersion)
 }
 
-// databases picks where each database goes and creates the absent ones.
+// databases names the new database each source database loads into:
+// <db>_restored_<ts>, then _2, _3… while the name is taken. The target's own
+// databases are never touched (ADR-0022).
 func (pl *planner) databases() {
+	if pl.in.Mode == ModeData && !pl.tgt.Env.Superuser && !pl.tgt.CreateDB {
+		u := pl.tgt.Env.CurrentUser
+		pl.manual("database", "CREATEDB", u+" needs CREATEDB to create the database the restore loads into",
+			fmt.Sprintf("ask an admin of the server: ALTER ROLE %s CREATEDB", pg.QuoteIdent(u)))
+	}
 	at := backupTime(pl.src.TS, pl.in.Now)
+	names := map[string]bool{}
+	for n := range pl.tgt.Names {
+		names[n] = true
+	}
+	taken := func(n string) (bool, error) { return names[n], nil }
 	for _, sdb := range pl.src.DBs {
 		dp := &DBPlan{Source: sdb.Name}
 		pl.p.DBs = append(pl.p.DBs, dp)
 		if t, ok := pl.in.Loaded[sdb.Name]; ok {
-			dp.Target, dp.State = t, StateHasData
+			dp.Target = t
 			continue
 		}
-		td := pl.tgt.DBs[sdb.Name]
-		switch {
-		case td == nil || !td.Exists:
-			dp.State, dp.Target = StateAbsent, sdb.Name
-		case td.Objects == 0:
-			dp.State, dp.Target = StateEmpty, sdb.Name
-		default:
-			dp.State = StateHasData
-			// <db>_restored_<ts>: reuse it when it is there and empty, else the next free one.
-			base := "_restored_" + at.UTC().Format("20060102_1504")
-			for n := 1; n < 100; n++ {
-				suffix := base
-				if n > 1 {
-					suffix += "_" + strconv.Itoa(n)
-				}
-				name := cutBytes(sdb.Name, maxIdent-len(suffix)) + suffix
-				side := pl.tgt.DBs[name]
-				if side == nil || !side.Exists || side.Objects == 0 {
-					dp.Target = name
-					break
-				}
-			}
-		}
-		if dp.Target == "" {
-			pl.manual("database", sdb.Name, "no free name for a database next to it", "drop the old "+sdb.Name+"_restored_* databases")
+		name, err := SideName(sdb.Name, "restored", at, taken)
+		if err != nil {
+			pl.manual("database", sdb.Name, err.Error(), "drop the old "+sdb.Name+"_restored_* databases")
 			continue
 		}
-		td = pl.tgt.DBs[dp.Target]
-		switch {
-		case td == nil || !td.Exists:
-			pl.createDB(sdb, dp.Target)
-			pl.sql("database", sdb.Name, fmt.Sprintf("%s does not exist; env-up creates it", dp.Target))
-		default:
-			if loc := sdb.Dump.Locale; loc != nil && td.Locale != nil && !sameLocale(loc, td.Locale) {
-				dp.Recreate = true
-				pl.up[gCreateDB] = append(pl.up[gCreateDB], fmt.Sprintf("-- %s is empty but has locale %s; the backup has %s", dp.Target, td.Locale, loc))
-				pl.up[gCreateDB] = append(pl.up[gCreateDB], dropStmts(dp.Target, pl.targetMajor(), false)...)
-				pl.createDB(sdb, dp.Target)
-				pl.up[gCreateDB] = append(pl.up[gCreateDB], afterCreate(dp.Target)...)
-				// env-down: drop what env-up created (createDB), then bring the old one back.
-				// createDB's down already drops it: only build the old one again.
-				pl.down[gCreateDB] = append(pl.down[gCreateDB], recreateDB(td, pl.targetMajor())[1+len(dropStmts(td.Name, pl.targetMajor(), true)):]...)
-				pl.sql("database", sdb.Name, fmt.Sprintf("%s is empty but its locale is %s, the backup's is %s; env-up recreates it", dp.Target, td.Locale, loc))
-			} else if dp.State == StateHasData {
-				pl.ok("database", sdb.Name, fmt.Sprintf("%s has data; restoring into %s (empty) next to it", sdb.Name, dp.Target))
-			} else {
-				pl.ok("database", sdb.Name, dp.Target+" exists and is empty")
-			}
-			if len(td.Connections) > 0 {
-				pl.manual("connections", dp.Target, "connected now: "+listFirst(td.Connections, 3), stopHint(pl.tgt))
-			}
-		}
+		names[name] = true
+		dp.Target = name
+		pl.createDB(sdb, dp)
+		pl.ok("database", sdb.Name, "loads into a new database "+name)
 	}
 }
 
-func stopHint(t *TargetState) string {
-	if t.Kind == "container" {
-		return "stop the app (for example: docker compose stop <app service>), then run restore again"
-	}
-	return "stop the app connected to it, then run restore again"
-}
-
-// createDB writes CREATE DATABASE with the source locale, owner and, in data
-// mode, the connecting user as owner.
-func (pl *planner) createDB(sdb *SourceDB, target string) {
-	stmt := "CREATE DATABASE " + pg.QuoteIdent(target) + " TEMPLATE template0"
+// createDB starts dp.Create: CREATE DATABASE with the source's locale and
+// owner (data mode: the connecting user).
+func (pl *planner) createDB(sdb *SourceDB, dp *DBPlan) {
+	stmt := "CREATE DATABASE " + pg.QuoteIdent(dp.Target) + " TEMPLATE template0"
 	if loc := sdb.Dump.Locale; loc != nil {
 		if opts, err := loc.CreateOptions(pl.targetMajor()); err == nil {
 			stmt += opts
@@ -326,150 +282,63 @@ func (pl *planner) createDB(sdb *SourceDB, target string) {
 	}
 	owner := pl.tgt.Env.CurrentUser
 	if pl.in.Mode == ModeFull {
-		if a := pl.attrs(sdb, target); a != nil && a.Owner != "" {
+		if a := pl.attrs(sdb, dp.Target); a != nil && a.Owner != "" {
 			owner = a.Owner
 		}
 	}
-	stmt += " OWNER " + pg.QuoteIdent(owner) + ";"
-	pl.up[gCreateDB] = append(pl.up[gCreateDB], stmt)
-	pl.down[gCreateDB] = append(pl.down[gCreateDB], dropStmts(target, pl.targetMajor(), true)...)
+	dp.Create = append(dp.Create, stmt+" OWNER "+pg.QuoteIdent(owner)+";")
 }
 
-// dropStmts drops a database, stepping out of it first when it is the one
-// psql is connected to (postgres) and clearing IS_TEMPLATE (template1).
-func dropStmts(name string, major int, ifExists bool) []string {
-	q := pg.QuoteIdent(name)
-	stmt := "DROP DATABASE "
-	if ifExists {
-		stmt += "IF EXISTS "
-	}
-	stmt += q
+// DropDB drops a database restore created; FORCE ends sessions in it (PG13+).
+func DropDB(name string, major int) string {
+	stmt := "DROP DATABASE IF EXISTS " + pg.QuoteIdent(name)
 	if major >= 13 {
 		stmt += " WITH (FORCE)"
 	}
-	stmt += ";"
-	switch name {
-	case "postgres":
-		return []string{`\connect template1`, stmt}
-	case "template1":
-		return []string{"ALTER DATABASE template1 IS_TEMPLATE false;", stmt}
-	}
-	return []string{stmt}
-}
-
-// afterCreate undoes what dropStmts stepped around.
-func afterCreate(name string) []string {
-	switch name {
-	case "postgres":
-		return []string{`\connect postgres`}
-	case "template1":
-		return []string{"ALTER DATABASE template1 IS_TEMPLATE true;"}
-	}
-	return nil
-}
-
-// recreateDB writes the SQL that puts an empty database back as it was:
-// locale, owner, settings, privileges, comment, extensions.
-func recreateDB(td *TargetDB, major int) []string {
-	q := pg.QuoteIdent(td.Name)
-	out := []string{"-- " + td.Name}
-	out = append(out, dropStmts(td.Name, major, true)...)
-	stmt := "CREATE DATABASE " + q + " TEMPLATE template0"
-	if td.Locale != nil {
-		if opts, err := td.Locale.CreateOptions(major); err == nil {
-			stmt += opts
-		}
-	}
-	out = append(out, stmt+" OWNER "+pg.QuoteIdent(td.Owner)+";")
-	out = append(out, afterCreate(td.Name)...)
-	for _, k := range sortedKeys(td.Settings) {
-		role, _, _ := strings.Cut(k, "\x00")
-		out = append(out, setDBSQL(td.Name, role, td.SettingName[k], td.Settings[k]))
-	}
-	if !td.ACLNull {
-		def := defaultDBACL(td.Owner)
-		out = append(out, aclDiff(td.Name, def, td.ACL)...)
-	}
-	if td.Comment != nil {
-		out = append(out, "COMMENT ON DATABASE "+q+" IS "+pg.QuoteLiteral(*td.Comment)+";")
-	}
-	if len(td.Extensions) > 0 {
-		out = append(out, `\connect `+q)
-		for _, e := range td.Extensions {
-			s := "CREATE EXTENSION IF NOT EXISTS " + pg.QuoteIdent(e.Name)
-			if e.Schema != "" {
-				s += " SCHEMA " + pg.QuoteIdent(e.Schema)
-			}
-			out = append(out, s+" VERSION "+pg.QuoteLiteral(e.Version)+";")
-		}
-		out = append(out, `\connect postgres`)
-	}
-	return out
-}
-
-func sameLocale(a, b *pg.Locale) bool {
-	n := func(s string) string { return strings.ToLower(strings.ReplaceAll(s, "-", "")) }
-	pa, pb := a.Provider, b.Provider
-	if pa == "" {
-		pa = "libc"
-	}
-	if pb == "" {
-		pb = "libc"
-	}
-	// For UTF8, collate C.UTF-8 sorts by code point, which is byte order: C.
-	// Postgres on musl stores it as C.
-	coll := func(l *pg.Locale) string {
-		if c := n(l.Collate); c != "c.utf8" || !strings.EqualFold(l.Encoding, "UTF8") {
-			return c
-		}
-		return "c"
-	}
-	return strings.EqualFold(a.Encoding, b.Encoding) && coll(a) == coll(b) && n(a.Ctype) == n(b.Ctype) &&
-		pa == pb && n(a.Locale) == n(b.Locale) && a.ICURules == b.ICURules
+	return stmt + ";"
 }
 
 // extensions: every extension the backup uses is available in the same or a
-// newer version; one already installed in the target database must sit in
-// the same schema.
+// newer version; the dump creates it in the new database.
 func (pl *planner) extensions() {
-	for i, sdb := range pl.src.DBs {
-		dp := pl.p.DBs[i]
-		var installed map[string]pg.Extension
-		if td := pl.tgt.DBs[dp.Target]; td != nil && td.Exists && !dp.Recreate {
-			installed = map[string]pg.Extension{}
-			for _, e := range td.Extensions {
-				installed[e.Name] = e
-			}
-		}
+	for _, sdb := range pl.src.DBs {
 		for _, e := range sdb.Dump.Extensions {
 			name := sdb.Name + ": " + e.Name + " " + e.Version
-			if have, ok := installed[e.Name]; ok {
-				switch {
-				case e.Schema != "" && have.Schema != e.Schema:
-					pl.manual("extension", name, fmt.Sprintf("%s has %s in schema %s, the backup in %s", dp.Target, e.Name, have.Schema, e.Schema),
-						fmt.Sprintf("DROP EXTENSION %s in %s (it is empty), then run restore again", pg.QuoteIdent(e.Name), dp.Target))
-				case cmpVersion(have.Version, e.Version) < 0:
-					pl.manual("extension", name, fmt.Sprintf("%s has %s %s installed, older than the backup", dp.Target, e.Name, have.Version),
-						fmt.Sprintf("ALTER EXTENSION %s UPDATE in %s, then run restore again", pg.QuoteIdent(e.Name), dp.Target))
-				default:
-					pl.ok("extension", name, "installed: "+have.Version)
-				}
-				continue
-			}
 			av, ok := pl.tgt.Avail[e.Name]
 			switch {
 			case !ok:
 				pl.manual("extension", name, "the target server does not have it", pl.extensionHint(e))
-			case av.Default != "" && cmpVersion(av.Default, e.Version) < 0:
-				pl.manual("extension", name, fmt.Sprintf("the target server has %s %s, older than the backup", e.Name, av.Default), pl.extensionHint(e))
 			case pl.in.Mode == ModeData && !pl.tgt.Env.Superuser && !av.Trusted:
 				pl.manual("extension", name, fmt.Sprintf("%s is not trusted and %s is not a superuser", e.Name, pl.tgt.Env.CurrentUser),
-					fmt.Sprintf("ask your provider's admin to run CREATE EXTENSION %s in %s, then run restore again", pg.QuoteIdent(e.Name), dp.Target))
+					fmt.Sprintf("ask your provider's admin to let %s create extension %s", pl.tgt.Env.CurrentUser, e.Name))
+			case e.Config:
+				pl.configExtension(name, e, av)
+			case av.Default != "" && cmpVersion(av.Default, e.Version) < 0:
+				pl.manual("extension", name, fmt.Sprintf("the target server has %s %s, older than the backup", e.Name, av.Default), pl.extensionHint(e))
 			default:
 				pl.ok("extension", name, "available: "+av.Default)
 			}
 		}
 	}
+}
+
+// configExtension: an extension with configuration tables must be installed
+// at exactly the backup's version, since the dump holds those tables' rows as
+// of it. The dump's CREATE EXTENSION installs the target's default, so the
+// default must be that version (spec restore § extensions).
+func (pl *planner) configExtension(name string, e pg.Extension, av ExtAvail) {
+	if av.Default == e.Version {
+		pl.ok("extension", name, "available: "+av.Default)
+		return
+	}
+	detail := fmt.Sprintf("the target installs %s %s by default; the dump holds its configuration tables as of %s", e.Name, av.Default, e.Version)
+	if c := pl.src.Env.Container; c != nil && c.Image != "" && pl.tgt.Kind == "container" {
+		pl.manual("extension", name, detail, fmt.Sprintf("use image %s (the source's) for container %s, recreate it, restore, then run ALTER EXTENSION %s UPDATE in each database that has it",
+			c.Image, pl.tgt.Container, pg.QuoteIdent(e.Name)))
+		return
+	}
+	pl.manual("extension", name, detail, pl.rebuildHint(fmt.Sprintf("extension %s %s as the default version", e.Name, e.Version))+
+		fmt.Sprintf("; after the restore, ALTER EXTENSION %s UPDATE updates it", pg.QuoteIdent(e.Name)))
 }
 
 func (pl *planner) extensionHint(e pg.Extension) string {
@@ -481,7 +350,7 @@ func (pl *planner) extensionHint(e pg.Extension) string {
 			}
 		}
 		if len(pkgs) > 0 {
-			return "sudo apt install " + strings.Join(pkgs, " ") + ", then run restore again"
+			return "sudo apt install " + strings.Join(pkgs, " ")
 		}
 	}
 	return pl.rebuildHint(fmt.Sprintf("extension %s %s or newer", e.Name, e.Version))
@@ -556,7 +425,7 @@ func (pl *planner) preload() {
 		return
 	}
 	if pl.cmdLineSetting("shared_preload_libraries") {
-		pl.manual("preload", strings.Join(missing, ","), "shared_preload_libraries is set on the server's command line", fmt.Sprintf("add %s to -c shared_preload_libraries in the container's command, recreate it, then run restore again", strings.Join(missing, ",")))
+		pl.manual("preload", strings.Join(missing, ","), "shared_preload_libraries is set on the server's command line", fmt.Sprintf("add %s to -c shared_preload_libraries in the container's command, recreate it", strings.Join(missing, ",")))
 		return
 	}
 	all := append(append([]string{}, cur...), missing...)
@@ -565,6 +434,43 @@ func (pl *planner) preload() {
 	pl.p.Restart = true
 	pl.add(Check{Area: "preload", Name: strings.Join(missing, ","), Detail: "not loaded; the library is installed", Fix: FixSQL,
 		Manual: "after env-up: " + pl.restartCmd()})
+}
+
+// locks: the target's lock table holds what loading the largest database in
+// one transaction locks (spec restore § locks).
+func (pl *planner) locks() {
+	need, biggest := 0, ""
+	for _, sdb := range pl.src.DBs {
+		if n := sdb.Dump.LockObjects.Locks(); n > need {
+			need, biggest = n, sdb.Name
+		}
+	}
+	if need == 0 {
+		return
+	}
+	const name = "max_locks_per_transaction"
+	l := pl.tgt.Locks
+	if l == nil {
+		pl.warn("locks", name, "cannot read the target's lock settings; not checked")
+		return
+	}
+	if l.Capacity() >= need {
+		pl.ok("locks", name, fmt.Sprintf("room for %d locks; %s needs about %d", l.Capacity(), biggest, need))
+		return
+	}
+	want := pg.LocksPer(need, l.Slots)
+	detail := fmt.Sprintf("%s needs about %d locks in one transaction; the target has room for %d (%d × %d)", biggest, need, l.Capacity(), l.PerTransaction, l.Slots)
+	switch {
+	case pl.in.Mode != ModeFull:
+		pl.manual("locks", name, detail, fmt.Sprintf("set max_locks_per_transaction to at least %d on the target and restart it", want))
+	case l.Source == "command line" || l.Source == "environment variable" || pl.cmdLineSetting(name):
+		pl.manual("locks", name, detail+" (set on the server's command line)", fmt.Sprintf("change -c max_locks_per_transaction in the container's command to %d, recreate it", want))
+	default:
+		pl.up[gSystem] = append(pl.up[gSystem], fmt.Sprintf("ALTER SYSTEM SET max_locks_per_transaction = %d;", want))
+		pl.down[gSystem] = append(pl.down[gSystem], pl.systemRevert(name))
+		pl.p.Restart = true
+		pl.add(Check{Area: "locks", Name: name, Detail: detail, Fix: FixSQL, Manual: "after env-up: " + pl.restartCmd()})
+	}
 }
 
 // cmdLineSetting: the target's value comes from its command line, which ALTER SYSTEM cannot change.
@@ -593,7 +499,7 @@ func (pl *planner) locales() {
 	for _, sdb := range pl.src.DBs {
 		l := sdb.Dump.Locale
 		if l == nil {
-			pl.warn("locale", sdb.Name, "the manifest has no locale for this dump")
+			pl.warn("locale", sdb.Name, "run.json has no locale for this dump")
 			continue
 		}
 		k := localeKey(l)
@@ -604,7 +510,7 @@ func (pl *planner) locales() {
 		if err, ok := pl.tgt.LocaleOK[k]; ok && err != "" {
 			fix := pl.rebuildHint("locale " + l.Collate)
 			if pl.tgt.Kind == "local" {
-				fix = fmt.Sprintf("sudo locale-gen %s && %s, then run restore again", l.Collate, pl.restartCmd())
+				fix = fmt.Sprintf("sudo locale-gen %s && %s", l.Collate, pl.restartCmd())
 			}
 			pl.manual("locale", l.String(), err, fix)
 			continue
@@ -618,6 +524,104 @@ func (pl *planner) locales() {
 			}
 		}
 	}
+}
+
+// needs: the target has what the databases need beyond their dumps: library
+// and text search files, collations (spec restore § outside the dump).
+func (pl *planner) needs() {
+	libs, ts := map[string]*neededUse{}, map[string]*neededUse{}
+	var colls []pg.Collation
+	collUsers := map[string][]string{}
+	for _, sdb := range pl.src.DBs {
+		n := sdb.Dump.RestoreNeeds
+		if n == nil {
+			continue
+		}
+		addUses(libs, sdb.Name, n.Libraries)
+		addUses(ts, sdb.Name, n.TSFiles)
+		for _, c := range n.Collations {
+			k := c.QualName()
+			if _, seen := collUsers[k]; !seen {
+				colls = append(colls, c)
+				collUsers[k] = []string{}
+			}
+			for _, u := range c.UsedBy {
+				collUsers[k] = append(collUsers[k], sdb.Name+": "+u)
+			}
+		}
+	}
+	pl.neededFiles("library", libs, pl.tgt.PkgLib)
+	pl.neededFiles("text search file", ts, pl.tgt.TSData)
+	for _, c := range colls {
+		users := usedBy(collUsers[c.QualName()])
+		what := "locale " + c.Collate
+		if c.Locale.Locale != "" {
+			what = "locale " + c.Locale.Locale
+		}
+		if c.Created {
+			if err := pl.tgt.LocaleOK[localeKey(&c.Locale)]; err != "" {
+				pl.manual("collation", c.QualName(), "the target cannot create it ("+err+")"+users, pl.rebuildHint(what))
+				continue
+			}
+			pl.ok("collation", c.QualName(), "the target can create it")
+			continue
+		}
+		v, ok := pl.tgt.Collations[c.Name]
+		switch {
+		case !ok:
+			pl.manual("collation", c.Name, "the target does not have this collation"+users+"; a server gets its system collations when it is initialized", pl.rebuildHint(what))
+		case v != "" && c.Version != "" && v != c.Version:
+			pl.warn("collation", c.Name, fmt.Sprintf("version %s on the target, %s in the backup: text may sort differently", v, c.Version))
+		default:
+			pl.ok("collation", c.Name, "available")
+		}
+	}
+}
+
+// neededUse is who uses one file the databases need.
+type neededUse struct {
+	users []string
+}
+
+func addUses(m map[string]*neededUse, db string, files []pg.NeededFile) {
+	for _, f := range files {
+		u := m[f.Name]
+		if u == nil {
+			u = &neededUse{}
+			m[f.Name] = u
+		}
+		for _, by := range f.UsedBy {
+			u.users = append(u.users, db+": "+by)
+		}
+	}
+}
+
+// neededFiles: each file is in the target's directory (have, nil when it
+// cannot be read). Its content is not compared: a load that misses a
+// function fails and rolls back (ADR-0022).
+func (pl *planner) neededFiles(area string, files map[string]*neededUse, have map[string]bool) {
+	for _, name := range sortedKeys(files) {
+		users := usedBy(files[name].users)
+		switch {
+		case have == nil:
+			pl.manual(area, name, "cannot check that the target has it"+users+": its directory is not readable", "connect as a superuser")
+		case !have[name]:
+			pl.manual(area, name, "the target does not have it"+users, pl.rebuildHint(area+" "+name))
+		default:
+			pl.ok(area, name, "installed")
+		}
+	}
+}
+
+// usedBy is " (used by a, b)" or "".
+func usedBy(users []string) string {
+	if len(users) == 0 {
+		return ""
+	}
+	if len(users) > 3 {
+		users = append(users[:3:3], fmt.Sprintf("%d more", len(users)-3))
+	}
+	return " (used by " + strings.Join(users, ", ") + ")"
 }
 
 // serverSettings: the settings that change what queries do are equal at the
@@ -650,7 +654,7 @@ func (pl *planner) serverSettings() {
 			continue
 		}
 		if pl.cmdLineSetting(s.Name) {
-			pl.manual("setting", s.Name, detail+" (set on the server's command line)", fmt.Sprintf("change -c %s in the container's command to %s, recreate it, then run restore again", s.Name, s.Value))
+			pl.manual("setting", s.Name, detail+" (set on the server's command line)", fmt.Sprintf("change -c %s in the container's command to %s, recreate it", s.Name, s.Value))
 			continue
 		}
 		pl.up[gSystem] = append(pl.up[gSystem], "ALTER SYSTEM SET "+settingName(s.Name)+" = "+valueSQL(s.Name, s.Value)+";")
@@ -678,7 +682,7 @@ func (pl *planner) moduleSettings() {
 		}
 		detail := fmt.Sprintf("target %s, backup %s", t.Value, s.Value)
 		if pl.cmdLineSetting(s.Name) {
-			pl.manual("setting", s.Name, detail+" (set on the server's command line)", fmt.Sprintf("change -c %s in the container's command to %s, recreate it, then run restore again", s.Name, s.Value))
+			pl.manual("setting", s.Name, detail+" (set on the server's command line)", fmt.Sprintf("change -c %s in the container's command to %s, recreate it", s.Name, s.Value))
 			continue
 		}
 		pl.up[gSystem] = append(pl.up[gSystem], "ALTER SYSTEM SET "+settingName(s.Name)+" = "+valueSQL(s.Name, s.Value)+";")
@@ -727,8 +731,11 @@ func valueSQL(name, v string) string {
 	return pg.QuoteLiteral(v)
 }
 
-// dataSettings (URL source): the values in effect in each database are equal;
-// ALTER DATABASE … SET fixes them, since a managed target refuses ALTER SYSTEM.
+// dataSettings (URL source): the settings in effect for the connecting user
+// equal the backup's. Before the load they are read in the maintenance
+// database, and a difference becomes ALTER DATABASE … SET on the new database
+// (a managed target refuses ALTER SYSTEM); after it they are read in the
+// loaded database and must be equal.
 func (pl *planner) dataSettings() {
 	for i, sdb := range pl.src.DBs {
 		dp := pl.p.DBs[i]
@@ -737,25 +744,32 @@ func (pl *planner) dataSettings() {
 			pl.warn("setting", sdb.Name, "the backup has no settings for this database")
 			continue
 		}
-		td := pl.tgt.DBs[dp.Target]
-		if td == nil || !td.Exists || dp.Recreate || td.Effective == nil {
-			pl.add(Check{Area: "setting", Name: sdb.Name, Detail: "compared once " + dp.Target + " exists", Fix: FixRerun})
+		_, loaded := pl.in.Loaded[sdb.Name]
+		eff := pl.tgt.Effective
+		if loaded {
+			eff = nil
+			if td := pl.tgt.DBs[dp.Target]; td != nil {
+				eff = td.Effective
+			}
+		}
+		if eff == nil {
+			pl.warn("setting", sdb.Name, "cannot read the settings in effect on the target; not compared")
 			continue
 		}
 		have := map[string]pg.Setting{}
-		for _, s := range td.Effective {
+		for _, s := range eff {
 			have[strings.ToLower(s.Name)] = s
 		}
 		a := pl.attrs(sdb, dp.Target)
-		diffs := 0
+		var differ []string
 		for _, s := range want {
 			t, ok := have[strings.ToLower(s.Name)]
 			if !ok || pg.SessionOnly(s.Name) {
 				continue
 			}
-			// A database setting of the archive takes over the value once loaded.
+			// A database setting of the archive is set on the new database too.
 			value := t.Value
-			if a != nil {
+			if a != nil && !loaded {
 				for _, as := range a.Settings {
 					if as.Role == "" && strings.EqualFold(as.Name, s.Name) {
 						value = pg.NormalizeValue(as.Value, s.Unit, s.Vartype)
@@ -765,14 +779,18 @@ func (pl *planner) dataSettings() {
 			if pg.SameValue(s.Name, s.Vartype, s.Value, value) {
 				continue
 			}
-			diffs++
-			k := "\x00" + strings.ToLower(s.Name)
-			pl.up[gDBAttr] = append(pl.up[gDBAttr], setDBSQL(dp.Target, "", s.Name, s.Value))
-			pl.down[gDBAttr] = append(pl.down[gDBAttr], revertDBSetting(td, dp.Target, k, s.Name))
-			pl.sql("setting", sdb.Name+": "+s.Name, fmt.Sprintf("in %s %s, backup %s", dp.Target, value, s.Value))
+			differ = append(differ, s.Name)
+			if loaded {
+				pl.add(Check{Area: "setting", Name: sdb.Name + ": " + s.Name, Detail: fmt.Sprintf("in %s %s, backup %s", dp.Target, value, s.Value)})
+				continue
+			}
+			dp.Create = append(dp.Create, setDBSQL(dp.Target, "", s.Name, s.Value))
 		}
-		if diffs == 0 {
-			pl.ok("setting", sdb.Name, fmt.Sprintf("%d settings equal in %s", len(want), dp.Target))
+		switch {
+		case len(differ) == 0:
+			pl.ok("setting", sdb.Name, fmt.Sprintf("%d settings equal", len(want)))
+		case !loaded:
+			pl.ok("setting", sdb.Name, fmt.Sprintf("%s set on %s when it is created", strings.Join(differ, ", "), dp.Target))
 		}
 	}
 }
@@ -784,25 +802,10 @@ func setDBSQL(db, role, name, value string) string {
 	return fmt.Sprintf("ALTER DATABASE %s SET %s = %s;", pg.QuoteIdent(db), settingName(name), valueSQL(name, value))
 }
 
-func resetDBSQL(db, role, name string) string {
-	if role != "" {
-		return fmt.Sprintf("ALTER ROLE %s IN DATABASE %s RESET %s;", pg.QuoteIdent(role), pg.QuoteIdent(db), settingName(name))
-	}
-	return fmt.Sprintf("ALTER DATABASE %s RESET %s;", pg.QuoteIdent(db), settingName(name))
-}
-
-func revertDBSetting(td *TargetDB, db, key, name string) string {
-	role, _, _ := strings.Cut(key, "\x00")
-	if v, ok := td.Settings[key]; ok {
-		return setDBSQL(db, role, td.SettingName[key], v)
-	}
-	return resetDBSQL(db, role, name)
-}
-
 func (pl *planner) ssl() {
 	switch {
 	case pl.src.Env.SSL && !pl.tgt.Env.SSL:
-		pl.manual("ssl", "ssl", "on in the backup, off on the target: apps with sslmode=require cannot connect", "turn on ssl on the target (ssl = on with a certificate), then run restore again")
+		pl.manual("ssl", "ssl", "on in the backup, off on the target: apps with sslmode=require cannot connect", "turn on ssl on the target (ssl = on with a certificate)")
 	case pl.src.Env.SSL:
 		pl.ok("ssl", "ssl", "on")
 	}
@@ -825,7 +828,7 @@ func (pl *planner) tablespaces() {
 			continue
 		}
 		pl.manual("tablespace", t.Name, "objects of the backup live in it; the target does not have it",
-			fmt.Sprintf("create a directory owned by postgres on the target and run CREATE TABLESPACE %s LOCATION '<dir>', then run restore again", pg.QuoteIdent(t.Name)))
+			fmt.Sprintf("create a directory owned by postgres on the target and run CREATE TABLESPACE %s LOCATION '<dir>'", pg.QuoteIdent(t.Name)))
 	}
 }
 
@@ -833,7 +836,7 @@ func (pl *planner) tablespaces() {
 func (pl *planner) roles() {
 	g, tr := pl.src.Globals, pl.tgt.Roles
 	if g == nil || tr == nil {
-		pl.manual("role", "users", "the run has no globals", "use --preview")
+		pl.manual("role", "users", "the run has no globals", "pick another run")
 		return
 	}
 	rls := false
@@ -895,9 +898,9 @@ func (pl *planner) roles() {
 					detail := fmt.Sprintf("%s on the target, not in the backup; tables use row-level security, which %s would bypass", f, n)
 					switch {
 					case pl.tgt.Env.BootstrapSuperuser == n:
-						pl.manual("role", n, detail, fmt.Sprintf("%s is the target's initial superuser and cannot lose %s: recreate the target with POSTGRES_USER=%s (initdb -U %s), then run restore again", n, f, pl.src.Env.BootstrapSuperuser, pl.src.Env.BootstrapSuperuser))
+						pl.manual("role", n, detail, fmt.Sprintf("%s is the target's initial superuser and cannot lose %s: recreate the target with POSTGRES_USER=%s (initdb -U %s)", n, f, pl.src.Env.BootstrapSuperuser, pl.src.Env.BootstrapSuperuser))
 					case pl.tgt.Env.CurrentUser == n:
-						pl.manual("role", n, detail, "connect as another superuser, then run restore again")
+						pl.manual("role", n, detail, "connect as another superuser")
 					default:
 						pl.up[gAlterRole] = append(pl.up[gAlterRole], "ALTER ROLE "+q+" WITH NO"+f+";")
 						pl.down[gAlterRole] = append(pl.down[gAlterRole], "ALTER ROLE "+q+" WITH "+f+";")
@@ -982,7 +985,7 @@ func (pl *planner) roles() {
 		pl.sql("role", pgr.Grantee, fmt.Sprintf("missing %s on parameter %s", pgr.Privilege, pgr.Param))
 	}
 	if len(existing) > 0 {
-		pl.p.Notes = append(pl.p.Notes, fmt.Sprintf("users %s already exist on the target and keep the target's password (its hash differs from the backup's; restore never changes it): an app that connects as one of them uses the target's password", strings.Join(existing, ", ")))
+		pl.p.Notes = append(pl.p.Notes, fmt.Sprintf("users %s already exist on the target with their own password (restore never changes it; a hash cannot tell whether it is the same password): only the app check proves the app's password works", strings.Join(existing, ", ")))
 	}
 	var extra []string
 	for _, n := range sortedKeys(tr.Roles) {
@@ -1038,7 +1041,7 @@ func (pl *planner) hba(name string, spec *RoleSpec) {
 		}
 		if r.Method == "scram-sha-256" {
 			pl.manual("pg_hba", name, "the backup has an md5 password hash and pg_hba.conf asks for scram-sha-256: the app could not log in",
-				fmt.Sprintf("change that pg_hba.conf line to md5 (it accepts both), or after env-up set a new password: ALTER ROLE %s PASSWORD '…'; then run restore again", pg.QuoteIdent(name)))
+				fmt.Sprintf("change that pg_hba.conf line to md5 (it accepts both), or after env-up set a new password: ALTER ROLE %s PASSWORD '…'", pg.QuoteIdent(name)))
 		}
 		return
 	}
@@ -1142,109 +1145,70 @@ func (pl *planner) attrs(sdb *SourceDB, target string) *Attributes {
 	return a
 }
 
-// dbAttributes: owner, settings, privileges and comment equal the archive's.
+// dbAttributes: the new database gets the archive's owner, settings,
+// privileges and comment when it is created; after the load they must be
+// what the archive says.
 func (pl *planner) dbAttributes() {
 	for i, sdb := range pl.src.DBs {
 		dp := pl.p.DBs[i]
 		a := pl.attrs(sdb, dp.Target)
 		if a == nil {
-			pl.manual("database", sdb.Name+" attributes", "could not read the database's entries from the archive", "use --preview")
+			pl.manual("database", sdb.Name+" attributes", "could not read the database's entries from the archive", "pick another run")
 			continue
 		}
-		if pl.in.Mode == ModeFull {
-			for _, w := range a.Warnings {
-				pl.p.Notes = append(pl.p.Notes, sdb.Name+": "+w)
+		if _, loaded := pl.in.Loaded[sdb.Name]; !loaded {
+			if pl.in.Mode == ModeFull {
+				for _, w := range a.Warnings {
+					pl.p.Notes = append(pl.p.Notes, sdb.Name+": "+w)
+				}
 			}
+			for _, st := range a.Statements {
+				dp.Create = append(dp.Create, st+";")
+			}
+			continue
 		}
 		td := pl.tgt.DBs[dp.Target]
-		if td == nil || !td.Exists || dp.Recreate {
-			// env-up creates it: every attribute of the archive follows CREATE DATABASE.
-			for _, st := range a.Statements {
-				pl.up[gDBAttr] = append(pl.up[gDBAttr], st+";")
-			}
+		if td == nil || !td.Exists {
+			pl.add(Check{Area: "database", Name: dp.Target, Detail: "not on the target after the load"})
 			continue
 		}
-		q := pg.QuoteIdent(dp.Target)
-		var diffs []string
-		if pl.in.Mode == ModeData {
-			if td.Owner != pl.tgt.Env.CurrentUser && !pl.tgt.Env.Superuser {
-				pl.manual("database", dp.Target+" owner", fmt.Sprintf("owned by %s; %s cannot load into it", td.Owner, pl.tgt.Env.CurrentUser),
-					fmt.Sprintf("connect as %s, or ask the admin: ALTER DATABASE %s OWNER TO %s; then run restore again", td.Owner, q, pg.QuoteIdent(pl.tgt.Env.CurrentUser)))
+		owner := pl.tgt.Env.CurrentUser
+		if pl.in.Mode == ModeFull {
+			if owner = a.Owner; owner == "" {
+				owner = td.Owner
 			}
-		} else if a.Owner != "" && td.Owner != a.Owner {
-			pl.up[gDBAttr] = append(pl.up[gDBAttr], "ALTER DATABASE "+q+" OWNER TO "+pg.QuoteIdent(a.Owner)+";")
-			pl.down[gDBAttr] = append(pl.down[gDBAttr], "ALTER DATABASE "+q+" OWNER TO "+pg.QuoteIdent(td.Owner)+";")
-			diffs = append(diffs, "owner "+td.Owner+" → "+a.Owner)
+		}
+		var diffs []string
+		if td.Owner != owner {
+			diffs = append(diffs, "owner "+td.Owner+", the backup's "+owner)
 		}
 		want := map[string]bool{}
 		for _, s := range a.Settings {
 			k := s.Role + "\x00" + strings.ToLower(s.Name)
 			want[k] = true
-			if got, ok := td.Settings[k]; ok && normSetting(got) == normSetting(s.Value) {
-				continue
+			if got, ok := td.Settings[k]; !ok || normSetting(got) != normSetting(s.Value) {
+				diffs = append(diffs, "setting "+s.Name)
 			}
-			stmt := fmt.Sprintf("ALTER DATABASE %s SET %s TO %s;", q, settingName(s.Name), s.SQL)
-			if s.Role != "" {
-				stmt = fmt.Sprintf("ALTER ROLE %s IN DATABASE %s SET %s TO %s;", pg.QuoteIdent(s.Role), q, settingName(s.Name), s.SQL)
-			}
-			pl.up[gDBAttr] = append(pl.up[gDBAttr], stmt)
-			pl.down[gDBAttr] = append(pl.down[gDBAttr], revertDBSetting(td, dp.Target, k, s.Name))
-			diffs = append(diffs, "setting "+s.Name)
 		}
 		if pl.in.Mode == ModeFull {
 			for _, k := range sortedKeys(td.Settings) {
-				if want[k] {
-					continue
+				if !want[k] {
+					diffs = append(diffs, "extra setting "+td.SettingName[k])
 				}
-				role, _, _ := strings.Cut(k, "\x00")
-				pl.up[gDBAttr] = append(pl.up[gDBAttr], resetDBSQL(dp.Target, role, td.SettingName[k]))
-				pl.down[gDBAttr] = append(pl.down[gDBAttr], setDBSQL(dp.Target, role, td.SettingName[k], td.Settings[k]))
-				diffs = append(diffs, "extra setting "+td.SettingName[k])
 			}
-			owner := a.Owner
-			if owner == "" {
-				owner = td.Owner
-			}
-			exp := a.expectedACL(owner)
-			if up := aclDiff(dp.Target, td.ACL, exp); len(up) > 0 {
-				pl.up[gDBAttr] = append(pl.up[gDBAttr], up...)
-				pl.down[gDBAttr] = append(pl.down[gDBAttr], aclDiff(dp.Target, exp, td.ACL)...)
+			if len(aclDiff(dp.Target, td.ACL, a.expectedACL(owner))) > 0 {
 				diffs = append(diffs, "privileges")
 			}
-			switch {
-			case a.Comment != nil && (td.Comment == nil || *td.Comment != *a.Comment):
-				pl.up[gDBAttr] = append(pl.up[gDBAttr], "COMMENT ON DATABASE "+q+" IS "+pg.QuoteLiteral(*a.Comment)+";")
-				pl.down[gDBAttr] = append(pl.down[gDBAttr], commentSQL(q, td.Comment))
-				diffs = append(diffs, "comment")
-			case a.Comment == nil && td.Comment != nil:
-				pl.up[gDBAttr] = append(pl.up[gDBAttr], "COMMENT ON DATABASE "+q+" IS NULL;")
-				pl.down[gDBAttr] = append(pl.down[gDBAttr], commentSQL(q, td.Comment))
+			if !sameComment(a.Comment, td.Comment) {
 				diffs = append(diffs, "comment")
 			}
 		}
 		if len(diffs) > 0 {
-			pl.sql("database", dp.Target+" attributes", strings.Join(diffs, "; "))
+			pl.add(Check{Area: "database", Name: dp.Target + " attributes", Detail: strings.Join(diffs, "; ")})
 		} else {
 			pl.ok("database", dp.Target+" attributes", "equal")
 		}
 	}
-}
-
-func commentSQL(q string, c *string) string {
-	if c == nil {
-		return "COMMENT ON DATABASE " + q + " IS NULL;"
-	}
-	return "COMMENT ON DATABASE " + q + " IS " + pg.QuoteLiteral(*c) + ";"
-}
-
-// defaultDBACL is acldefault('d', owner): the owner has everything, PUBLIC
-// CONNECT and TEMPORARY.
-func defaultDBACL(owner string) map[string]bool {
-	acl := map[string]bool{"PUBLIC CONNECT": true, "PUBLIC TEMPORARY": true}
-	for _, p := range dbPrivileges {
-		acl[owner+" "+p] = true
-	}
-	return acl
 }
 
 // splitACL splits "grantee privilege"; a grantee may contain spaces.
@@ -1278,10 +1242,10 @@ func aclDiff(db string, have, want map[string]bool) []string {
 	return out
 }
 
-func (pl *planner) outOfScope() {
+func (pl *planner) external() {
 	for _, sdb := range pl.src.DBs {
-		for _, o := range sdb.Dump.OutOfScope {
-			pl.warn("out_of_scope", sdb.Name+": "+o, "depends on files or processes outside Postgres; restore cannot guarantee it")
+		for _, o := range sdb.Dump.External {
+			pl.warn("external", sdb.Name+": "+o, "depends on something outside Postgres; restore brings it back but cannot promise it works")
 		}
 	}
 }
@@ -1313,19 +1277,4 @@ func cmpVersion(a, b string) int {
 		}
 	}
 	return 0
-}
-
-// DataDown writes the SQL that empties the loaded databases again: drop and
-// recreate each as it was right before the load (ADR-0015).
-func DataDown(st *TargetState, targets []string) []string {
-	var out []string
-	sort.Strings(targets)
-	for _, t := range targets {
-		td := st.DBs[t]
-		if td == nil || !td.Exists {
-			continue
-		}
-		out = append(out, recreateDB(td, st.Major)...)
-	}
-	return out
 }

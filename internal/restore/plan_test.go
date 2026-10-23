@@ -37,7 +37,7 @@ func planSource(t *testing.T) *SourceRun {
 	return &SourceRun{Instance: "main", TS: "2026-10-16T030000Z", Kind: "container", Env: env, Globals: g, DBs: []*SourceDB{shop}}
 }
 
-// freshTarget is a new postgres:17 container: no database shop, only postgres, nothing preloaded.
+// freshTarget is a new postgres:17 container: only postgres, nothing preloaded.
 func freshTarget(t *testing.T) *TargetState {
 	empty := ""
 	env := &pg.Env{SourceKind: "container", ServerVersionNum: 170011, ServerVersion: "17.11", CurrentUser: "postgres", Superuser: true,
@@ -49,7 +49,7 @@ func freshTarget(t *testing.T) *TargetState {
 		Avail:    map[string]ExtAvail{"pg_stat_statements": {Default: "1.11", Trusted: false}},
 		PkgLib:   map[string]bool{"pg_stat_statements.so": true},
 		AutoConf: map[string]string{},
-		DBs:      map[string]*TargetDB{"shop": {Name: "shop"}},
+		DBs:      map[string]*TargetDB{},
 		Names:    map[string]bool{"postgres": true, "template0": true, "template1": true},
 		LocaleOK: map[string]string{"UTF8\x00en_US.utf8\x00en_US.utf8\x00\x00": ""}}
 }
@@ -80,24 +80,29 @@ func index(stmts []string, prefix string) int {
 	return -1
 }
 
-// ADR-0015 § 3: a fresh target gets every gap as SQL, with its undo, and nothing is loaded.
+// restoredShop is where the run of planSource loads shop: the run's ts, UTC.
+const restoredShop = "shop_restored_20261016_0300"
+
+// ADR-0015 § 3: a fresh target gets every server-wide gap as SQL, with its
+// undo; the new database is the load's, never env-up's (ADR-0022).
 func TestPlanFreshTarget(t *testing.T) {
 	src, tgt := planSource(t), freshTarget(t)
 	tgt.LocaleOK = map[string]string{localeKey(src.DBs[0].Dump.Locale): ""}
 	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
 	f := failed(p)
-	for _, k := range []string{"database shop", "preload pg_stat_statements", "setting DateStyle", "role app", "role Report Reader"} {
+	for _, k := range []string{"preload pg_stat_statements", "setting DateStyle", "role app", "role Report Reader"} {
 		if c, ok := f[k]; !ok || c.Fix != FixSQL {
 			t.Errorf("%s: %+v (all: %v)", k, c, f)
 		}
+	}
+	if _, ok := f["database shop"]; ok {
+		t.Errorf("a new database is not a gap: %v", f)
 	}
 	if p.OK() || !p.Restart || p.RestartCmd != "docker restart db" {
 		t.Errorf("ok %v restart %v %q", p.OK(), p.Restart, p.RestartCmd)
 	}
 	for _, s := range []string{
 		`CREATE ROLE "app" WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB LOGIN NOREPLICATION NOBYPASSRLS PASSWORD 'SCRAM-SHA-256$4096:x';`,
-		`CREATE DATABASE "shop" TEMPLATE template0 encoding 'UTF8' lc_collate 'en_US.utf8' lc_ctype 'en_US.utf8' OWNER "app";`,
-		`GRANT CONNECT ON DATABASE "shop" TO "Report Reader";`,
 		`ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';`,
 		`ALTER SYSTEM SET DateStyle = 'ISO, DMY';`,
 	} {
@@ -105,22 +110,34 @@ func TestPlanFreshTarget(t *testing.T) {
 			t.Errorf("env-up lacks %s:\n%s", s, strings.Join(p.Up, "\n"))
 		}
 	}
-	// Roles before the databases they own; a restart replaces the reload.
-	if index(p.Up, `CREATE ROLE "app"`) > index(p.Up, `CREATE DATABASE "shop"`) || has(p.Up, "SELECT pg_reload_conf();") {
-		t.Errorf("env-up order:\n%s", strings.Join(p.Up, "\n"))
+	// env-up is server-wide only; a restart replaces the reload.
+	if strings.Contains(strings.Join(p.Up, "\n"), " DATABASE ") || has(p.Up, "SELECT pg_reload_conf();") {
+		t.Errorf("env-up:\n%s", strings.Join(p.Up, "\n"))
 	}
-	// env-down undoes in reverse: settings first, then the database, then the users.
-	for _, s := range []string{`ALTER SYSTEM RESET shared_preload_libraries;`, `DROP DATABASE IF EXISTS "shop" WITH (FORCE);`, `DROP ROLE IF EXISTS "app";`} {
+	// The load creates the database with the source's locale, owner and privileges.
+	dp := p.DBs[0]
+	want := []string{
+		`CREATE DATABASE "` + restoredShop + `" TEMPLATE template0 encoding 'UTF8' lc_collate 'en_US.utf8' lc_ctype 'en_US.utf8' OWNER "app";`,
+		`ALTER DATABASE "` + restoredShop + `" OWNER TO app;`,
+		`GRANT CONNECT ON DATABASE "` + restoredShop + `" TO "Report Reader";`,
+	}
+	if dp.Source != "shop" || dp.Target != restoredShop || strings.Join(dp.Create, "\n") != strings.Join(want, "\n") {
+		t.Errorf("db plan: %+v\n%s", dp, strings.Join(dp.Create, "\n"))
+	}
+	// env-down undoes in reverse: settings first, then the users; the new
+	// database is dropped by the customer before it.
+	for _, s := range []string{`ALTER SYSTEM RESET shared_preload_libraries;`, `DROP ROLE IF EXISTS "app";`} {
 		if !has(p.Down, s) {
 			t.Errorf("env-down lacks %s:\n%s", s, strings.Join(p.Down, "\n"))
 		}
 	}
-	if index(p.Down, "ALTER SYSTEM RESET") > index(p.Down, "DROP DATABASE") || index(p.Down, "DROP DATABASE") > index(p.Down, "DROP ROLE") {
-		t.Errorf("env-down order:\n%s", strings.Join(p.Down, "\n"))
+	if index(p.Down, "ALTER SYSTEM RESET") > index(p.Down, "DROP ROLE") || index(p.Down, "DROP DATABASE") >= 0 {
+		t.Errorf("env-down:\n%s", strings.Join(p.Down, "\n"))
 	}
 }
 
-// After env-up the same comparison has nothing left; after the load (Loaded) too.
+// After env-up the same comparison has nothing left; after the load (Loaded)
+// too, checked in the database the run was loaded into.
 func TestPlanMatchingTarget(t *testing.T) {
 	src, tgt := planSource(t), freshTarget(t)
 	tgt.LocaleOK = map[string]string{localeKey(src.DBs[0].Dump.Locale): ""}
@@ -128,35 +145,59 @@ func TestPlanMatchingTarget(t *testing.T) {
 	tgt.Env.PreloadLibraries = &pre
 	tgt.Env.Settings[0].Value = "ISO, DMY"
 	tgt.Roles = &TargetRoles{Roles: src.Globals.Roles, ParamGrants: map[string]ParamGrant{}, HasGrantOptions: true}
-	tgt.DBs["shop"] = &TargetDB{Name: "shop", Exists: true, Owner: "app", Locale: src.DBs[0].Dump.Locale,
-		Settings: map[string]string{}, SettingName: map[string]string{},
-		ACL: map[string]bool{"PUBLIC CONNECT": true, "PUBLIC TEMPORARY": true, "app CONNECT": true, "app CREATE": true, "app TEMPORARY": true, "Report Reader CONNECT": true}}
 	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
 	if !p.OK() || len(p.Up) != 0 {
 		t.Fatalf("failed %v, up:\n%s", failed(p), strings.Join(p.Up, "\n"))
 	}
-	if p.DBs[0].Target != "shop" || p.DBs[0].State != StateEmpty {
+	if p.DBs[0].Target != restoredShop {
 		t.Errorf("db plan: %+v", p.DBs[0])
 	}
-	// The load added tables: Loaded says so, and the plan does not move it to a side database.
-	tgt.DBs["shop"].Objects = 5
-	p = MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Loaded: map[string]string{"shop": "shop"}})
-	if !p.OK() || p.DBs[0].Target != "shop" {
+	// The load created it: Loaded keeps its name although it is now taken.
+	tgt.Names[restoredShop] = true
+	tgt.DBs[restoredShop] = &TargetDB{Name: restoredShop, Exists: true, Objects: 5, Owner: "app", Locale: src.DBs[0].Dump.Locale,
+		Settings: map[string]string{}, SettingName: map[string]string{},
+		ACL: map[string]bool{"PUBLIC CONNECT": true, "PUBLIC TEMPORARY": true, "app CONNECT": true, "app CREATE": true, "app TEMPORARY": true, "Report Reader CONNECT": true}}
+	p = MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Loaded: map[string]string{"shop": restoredShop}})
+	if !p.OK() || p.DBs[0].Target != restoredShop || len(p.DBs[0].Create) != 0 {
 		t.Errorf("after the load: %v %+v", failed(p), p.DBs[0])
+	}
+	// What the load did not bring back fails the check.
+	tgt.DBs[restoredShop].Owner = "postgres"
+	delete(tgt.DBs[restoredShop].ACL, "Report Reader CONNECT")
+	p = MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Loaded: map[string]string{"shop": restoredShop}})
+	if c := failed(p)["database "+restoredShop+" attributes"]; !strings.Contains(c.Detail, "owner postgres, the backup's app") || !strings.Contains(c.Detail, "privileges") {
+		t.Errorf("attributes: %+v", c)
+	}
+	delete(tgt.DBs, restoredShop)
+	if _, ok := failed(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Loaded: map[string]string{"shop": restoredShop}}))["database "+restoredShop]; !ok {
+		t.Error("a database missing after the load must fail")
 	}
 }
 
-// A database with data is never touched: the run goes next to it.
-func TestPlanHasDataGoesNextToIt(t *testing.T) {
+// ADR-0022: the run always loads into a new database; the target's own
+// databases, empty or not, are never touched. A taken name gets _2.
+func TestPlanNewDatabaseName(t *testing.T) {
 	src, tgt := planSource(t), freshTarget(t)
+	tgt.Names["shop"], tgt.Names[restoredShop] = true, true
 	tgt.DBs["shop"] = &TargetDB{Name: "shop", Exists: true, Objects: 3, Owner: "app", Locale: src.DBs[0].Dump.Locale}
-	tgt.Names["shop"] = true
 	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Now: time.Now()})
-	if dp := p.DBs[0]; dp.State != StateHasData || dp.Target != "shop_restored_20261016_0300" {
+	dp := p.DBs[0]
+	if dp.Target != restoredShop+"_2" || index(dp.Create, `CREATE DATABASE "`+restoredShop+`_2" TEMPLATE template0`) != 0 {
 		t.Errorf("db plan: %+v", dp)
 	}
-	if index(p.Up, `CREATE DATABASE "shop_restored_20261016_0300"`) < 0 || index(p.Up, `DROP DATABASE`) >= 0 {
-		t.Errorf("env-up:\n%s", strings.Join(p.Up, "\n"))
+	all := strings.Join(append(append(append([]string{}, dp.Create...), p.Up...), p.Down...), "\n")
+	if strings.Contains(all, `"shop"`) || strings.Contains(all, "DATABASE shop") {
+		t.Errorf("touches the target's shop:\n%s", all)
+	}
+	// Two runs in one minute: the second takes the next free number.
+	tgt.Names[restoredShop+"_2"] = true
+	if dp := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull}).DBs[0]; dp.Target != restoredShop+"_3" {
+		t.Errorf("third: %+v", dp)
+	}
+	// No readable run ts: the name takes the time of the restore.
+	src.TS = ""
+	if dp := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Now: time.Date(2026, 10, 17, 5, 6, 0, 0, time.UTC)}).DBs[0]; dp.Target != "shop_restored_20261017_0506" {
+		t.Errorf("no ts: %+v", dp)
 	}
 }
 
@@ -180,51 +221,48 @@ func TestPlanManualChecks(t *testing.T) {
 	}
 }
 
-// An empty database with another locale is dropped and created again; env-down brings it back.
-func TestPlanRecreatesEmptyDatabaseWithOtherLocale(t *testing.T) {
-	src, tgt := planSource(t), freshTarget(t)
-	tgt.DBs["shop"] = &TargetDB{Name: "shop", Exists: true, Owner: "postgres", ACLNull: true,
-		Locale: &pg.Locale{Encoding: "UTF8", Collate: "C", Ctype: "C"}, Settings: map[string]string{}, SettingName: map[string]string{}, ACL: map[string]bool{}}
-	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
-	if !p.DBs[0].Recreate || index(p.Up, `DROP DATABASE "shop"`) < 0 {
-		t.Fatalf("recreate: %+v\n%s", p.DBs[0], strings.Join(p.Up, "\n"))
-	}
-	if index(p.Down, `CREATE DATABASE "shop" TEMPLATE template0 encoding 'UTF8' lc_collate 'C' lc_ctype 'C' OWNER "postgres";`) < 0 {
-		t.Errorf("env-down:\n%s", strings.Join(p.Down, "\n"))
-	}
-	// env-down drops the restored database once, then builds the old one.
-	if n := strings.Count(strings.Join(p.Down, "\n"), `DROP DATABASE IF EXISTS "shop"`); n != 1 {
-		t.Errorf("env-down drops shop %d times:\n%s", n, strings.Join(p.Down, "\n"))
-	}
-}
-
-// A URL run is data only: the database is created owned by the connecting
-// user, and its settings are compared once it exists.
-func TestPlanDataModeDefersSettings(t *testing.T) {
+// A URL run is data only: the new database is owned by the connecting user,
+// a setting that differs is set on it when it is created, and after the load
+// the settings in effect in it are compared (spec restore § data mode).
+func TestPlanDataModeSetsSettingsOnCreate(t *testing.T) {
 	src, tgt := planSource(t), freshTarget(t)
 	src.Kind, src.Env.SourceKind, src.Globals = "url", "url", nil
 	src.Env.DBSettings = map[string][]pg.Setting{"shop": {{Name: "TimeZone", Value: "GMT", Vartype: "string"}}}
 	tgt.Roles = nil
+	tgt.Env.CurrentUser, tgt.Env.Superuser = "deployer", false
 	tgt.Env.PreloadLibraries = src.Env.PreloadLibraries
+	tgt.Avail["pg_stat_statements"] = ExtAvail{Default: "1.11", Trusted: true}
+	tgt.Effective = []pg.Setting{{Name: "TimeZone", Value: "UTC", Vartype: "string"}}
 	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeData})
 	f := failed(p)
-	if c := f["setting shop"]; c.Fix != FixRerun {
-		t.Errorf("settings: %+v (%v)", c, f)
+	if c := f["database CREATEDB"]; c.Fix != FixManual || !strings.Contains(c.Detail, "deployer needs CREATEDB") {
+		t.Errorf("CREATEDB: %+v (%v)", c, f)
 	}
-	if _, ok := f["role app"]; ok || index(p.Up, `CREATE DATABASE "shop" TEMPLATE template0 encoding 'UTF8' lc_collate 'en_US.utf8' lc_ctype 'en_US.utf8' OWNER "postgres";`) < 0 {
-		t.Errorf("data mode creates no user and owns the database: %v\n%s", f, strings.Join(p.Up, "\n"))
+	if _, ok := f["role app"]; ok || len(p.Up) != 0 {
+		t.Errorf("data mode creates no user: %v\n%s", f, strings.Join(p.Up, "\n"))
 	}
-}
+	want := []string{
+		`CREATE DATABASE "` + restoredShop + `" TEMPLATE template0 encoding 'UTF8' lc_collate 'en_US.utf8' lc_ctype 'en_US.utf8' OWNER "deployer";`,
+		`ALTER DATABASE "` + restoredShop + `" SET TimeZone = 'GMT';`,
+	}
+	if got := strings.Join(p.DBs[0].Create, "\n"); got != strings.Join(want, "\n") {
+		t.Errorf("create:\n%s", got)
+	}
+	tgt.CreateDB = true
+	if p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeData}); !p.OK() {
+		t.Errorf("with CREATEDB: %v", failed(p))
+	}
 
-// For UTF8, collate C.UTF-8 is byte order like C (musl stores it as C).
-func TestSameLocaleCUTF8(t *testing.T) {
-	a := &pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C.UTF-8", Provider: "builtin", Locale: "C.UTF-8"}
-	b := &pg.Locale{Encoding: "UTF8", Collate: "C", Ctype: "C.UTF-8", Provider: "builtin", Locale: "C.UTF-8"}
-	if !sameLocale(a, b) {
-		t.Error("C.UTF-8 collate must equal C for UTF8")
+	// After the load: read in the loaded database, equal or not.
+	loaded := map[string]string{"shop": restoredShop}
+	tgt.DBs[restoredShop] = &TargetDB{Name: restoredShop, Exists: true, Owner: "deployer", Settings: map[string]string{}, SettingName: map[string]string{},
+		Effective: []pg.Setting{{Name: "TimeZone", Value: "GMT", Vartype: "string"}}}
+	if p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeData, Loaded: loaded}); !p.OK() {
+		t.Errorf("after the load: %v", failed(p))
 	}
-	if c := (&pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C"}); sameLocale(a, c) {
-		t.Error("ctype C.UTF-8 differs from C")
+	tgt.DBs[restoredShop].Effective[0].Value = "UTC"
+	if c, ok := failed(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeData, Loaded: loaded}))["setting shop: TimeZone"]; !ok || !strings.Contains(c.Detail, "in "+restoredShop+" UTC, backup GMT") {
+		t.Errorf("differs after the load: %+v", c)
 	}
 }
 
@@ -328,7 +366,128 @@ func TestPlanExtensionHintNamesEveryPackage(t *testing.T) {
 			hint = c.Manual
 		}
 	}
-	if want := "sudo apt install postgresql-18-postgis-3-scripts postgresql-18-postgis-3, then run restore again"; hint != want {
+	if want := "sudo apt install postgresql-18-postgis-3-scripts postgresql-18-postgis-3"; hint != want {
 		t.Errorf("hint %q, want %q", hint, want)
+	}
+}
+
+// spec restore § outside the dump: files and collations the databases
+// need are checked before anything is loaded; a file's content is not
+// compared (ADR-0022).
+func TestPlanNeeds(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	tgt.LocaleOK[localeKey(src.DBs[0].Dump.Locale)] = ""
+	created := pg.Locale{Provider: "icu", Locale: "und-u-ks-level2"}
+	src.DBs[0].Dump.RestoreNeeds = &pg.RestoreNeeds{
+		Libraries: []pg.NeededFile{{Name: "mylib.so", UsedBy: []string{"public.score(text)"}},
+			{Name: "other.so", UsedBy: []string{"public.rank(text)"}}},
+		TSFiles: []pg.NeededFile{{Name: "swedish.dict", UsedBy: []string{"public.sv"}}},
+		Collations: []pg.Collation{
+			{Schema: "pg_catalog", Name: "sv_SE", Locale: pg.Locale{Collate: "sv_SE.utf8", Ctype: "sv_SE.utf8"}, UsedBy: []string{"public.customers.name"}},
+			{Schema: "pg_catalog", Name: "de_DE", Locale: pg.Locale{Collate: "de_DE.utf8", Ctype: "de_DE.utf8"}, Version: "2.36"},
+			{Schema: "public", Name: "ci", Created: true, Locale: created},
+		}}
+	tgt.PkgLib["mylib.so"] = true
+	tgt.TSData = map[string]bool{}
+	tgt.Collations = map[string]string{"de_DE": "2.41"}
+	tgt.LocaleOK[localeKey(&created)] = `ICU is not supported in this build`
+
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	f := failed(p)
+	for k, want := range map[string]string{
+		"library other.so":              "the target does not have it (used by shop: public.rank(text))",
+		"text search file swedish.dict": "the target does not have it (used by shop: public.sv)",
+		"collation sv_SE":               "the target does not have this collation (used by shop: public.customers.name)",
+		`collation "public"."ci"`:       "the target cannot create it (ICU is not supported in this build)",
+	} {
+		if c, ok := f[k]; !ok || c.Fix != FixManual || !strings.HasPrefix(c.Detail, want) {
+			t.Errorf("%s: %+v", k, c)
+		}
+	}
+	if _, ok := f["library mylib.so"]; ok {
+		t.Error("mylib.so is installed: it must not fail")
+	}
+	var warned bool
+	for _, c := range p.Checks {
+		if c.Area == "collation" && c.Name == "de_DE" && c.Warn && strings.Contains(c.Detail, "version 2.41 on the target, 2.36 in the backup") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("de_DE version must warn: %+v", p.Checks)
+	}
+
+	// Directories not readable (not a superuser): cannot check, not assumed.
+	tgt.PkgLib, tgt.TSData = nil, nil
+	f = failed(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull}))
+	if c := f["library mylib.so"]; !strings.HasPrefix(c.Detail, "cannot check") {
+		t.Errorf("unreadable: %+v", c)
+	}
+}
+
+func TestPlanLocks(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	tgt.LocaleOK[localeKey(src.DBs[0].Dump.Locale)] = ""
+	// 2000 tables with a primary key and a text column; PG17 defaults.
+	src.DBs[0].Dump.LockObjects = &pg.LockObjects{Relations: 10000}
+	tgt.Locks = &pg.LockCapacity{PerTransaction: 64, Slots: 122, Source: "default"}
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	c, ok := failed(p)["locks max_locks_per_transaction"]
+	if !ok || c.Fix != FixSQL || !strings.Contains(c.Detail, "shop needs about 35100 locks") || !strings.Contains(c.Manual, "docker restart db") {
+		t.Fatalf("check: %+v", c)
+	}
+	if !has(p.Up, "ALTER SYSTEM SET max_locks_per_transaction = 320;") || !has(p.Down, "ALTER SYSTEM RESET max_locks_per_transaction;") || !p.Restart {
+		t.Errorf("up %v down %v restart %v", p.Up, p.Down, p.Restart)
+	}
+
+	// Data mode cannot change it: manual, with the number.
+	c = failed(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeData}))["locks max_locks_per_transaction"]
+	if c.Fix != FixManual || !strings.Contains(c.Manual, "at least 320") {
+		t.Errorf("data mode: %+v", c)
+	}
+
+	// Set on the command line: ALTER SYSTEM would not win.
+	tgt.Locks.Source = "command line"
+	c = failed(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull}))["locks max_locks_per_transaction"]
+	if c.Fix != FixManual || !strings.Contains(c.Manual, "-c max_locks_per_transaction in the container's command to 320") {
+		t.Errorf("command line: %+v", c)
+	}
+
+	// Enough room: ok, nothing to change.
+	tgt.Locks = &pg.LockCapacity{PerTransaction: 320, Slots: 122}
+	p = MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	if _, ok := failed(p)["locks max_locks_per_transaction"]; ok || index(p.Up, "ALTER SYSTEM SET max_locks") >= 0 {
+		t.Errorf("enough: %v %v", p.Failed(), p.Up)
+	}
+}
+
+func TestPlanConfigExtension(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	tgt.LocaleOK[localeKey(src.DBs[0].Dump.Locale)] = ""
+	ts := pg.Extension{Name: "timescaledb", Version: "2.29.2", Schema: "public", Config: true}
+	src.DBs[0].Dump.Extensions = []pg.Extension{ts}
+	check := func(p *Plan) Check {
+		for _, c := range p.Checks {
+			if c.Area == "extension" && c.Name == "shop: timescaledb 2.29.2" {
+				return c
+			}
+		}
+		t.Fatalf("no check: %+v", p.Checks)
+		return Check{}
+	}
+
+	// Same default: the dump's CREATE EXTENSION installs it.
+	tgt.Avail["timescaledb"] = ExtAvail{Default: "2.29.2"}
+	if c := check(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})); !c.OK {
+		t.Errorf("same default: %+v", c)
+	}
+
+	// A newer default: manual, naming the source's image.
+	tgt.Avail["timescaledb"] = ExtAvail{Default: "2.31.0"}
+	src.Env.Container = &pg.ContainerEnv{Image: "timescale/timescaledb:2.29.2-pg17"}
+	c := check(MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull}))
+	if c.OK || c.Fix != FixManual || c.Detail != "the target installs timescaledb 2.31.0 by default; the dump holds its configuration tables as of 2.29.2" ||
+		!strings.HasPrefix(c.Manual, "use image timescale/timescaledb:2.29.2-pg17 (the source's) for container db") {
+		t.Errorf("newer default: %+v", c)
 	}
 }

@@ -38,7 +38,7 @@ func StartSession(ctx context.Context, runner Runner, conn Conn) (*Session, erro
 		inR.CloseWithError(runCtx.Err())
 	}()
 	go func() {
-		args := []string{"-X", "-A", "-t", "-q", "-F", "\x1f", "-v", "ON_ERROR_STOP=0", "-f", "-"}
+		args := []string{"-X", "-A", "-t", "-q", "-F", "\x1f", "-0", "-v", "ON_ERROR_STOP=0", "-f", "-"}
 		err := runner.Run(ctx, conn, "psql", args, inR, outW)
 		stopWatch()
 		outW.CloseWithError(err)
@@ -53,7 +53,7 @@ func StartSession(ctx context.Context, runner Runner, conn Conn) (*Session, erro
 	return s, nil
 }
 
-// Exec sends one SQL statement and returns the result rows (columns separated by \x1f).
+// Exec sends one SQL statement and returns the result rows (see parseRows).
 // An SQL error is recorded by psql in :LAST_ERROR_MESSAGE and returned as an error.
 func (s *Session) Exec(sql string) ([][]string, error) {
 	s.mu.Lock()
@@ -65,24 +65,30 @@ func (s *Session) Exec(sql string) ([][]string, error) {
 	if _, err := fmt.Fprintf(s.stdin, "%s;\n\\echo %s :ERROR :LAST_ERROR_MESSAGE\n", sql, sessionMarker); err != nil {
 		return nil, s.runErr(err)
 	}
-	var rows [][]string
+	// Rows end with NUL and may hold newlines; the marker line follows the
+	// last NUL (or comes first when there is no row).
+	var buf strings.Builder
 	for {
-		line, err := s.out.ReadString('\n')
+		chunk, err := s.out.ReadString('\n')
 		if err != nil {
 			return nil, s.runErr(err)
 		}
-		line = strings.TrimRight(line, "\n")
-		if strings.HasPrefix(line, sessionMarker) {
-			rest := strings.TrimSpace(strings.TrimPrefix(line, sessionMarker))
-			if strings.HasPrefix(rest, "true") {
-				return nil, fmt.Errorf("%s", strings.TrimSpace(strings.TrimPrefix(rest, "true")))
-			}
-			return rows, nil
+		buf.WriteString(chunk)
+		all := buf.String()
+		at := -1
+		if strings.HasPrefix(all, sessionMarker) {
+			at = 0
+		} else if i := strings.LastIndex(all, "\x00"+sessionMarker); i >= 0 {
+			at = i + 1
 		}
-		if line == "" {
+		if at < 0 {
 			continue
 		}
-		rows = append(rows, strings.Split(line, "\x1f"))
+		rest := strings.TrimSpace(strings.TrimPrefix(all[at:], sessionMarker))
+		if strings.HasPrefix(rest, "true") {
+			return nil, fmt.Errorf("%s", strings.TrimSpace(strings.TrimPrefix(rest, "true")))
+		}
+		return parseRows(all[:at]), nil
 	}
 }
 

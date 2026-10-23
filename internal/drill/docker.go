@@ -118,7 +118,7 @@ func (r *dockerRuntime) imageVolumes(ctx context.Context, image string) ([]strin
 // start creates the temporary Postgres with image, bootstrap superuser user
 // and the preload libraries, checks free disk (needBytes), waits until it
 // answers, and returns it; whatever it created is removed on error.
-func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.Instance, image, user string, preload []string, needBytes int64, ir *InstanceResult, res *Result, d Deps) (*tempPG, error) {
+func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.Instance, image, user string, preload []string, locksPer int, needBytes int64, ir *InstanceResult, res *Result, d Deps) (*tempPG, error) {
 	// A named + labeled volume for each VOLUME of the image, so docker rm -v
 	// leaves no copy of the data behind.
 	paths, err := r.imageVolumes(ctx, image)
@@ -150,7 +150,7 @@ func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.In
 		}
 	}
 	// Measure disk through the volume just created, before starting the container.
-	if err := reportDisk(r.checkDisk(ctx, image, t.volumes[0], needBytes), in, ir, res, d); err != nil {
+	if err := reportDisk(r.checkDisk(ctx, image, t.volumes[0], needBytes), ir); err != nil {
 		r.removeVolumes(ctx, t.volumes, res, in.Name)
 		return nil, err
 	}
@@ -159,14 +159,14 @@ func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.In
 		if cfg.Drill.Memory != "" {
 			runArgs = append(runArgs, "--memory", cfg.Drill.Memory)
 		}
-		if cfg.Drill.CPUs != "" {
-			runArgs = append(runArgs, "--cpus", cfg.Drill.CPUs)
-		}
 	}
 	runArgs = append(runArgs, image)
 	if len(preload) > 0 {
 		// The image entrypoint passes arguments starting with - to postgres.
 		runArgs = append(runArgs, "-c", "shared_preload_libraries="+strings.Join(preload, ","))
+	}
+	if locksPer > 0 {
+		runArgs = append(runArgs, "-c", fmt.Sprintf("max_locks_per_transaction=%d", locksPer))
 	}
 	if _, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: runArgs, Env: []string{"POSTGRES_PASSWORD=" + d.Rand(16)}}); err != nil {
 		r.remove(ctx, t, res, in.Name)
@@ -230,11 +230,6 @@ func (r *dockerRuntime) remove(ctx context.Context, t *tempPG, res *Result, inst
 		return // the volumes are still attached to the container; remove them along with it
 	}
 	r.removeVolumes(rmCtx, t.volumes, res, instance)
-}
-
-func (r *dockerRuntime) keep(t *tempPG, ir *InstanceResult) {
-	ir.Container = t.name
-	ir.Volumes = t.volumes
 }
 
 // removeVolumes removes the drill's named volumes; on error it only warns, with the manual cleanup command.

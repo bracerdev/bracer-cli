@@ -9,17 +9,19 @@ import (
 	"strings"
 )
 
-// Secrets is the result of loading three sources in precedence order: process
-// environment > --env-file > secrets_file (conventions § Secret). Source records
-// where each variable came from so --dry-run can print it.
+// Secrets holds the variables of secrets_file, the one source of secrets of
+// every command: the process environment does not override it and there is
+// no --env-file (ADR-0022). Source records where each variable came from so
+// --dry-run can print it.
 type Secrets struct {
 	values map[string]string
 	Source map[string]string
+	file   string
 }
 
-// NewSecrets builds Secrets from an existing map (tests, or a source other than the three standard ones).
+// NewSecrets builds Secrets from an existing map (tests, or values typed at a prompt).
 func NewSecrets(values map[string]string, source string) *Secrets {
-	s := &Secrets{values: map[string]string{}, Source: map[string]string{}}
+	s := &Secrets{values: map[string]string{}, Source: map[string]string{}, file: source}
 	for k, v := range values {
 		s.values[k] = v
 		s.Source[k] = source
@@ -31,6 +33,7 @@ func NewSecrets(values map[string]string, source string) *Secrets {
 func (s *Secrets) With(name, value, source string) *Secrets {
 	c := &Secrets{values: map[string]string{}, Source: map[string]string{}}
 	if s != nil {
+		c.file = s.file
 		for k, v := range s.values {
 			c.values[k] = v
 		}
@@ -42,67 +45,45 @@ func (s *Secrets) With(name, value, source string) *Secrets {
 	return c
 }
 
-// Lookup returns the variable's value; ok=false if it is in none of the sources.
+// Lookup returns the variable's value; ok=false if secrets_file does not have it.
 func (s *Secrets) Lookup(name string) (string, bool) {
 	v, ok := s.values[name]
 	return v, ok
 }
 
-// Require is like Lookup but returns an error naming the variable and the three ways to provide it.
+// Require is like Lookup but returns an error naming the variable and the file.
 func (s *Secrets) Require(name string) (string, error) {
 	v, ok := s.values[name]
 	if !ok {
-		return "", fmt.Errorf("%w: variable %s not found in the environment, --env-file or secrets_file", ErrMissingSecret, name)
+		where := "secrets_file"
+		if s.file != "" {
+			where = s.file
+		}
+		return "", fmt.Errorf("%w: variable %s not found in %s", ErrMissingSecret, name, where)
 	}
 	return v, nil
 }
 
-// LoadSecrets loads secrets_file (if the app declares one), then envFile (if
-// given), then the process environment, each level overriding the previous. A
-// declared file that cannot be read is an error.
-func LoadSecrets(a *App, envFile string) (*Secrets, []string, error) {
-	s := &Secrets{values: map[string]string{}, Source: map[string]string{}}
+// LoadSecrets loads secrets_file of the app. A file that cannot be read is an
+// error; a file with loose permissions is a warning.
+func LoadSecrets(a *App) (*Secrets, []string, error) {
+	path := a.SecretsFile
+	s := &Secrets{values: map[string]string{}, Source: map[string]string{}, file: path}
 	var warnings []string
-	load := func(path, label string) error {
-		if path == "" {
-			return nil
-		}
-		path, err := ExpandHome(path)
-		if err != nil {
-			return err
-		}
-		if w := permWarning(path); w != "" {
-			warnings = append(warnings, w)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("%s: %w", label, err)
-		}
-		vars, err := ParseEnvFile(data)
-		if err != nil {
-			return fmt.Errorf("%s %s: %w", label, path, err)
-		}
-		for k, v := range vars {
-			s.values[k] = v
-			s.Source[k] = label + " " + path
-		}
-		return nil
+	if w := permWarning(path); w != "" {
+		warnings = append(warnings, w)
 	}
-	if a != nil {
-		if err := load(a.SecretsFile, "secrets_file"); err != nil {
-			return nil, warnings, err
-		}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, warnings, fmt.Errorf("secrets_file: %w", err)
 	}
-	if err := load(envFile, "--env-file"); err != nil {
-		return nil, warnings, err
+	vars, err := ParseEnvFile(data)
+	if err != nil {
+		return nil, warnings, fmt.Errorf("secrets_file %s: %w", path, err)
 	}
-	for _, kv := range os.Environ() {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok {
-			continue
-		}
+	for k, v := range vars {
 		s.values[k] = v
-		s.Source[k] = "environment"
+		s.Source[k] = "secrets_file " + path
 	}
 	return s, warnings, nil
 }
@@ -119,8 +100,9 @@ func permWarning(path string) string {
 }
 
 // ParseEnvFile reads a dotenv file of one NAME=value per line, no interpolation.
-// A leading `#` is a comment. A value wrapped in a pair of single or double
-// quotes has the quotes removed. A malformed line is an error with its line number.
+// A leading `#` is a comment. A value wrapped in single quotes is taken as is;
+// one wrapped in double quotes has \\ and \" unescaped (what quoteIfNeeded
+// writes). A malformed line is an error with its line number.
 func ParseEnvFile(data []byte) (map[string]string, error) {
 	out := map[string]string{}
 	sc := bufio.NewScanner(bytes.NewReader(data))
@@ -140,7 +122,11 @@ func ParseEnvFile(data []byte) (map[string]string, error) {
 		}
 		v = strings.TrimSpace(v)
 		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			q := v[0]
 			v = v[1 : len(v)-1]
+			if q == '"' {
+				v = strings.NewReplacer(`\"`, `"`, `\\`, `\`).Replace(v)
+			}
 		}
 		out[k] = v
 	}
@@ -150,63 +136,40 @@ func ParseEnvFile(data []byte) (map[string]string, error) {
 	return out, nil
 }
 
-// MergeEnvFile writes vars into the dotenv file at path (created if missing, mode
-// 600). An existing variable with the same value is kept; one with a different
-// value is overwritten only when overwrite(name) returns true, otherwise the old
-// value stays and the name goes into kept. The file's existing lines (comments,
-// order) are preserved; new variables are appended at the end.
-func MergeEnvFile(path string, vars map[string]string, overwrite func(name string) bool) (kept []string, err error) {
-	path, err = ExpandHome(path)
+// WriteEnvFile writes exactly vars to the dotenv file at path (mode 600,
+// directory 700), replacing whatever was there: the file is init's alone,
+// and a leftover of an interrupted init is overwritten without a question
+// (ADR-0030).
+func WriteEnvFile(path string, vars map[string]string) error {
+	path, err := ExpandHome(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var lines []string
-	existing := map[string]string{}
-	if data, rerr := os.ReadFile(path); rerr == nil {
-		existing, err = ParseEnvFile(data)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-		if len(lines) == 1 && lines[0] == "" {
-			lines = nil
-		}
-	} else if !os.IsNotExist(rerr) {
-		return nil, rerr
-	}
-
 	names := make([]string, 0, len(vars))
 	for k := range vars {
 		names = append(names, k)
 	}
 	sort.Strings(names)
+	var b strings.Builder
 	for _, k := range names {
-		v := vars[k]
-		old, has := existing[k]
-		switch {
-		case !has:
-			lines = append(lines, k+"="+quoteIfNeeded(v))
-		case old == v:
-		case overwrite != nil && overwrite(k):
-			for i, l := range lines {
-				if key, _, ok := strings.Cut(strings.TrimPrefix(strings.TrimSpace(l), "export "), "="); ok && strings.TrimSpace(key) == k {
-					lines[i] = k + "=" + quoteIfNeeded(v)
-				}
-			}
-		default:
-			kept = append(kept, k)
-		}
+		b.WriteString(k + "=" + quoteIfNeeded(vars[k]) + "\n")
 	}
-	data := strings.Join(lines, "\n") + "\n"
 	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
-		return kept, err
+		return err
 	}
-	return kept, writeAtomic(path, []byte(data), 0o600)
+	return writeAtomic(path, []byte(b.String()), 0o600)
 }
 
+// quoteIfNeeded writes v so that ParseEnvFile reads it back unchanged: bare
+// when it is plain, in single quotes (taken as is) when it has blanks, `#` or
+// double quotes, in double quotes with \\ and \" escaped when it holds a
+// single quote or a backslash.
 func quoteIfNeeded(v string) string {
-	if v == "" || strings.ContainsAny(v, " #\"'\t") || strings.HasPrefix(v, "'") {
-		return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+	switch {
+	case strings.ContainsAny(v, `'\`):
+		return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v) + `"`
+	case v == "" || strings.ContainsAny(v, " #\"\t"):
+		return "'" + v + "'"
 	}
 	return v
 }

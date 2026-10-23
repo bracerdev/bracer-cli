@@ -3,7 +3,7 @@ package drill
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"regexp"
@@ -11,8 +11,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"filippo.io/age"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -208,6 +206,9 @@ func (f *fakeDocker) exec(a []string, c pg.Cmd) (pg.Result, error) {
 
 // tool emulates pg_isready, psql and pg_restore inside a container; db is PGDATABASE.
 func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db string, c pg.Cmd) (pg.Result, error) {
+	if tool == "psql" && hasArg(args, "-0") && c.Stdout != nil {
+		c.Stdout = psqlRows{c.Stdout}
+	}
 	write := func(s string) {
 		if c.Stdout != nil {
 			io.WriteString(c.Stdout, s)
@@ -383,9 +384,22 @@ func (m *memStore) Delete(context.Context, string) error                   { ret
 
 func i64(n int64) *int64 { return &n }
 
-// seed writes the manifest + objects for app shop/instance main with database shop
-// (tables orders rows 500, events rows_est 83000, empty rows 0) and globals.
-func seed(t *testing.T, st *memStore, recipient string) {
+// The app's folder in the bucket, the place that writes it (ADR-0023) and
+// the run the tests drill.
+const (
+	testFolder = "shop-7f3k2q"
+	testRoot   = "bracer/" + testFolder + "/"
+	testTS     = "2026-10-16T030000Z"
+)
+
+var here = backup.Writer{ID: "1111222233334444", Hostname: "vps-1", Path: "/home/deploy/.config/bracer/shop"}
+
+// seed writes the run testTS of app shop to the bucket the way backup lays it
+// out (ADR-0026): app.yaml, then for instance main the dump of database shop
+// (tables orders rows 500, events rows_est 83000, empty rows 0), globals and
+// the environment file, then run.json. It returns the run as drill gets it
+// from backup: loaded back, keys filled in.
+func seed(t *testing.T, st *memStore, recipient string) *backup.Run {
 	t.Helper()
 	ctx := context.Background()
 	put := func(key, content string) {
@@ -402,39 +416,89 @@ func seed(t *testing.T, st *memStore, recipient string) {
 		}
 		st.Put(ctx, key, &buf, int64(buf.Len()))
 	}
+	enc := recipient != ""
 	var rp *string
-	if recipient != "" {
+	if enc {
 		rp = &recipient
 	}
-	put("bracer/shop/main/shop/2026-10-16T030000Z.dump", "PGDMP-shop")
-	put("bracer/shop/main/globals/2026-10-16T030000Z.sql", "CREATE ROLE postgres;\nCREATE ROLE app;\n")
-	m := &backup.Manifest{App: "shop", Instances: map[string]*backup.InstanceManifest{
-		"main": {PgVersion: "17.6", Databases: map[string]*backup.DatabaseManifest{
-			"shop": {Latest: "2026-10-16T030000Z", Dumps: []*backup.Dump{{
-				TS: "2026-10-16T030000Z", Key: "bracer/shop/main/shop/2026-10-16T030000Z.dump", Bytes: 10, Encrypted: recipient != "", Recipient: rp,
+	ext := ""
+	if enc {
+		ext = ".age"
+	}
+	appYAML, err := config.Marshal(baseCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := json.Marshal(&pg.Env{Schema: pg.EnvSchema, SourceKind: "container", ServerVersionNum: 170006, ServerVersion: "17.6", BootstrapSuperuser: "postgres", Superuser: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := backup.RunDir(testRoot, testTS)
+	put(dir+"app.yaml"+ext, string(appYAML))
+	put(dir+"main/shop.dump"+ext, "PGDMP-shop")
+	put(dir+"main/globals.sql"+ext, "CREATE ROLE postgres;\nCREATE ROLE app;\n")
+	put(dir+"main/env.json"+ext, string(env))
+	run := &backup.Run{App: "shop", TS: testTS, Writer: here,
+		Backup:  backup.Outcome{Result: backup.ResultOK, Reasons: []string{}},
+		AppYAML: &backup.Dump{Bytes: int64(len(appYAML))},
+		Instances: map[string]*backup.RunInstance{"main": {
+			Kind: "container", PgVersion: "17.6", ToolVersion: "17.6", SystemID: config.SystemIDNone, Encrypted: enc, Recipient: rp, Missing: []string{},
+			Env:     &backup.Dump{Bytes: int64(len(env))},
+			Globals: &backup.Dump{Bytes: 42, HasPasswords: true},
+			Databases: map[string]*backup.Dump{"shop": {
+				Bytes:  10,
 				Locale: &pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C.UTF-8"},
 				Tables: []pg.Table{
 					{Schema: "public", Name: "orders", Rows: i64(500)},
 					{Schema: "public", Name: "events", RowsEst: i64(83_000)},
 					{Schema: "public", Name: "empty", Rows: i64(0)},
 				},
-			}}},
-		}, Globals: backup.GlobalsManifest{Latest: "2026-10-16T030000Z", HasPasswords: true, Dumps: []*backup.Dump{{
-			TS: "2026-10-16T030000Z", Key: "bracer/shop/main/globals/2026-10-16T030000Z.sql", Encrypted: recipient != "", Recipient: rp,
-		}}}},
-	}}
-	if err := backup.SaveManifest(ctx, st, "bracer/shop/manifest.json", m, time.Now()); err != nil {
+			}},
+		}},
+	}
+	data, err := json.Marshal(run)
+	if err != nil {
 		t.Fatal(err)
 	}
+	st.Put(ctx, backup.RunKey(testRoot, testTS), bytes.NewReader(data), int64(len(data)))
+	run, err = backup.LoadRun(ctx, st, testRoot, testTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The keys the loaded run points at must be the objects written above:
+	// the layout the test assumes is the one backup writes.
+	ri := run.Instances["main"]
+	for _, dp := range []*backup.Dump{run.AppYAML, ri.Env, ri.Globals, ri.Databases["shop"]} {
+		if dp.Key == "" || dp.Encrypted != enc {
+			t.Fatalf("loaded run: key %q encrypted %v", dp.Key, dp.Encrypted)
+		}
+		if _, ok := st.objects[dp.Key]; !ok {
+			t.Fatalf("loaded run points at %s, which was not written", dp.Key)
+		}
+	}
+	return run
 }
 
 func baseCfg() *config.App {
 	return &config.App{
-		App:        "shop",
-		Instances:  []config.Instance{{Name: "main", Container: "shop-db", User: "postgres", PgMajor: 17, Databases: config.Databases{All: true}}},
-		Storage:    &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Prefix: "bracer", AccessKeyEnv: "A", SecretKeyEnv: "S"},
-		Encryption: "none",
+		App:         "shop",
+		SecretsFile: "/home/deploy/.config/bracer/shop/secrets.env",
+		Instances:   []config.Instance{{Name: "main", Connection: config.Connection{Container: "shop-db", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone}, Databases: config.Databases([]config.Database{{Name: "shop"}})}},
+		Storage:     &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Folder: testFolder, AccessKeyEnv: "A", SecretKeyEnv: "S"},
+		Encryption:  "none",
+		Schedule:    &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		Runtime:     &config.Runtime{User: "deploy", Path: "/usr/bin:/bin", Docker: "/usr/bin/docker"},
 	}
+}
+
+// withSide adds a second instance, side, to cfg, with drill off when off.
+func withSide(cfg *config.App, off bool) *config.App {
+	side := cfg.Instances[0]
+	side.Name, side.Container = "side", "side-db"
+	side.Drill = nil
+	side.SetDrillOff(off)
+	cfg.Instances = append(cfg.Instances, side)
+	return cfg
 }
 
 func deps(f *fakeDocker, st storage.Store) Deps {
@@ -453,6 +517,27 @@ func depsFor(sh pg.Shell, st storage.Store) Deps {
 	}
 }
 
+// containersStarted counts the `docker run` calls that start a container.
+func containersStarted(f *fakeDocker) int {
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "run ") && !strings.Contains(c, " df ") {
+			n++
+		}
+	}
+	return n
+}
+
+// backupResult is the backup's result for cfg, every instance dumped, the
+// way backup.Run hands it to the drill step.
+func backupResult(cfg *config.App) *backup.Result {
+	res := &backup.Result{Kind: "backup", App: cfg.App, TS: testTS, OK: true}
+	for _, in := range cfg.Instances {
+		res.Instances = append(res.Instances, &backup.InstanceResult{Name: in.Name, OK: true, Missing: []string{}})
+	}
+	return res
+}
+
 func TestWithinTolerance(t *testing.T) {
 	for _, tc := range []struct {
 		exp, found int64
@@ -467,75 +552,227 @@ func TestWithinTolerance(t *testing.T) {
 	}
 }
 
-func TestDrillNoBackupYet(t *testing.T) {
-	_, err := Run(context.Background(), baseCfg(), deps(newFakeDocker(), newMemStore()))
-	if err == nil || !strings.Contains(err.Error(), "run bracer backup first") {
-		t.Errorf("err = %v", err)
-	}
-}
-
-// The `postgres` dump is not restored straight into the existing `postgres` database
-// (the image may have written into it) but into bracer_drill_postgres created from template0.
-// Extensions in the manifest: the image is chosen by the mapping table; missing in
-// the image → the database fails before create database (spec drill § Flow 3a–3b).
-// spec drill AC: drill.runtime: none → UsageError before anything, --runtime docker overrides.
+// spec backup § Drill: every instance with drill.runtime: none → nothing is
+// drilled: no Docker, a result with no instance, and run.json records off.
 func TestDrillOff(t *testing.T) {
-	st := newMemStore()
-	seed(t, st, "")
 	cfg := baseCfg()
-	cfg.Drill = &config.Drill{Runtime: config.DrillRuntimeNone}
+	cfg.Instances[0].SetDrillOff(true)
+	st := newMemStore()
+	run := seed(t, st, "")
 	f := newFakeDocker()
-	_, err := Run(context.Background(), cfg, deps(f, st))
-	var ue *UsageError
-	if !errors.As(err, &ue) || !strings.Contains(err.Error(), "drill is off for app shop (drill.runtime: none)") || len(f.calls) != 0 {
-		t.Fatalf("off: err=%v calls=%v", err, f.calls)
+	res, err := Run(context.Background(), cfg, run, deps(f, st))
+	if err != nil || res == nil || !res.OK || len(res.Instances) != 0 || len(f.calls) != 0 {
+		t.Fatalf("off: res=%+v err=%v calls=%v", res, err, f.calls)
 	}
-	if _, err := DryRun(context.Background(), cfg, deps(f, st)); !errors.As(err, &ue) {
-		t.Errorf("dry-run off: %v", err)
+
+	bres := backupResult(cfg)
+	Step(cfg, deps(f, st), nil)(context.Background(), run, bres)
+	d := run.Instances["main"].Drill
+	if d == nil || d.Result != backup.DrillOff || len(d.Reasons) != 0 || !d.At.IsZero() {
+		t.Errorf("run.json drill: %+v", d)
 	}
-	d := deps(f, st)
-	d.ForceDocker = true
-	// The seeded backup predates ADR-0015: drill runs, and says why it cannot drill it.
-	if res, err := Run(context.Background(), cfg, d); err != nil || res.OK || res.Instances[0].Error != "the latest backup has no environment record; run bracer backup with this version first" {
-		t.Errorf("--runtime docker: %v %+v", err, res)
+	if ir := bres.Instance("main"); ir.DrillFailed != nil || ir.Drill != nil || len(f.calls) != 0 {
+		t.Errorf("backup result: %+v calls=%v", ir, f.calls)
 	}
 }
 
-// spec drill AC: a dump from a newer major than pg_major fails before any container;
-// the result names the system_id of the dumps tried.
-// spec drill AC "--dry-run": no container; no backup yet is not a failure; Docker or key problems fail with a Fix.
-func TestDrillDryRun(t *testing.T) {
+// Docker not answering is the one error Run returns: no instance could start,
+// so the result has none, and the step fails every instance that is on with it.
+func TestDrillNoDocker(t *testing.T) {
+	st := newMemStore()
+	run := seed(t, st, "")
 	f := newFakeDocker()
-	res, err := DryRun(context.Background(), baseCfg(), deps(f, newMemStore()))
-	if err != nil || !res.OK || len(res.Checks) != 2 || res.Checks[1].Detail != "no backup yet" {
-		t.Fatalf("empty bucket: %v %+v", err, res)
+	f.noDocker = true
+	cfg := withSide(baseCfg(), true)
+	res, err := Run(context.Background(), cfg, run, deps(f, st))
+	if err == nil || !strings.HasPrefix(err.Error(), "Docker is not available for the temporary Postgres: ") || !strings.Contains(err.Error(), "Cannot connect to the Docker daemon") || !strings.HasSuffix(err.Error(), "\nFix: bracer remove shop, then bracer init shop") {
+		t.Fatalf("err = %v", err)
 	}
-	for _, c := range f.calls {
-		if !strings.HasPrefix(c, "info") {
-			t.Errorf("dry-run ran %s", c)
+	if res == nil || res.OK || len(res.Instances) != 0 || res.TS != testTS || res.App != "shop" {
+		t.Fatalf("res = %+v", res)
+	}
+
+	run.Instances["side"] = &backup.RunInstance{Kind: "container", Missing: []string{}, Databases: map[string]*backup.Dump{}}
+	bres := backupResult(cfg)
+	Step(cfg, deps(f, st), nil)(context.Background(), run, bres)
+	d := run.Instances["main"].Drill
+	if d == nil || d.Result != backup.DrillFailed || len(d.Reasons) != 1 || d.Reasons[0] != err.Error() || d.At.IsZero() {
+		t.Errorf("run.json drill: %+v", d)
+	}
+	if ir := bres.Instance("main"); len(ir.DrillFailed) != 1 || ir.DrillFailed[0] != err.Error() || ir.Drill != nil {
+		t.Errorf("backup result: %+v", ir)
+	}
+	if d := run.Instances["side"].Drill; d == nil || d.Result != backup.DrillOff {
+		t.Errorf("side: %+v", d)
+	}
+	if bres.Instance("side").DrillFailed != nil {
+		t.Errorf("side must not fail: %+v", bres.Instance("side"))
+	}
+}
+
+// ADR-0016, ADR-0019: the run must hold every database its own app.yaml
+// names; one that does not fails the instance before any container, naming
+// what is missing. Whether backup recorded it in run.json or the run's
+// app.yaml names a database the run has no dump of, drilling the data that
+// is there would pass on a backup that is not whole.
+func TestDrillRunIncomplete(t *testing.T) {
+	const want = "the run is missing auth; nothing to test-restore"
+	for name, prepare := range map[string]func(t *testing.T, st *memStore, run *backup.Run){
+		"recorded in run.json": func(t *testing.T, st *memStore, run *backup.Run) {
+			run.Instances["main"].Missing = []string{"auth"}
+		},
+		"named by the run's app.yaml": func(t *testing.T, st *memStore, run *backup.Run) {
+			runCfg := baseCfg()
+			runCfg.Instances[0].Databases = []config.Database{{Name: "shop"}, {Name: "auth"}}
+			data, err := config.Marshal(runCfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st.Put(context.Background(), run.AppYAML.Key, bytes.NewReader(data), int64(len(data)))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newMemStore()
+			run := seed(t, st, "")
+			prepare(t, st, run)
+			f := newFakeDocker()
+			res, err := Run(context.Background(), baseCfg(), run, deps(f, st))
+			if err != nil || res.OK || len(res.Instances) != 1 {
+				t.Fatalf("err = %v, res = %+v", err, res)
+			}
+			ir := res.Instances[0]
+			if ir.Name != "main" || ir.Result != backup.DrillFailed || ir.OK || ir.Error != want || len(ir.Databases) != 0 {
+				t.Errorf("instance: %+v", ir)
+			}
+			if containersStarted(f) != 0 {
+				t.Errorf("no container may start: %v", f.calls)
+			}
+		})
+	}
+}
+
+// ADR-0019: the run has nothing of the instance (its backup failed): drill
+// fails it instead of passing an older run.
+func TestDrillRunLacksInstance(t *testing.T) {
+	st := newMemStore()
+	run := seed(t, st, "")
+	delete(run.Instances, "main")
+	f := newFakeDocker()
+	res, err := Run(context.Background(), baseCfg(), run, deps(f, st))
+	if err != nil || res.OK || len(res.Instances) != 1 {
+		t.Fatalf("err = %v, res = %+v", err, res)
+	}
+	ir := res.Instances[0]
+	if ir.Name != "main" || ir.Result != backup.DrillFailed || ir.Error != "the run has nothing of this instance" || containersStarted(f) != 0 {
+		t.Errorf("instance: %+v calls=%v", ir, f.calls)
+	}
+}
+
+// ADR-0019: an instance with drill off, or one the caller leaves out (the
+// preflight of init), is not in the result; the others are drilled.
+func TestDrillSkipsInstanceOff(t *testing.T) {
+	st := newMemStore()
+	run := seed(t, st, "")
+	run.Instances["main"].Missing = []string{"auth"} // main fails fast, without a container
+	cfg := withSide(baseCfg(), true)
+	f := newFakeDocker()
+	res, err := Run(context.Background(), cfg, run, deps(f, st))
+	if err != nil || res.OK || len(res.Instances) != 1 || res.Instances[0].Name != "main" || res.Instance("side") != nil {
+		t.Fatalf("drill off: err = %v, res = %+v", err, res)
+	}
+
+	d := deps(f, st)
+	d.SkipInstances = []string{"main"}
+	f.calls = nil
+	res, err = Run(context.Background(), cfg, run, d)
+	if err != nil || !res.OK || len(res.Instances) != 0 || len(f.calls) != 0 {
+		t.Fatalf("skipped: err = %v, res = %+v calls=%v", err, res, f.calls)
+	}
+}
+
+// ADR-0026: the drill step records the outcome of each instance where the
+// backup keeps it: run.json (result, when, how long, why) and the backup's
+// result (what fails the run, the drill's own detail for --json), and hands
+// its own result to the caller.
+func TestStep(t *testing.T) {
+	st := newMemStore()
+	run := seed(t, st, "")
+	run.Instances["main"].Missing = []string{"auth"}
+	run.Instances["side"] = &backup.RunInstance{Kind: "container", Missing: []string{}, Databases: map[string]*backup.Dump{}}
+	cfg := withSide(baseCfg(), true)
+	f := newFakeDocker()
+	f.orphans = []string{"deadbeef"}
+	var kept *Result
+	bres := backupResult(cfg)
+	Step(cfg, deps(f, st), func(r *Result) { kept = r })(context.Background(), run, bres)
+
+	if kept == nil || kept.Kind != "drill" || kept.App != "shop" || kept.TS != testTS || kept.OK || len(kept.Instances) != 1 {
+		t.Fatalf("kept: %+v", kept)
+	}
+	if !kept.FinishedAt.After(kept.StartedAt) {
+		t.Errorf("times: %v %v", kept.StartedAt, kept.FinishedAt)
+	}
+	x := kept.Instance("main")
+	d := run.Instances["main"].Drill
+	if d == nil || d.Result != backup.DrillFailed || !d.At.Equal(kept.StartedAt) || d.TookSeconds != x.TookSeconds || d.TookSeconds <= 0 {
+		t.Errorf("run.json main: %+v", d)
+	}
+	if want := []string{"the run is missing auth; nothing to test-restore"}; !equalStrings(d.Reasons, want) {
+		t.Errorf("reasons: %v", d.Reasons)
+	}
+	ir := bres.Instance("main")
+	if !equalStrings(ir.DrillFailed, d.Reasons) || ir.Drill != x {
+		t.Errorf("backup result main: failed=%v drill=%+v", ir.DrillFailed, ir.Drill)
+	}
+	if !equalStrings(bres.Failures(), []string{"main: drill: the run is missing auth; nothing to test-restore"}) {
+		t.Errorf("failures: %v", bres.Failures())
+	}
+	if s := run.Instances["side"].Drill; s == nil || s.Result != backup.DrillOff {
+		t.Errorf("run.json side: %+v", s)
+	}
+	if side := bres.Instance("side"); side.DrillFailed != nil || side.Drill != nil {
+		t.Errorf("backup result side: %+v", side)
+	}
+	// What the drill warns about reaches the backup's result.
+	if want := []string{"removed 1 leftover drill container(s) and 0 volume(s) from a previous run"}; !equalStrings(bres.Warnings, want) || !equalStrings(kept.Warnings, want) {
+		t.Errorf("warnings: backup %v drill %v", bres.Warnings, kept.Warnings)
+	}
+	if !equalStrings(f.removed, []string{"deadbeef"}) {
+		t.Errorf("orphans removed: %v", f.removed)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-
-	st := newMemStore()
-	seed(t, st, "")
-	f.noDocker = true
-	res, _ = DryRun(context.Background(), baseCfg(), deps(f, st))
-	if res.OK || res.Checks[0].OK || res.Checks[0].Fix != "bracer check" || !strings.Contains(res.Checks[1].Detail, "shop 2026-10-16T030000Z") {
-		t.Errorf("no docker: %+v", res.Checks)
-	}
-
-	cfg := baseCfg()
-	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", "age1other", "/keys/shop.key"
-	d := deps(newFakeDocker(), st)
-	d.ReadIdentities = func(string) ([]age.Identity, []string, error) { return nil, []string{"age1mine"}, nil }
-	res, _ = DryRun(context.Background(), cfg, d)
-	if res.OK || res.Checks[1].Name != "age key" || !strings.Contains(res.Checks[1].Detail, "no key for age_recipient age1other") {
-		t.Errorf("key: %+v", res.Checks)
-	}
+	return true
 }
 
-// spec fetch-restore AC (drill): the temporary database gets the archive's
-// owner and settings, read back with restore's code; a setting that does not
-// apply fails the database and names it.
-// ADR-0014: the temporary Postgres preloads the libraries of the extensions the
-// databases use (from the manifest), not the source's other libraries.
+// psqlRows turns the newline-ended rows the fakes print into what psql -0
+// prints: each row ended by a NUL. The session marker line keeps its newline.
+type psqlRows struct{ w io.Writer }
+
+func (p psqlRows) Write(b []byte) (int, error) {
+	if bytes.HasPrefix(b, []byte("__BRACER_END__")) || bytes.IndexByte(b, 0) >= 0 {
+		return p.w.Write(b)
+	}
+	if _, err := p.w.Write(bytes.ReplaceAll(b, []byte("\n"), []byte{0})); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func hasArg(args []string, a string) bool {
+	for _, x := range args {
+		if x == a {
+			return true
+		}
+	}
+	return false
+}

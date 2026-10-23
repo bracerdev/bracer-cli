@@ -16,7 +16,7 @@ import (
 // DATABASE … SET, comment, privileges) live in archive entries pg_restore only
 // applies with --create. Bracer creates the database itself, so it reads those
 // entries from the archive's start and applies them after the data
-// (spec fetch-restore § Flow 5b).
+// (spec restore § Flow 5b).
 
 // MaxTOC is how much of the archive's start is kept in memory: the table of
 // contents sits there and these entries need no data.
@@ -90,17 +90,6 @@ type Attributes struct {
 
 	acl []aclStmt
 }
-
-// AttrResult is the outcome after applying and checking (`--json`: "attributes").
-type AttrResult struct {
-	Owner      string   `json:"owner,omitempty"`
-	Applied    int      `json:"applied"`
-	Mismatches []string `json:"attribute_mismatches,omitempty"`
-	Error      string   `json:"error,omitempty"`
-}
-
-// OK when every attribute read back matches the archive.
-func (r *AttrResult) OK() bool { return r == nil || (r.Error == "" && len(r.Mismatches) == 0) }
 
 // ParseDatabaseSQL keeps the statements listed in spec § Flow 5b, rebuilt from
 // tokens with the source name swapped for target. roles are the names on the
@@ -349,94 +338,6 @@ func describe(toks []token) string {
 	return out
 }
 
-// Apply runs the statements on the target's postgres database, each on its own
-// (ON_ERROR_STOP=0: a setting of an extension not loaded there does not take
-// the owner with it). Errors come back as warnings.
-func (a *Attributes) Apply(ctx context.Context, runner pg.Runner, conn pg.Conn) (applied int, warnings []string) {
-	if len(a.Statements) == 0 {
-		return 0, nil
-	}
-	conn.Database = "postgres"
-	sql := strings.Join(a.Statements, ";\n") + ";\n"
-	stderr, err := pg.RunCapture(ctx, runner, conn, "psql", []string{"-X", "-q", "-v", "ON_ERROR_STOP=0", "-f", "-"}, strings.NewReader(sql), io.Discard)
-	failed := 0
-	for _, line := range strings.Split(string(stderr), "\n") {
-		if strings.Contains(line, "ERROR:") {
-			failed++
-			warnings = append(warnings, "database attributes: "+strings.TrimSpace(line))
-		}
-	}
-	if err != nil && failed == 0 {
-		warnings = append(warnings, "database attributes: psql: "+firstLineOf(err.Error()))
-		return 0, warnings
-	}
-	return len(a.Statements) - failed, warnings
-}
-
-// Verify reads owner, settings and privileges back from the target and lists
-// what differs from the archive. admin is connected to any database there.
-func (a *Attributes) Verify(ctx context.Context, admin *pg.Client) ([]string, error) {
-	db := pg.QuoteLiteral(a.Target)
-	var out []string
-	rows, err := admin.Query(ctx, "select pg_get_userbyid(datdba) from pg_database where datname = "+db)
-	if err != nil {
-		return nil, fmt.Errorf("read owner: %w", err)
-	}
-	if len(rows) == 0 || len(rows[0]) == 0 {
-		return nil, fmt.Errorf("database %s not found", a.Target)
-	}
-	owner := rows[0][0]
-	if a.Owner != "" && owner != a.Owner {
-		out = append(out, fmt.Sprintf("owner is %s, the archive has %s", owner, a.Owner))
-	}
-
-	if len(a.Settings) > 0 {
-		rows, err = admin.Query(ctx, "select coalesce(r.rolname, ''), c from pg_db_role_setting s join pg_database d on d.oid = s.setdatabase left join pg_roles r on r.oid = s.setrole, unnest(s.setconfig) c where d.datname = "+db)
-		if err != nil {
-			return nil, fmt.Errorf("read settings: %w", err)
-		}
-		have := map[string]string{}
-		for _, r := range rows {
-			if len(r) < 2 {
-				continue
-			}
-			name, val, _ := strings.Cut(r[1], "=")
-			have[r[0]+"\x00"+strings.ToLower(name)] = val
-		}
-		for _, s := range a.Settings {
-			who := ""
-			if s.Role != "" {
-				who = " for user " + s.Role
-			}
-			got, ok := have[s.Role+"\x00"+strings.ToLower(s.Name)]
-			switch {
-			case !ok:
-				out = append(out, fmt.Sprintf("setting %s%s is missing", s.Name, who))
-			case normSetting(got) != normSetting(s.Value):
-				out = append(out, fmt.Sprintf("setting %s%s is %q, the archive has %q", s.Name, who, got, s.Value))
-			}
-		}
-	}
-
-	if a.ACL {
-		rows, err = admin.Query(ctx, "select case when a.grantee = 0 then 'PUBLIC' else pg_get_userbyid(a.grantee) end, a.privilege_type from pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a where d.datname = "+db)
-		if err != nil {
-			return nil, fmt.Errorf("read privileges: %w", err)
-		}
-		got := map[string]bool{}
-		for _, r := range rows {
-			if len(r) >= 2 {
-				got[r[0]+" "+r[1]] = true
-			}
-		}
-		want := a.expectedACL(owner)
-		if g, w := privList(got), privList(want); g != w {
-			out = append(out, fmt.Sprintf("privileges are %s, the archive has %s", g, w))
-		}
-	}
-	return out, nil
-}
-
 // expectedACL replays the GRANT/REVOKE statements on acldefault for a database:
 // the owner holds every privilege, PUBLIC has CONNECT and TEMPORARY.
 func (a *Attributes) expectedACL(owner string) map[string]bool {
@@ -496,47 +397,6 @@ func firstLineOf(s string) string {
 		return s[:i]
 	}
 	return s
-}
-
-// Finish applies the attributes and reads them back (after the data and the
-// table comparison). conn is the target server; any database is fine.
-func (a *Attributes) Finish(ctx context.Context, runner pg.Runner, conn pg.Conn) (*AttrResult, []string) {
-	res := &AttrResult{Owner: a.Owner}
-	applied, warnings := a.Apply(ctx, runner, conn)
-	res.Applied = applied
-	admin := &pg.Client{Runner: runner, Conn: conn}
-	admin.Conn.Database = "postgres"
-	mm, err := a.Verify(ctx, admin)
-	if err != nil {
-		res.Error = "check database attributes: " + err.Error()
-	}
-	res.Mismatches = mm
-	return res, warnings
-}
-
-// PrepareAttributes is the part before the data: read the database's entries
-// from head and filter them against the target's roles. A failure is not fatal
-// (the data is still restored): it comes back as a warning and nil.
-func PrepareAttributes(ctx context.Context, runner pg.Runner, conn pg.Conn, head []byte, target string, extra []string) (*Attributes, []string) {
-	sql, err := DatabaseSQL(ctx, runner, conn, head, extra)
-	if err != nil {
-		return nil, []string{"database attributes (owner, settings, privileges) not applied: " + err.Error()}
-	}
-	admin := &pg.Client{Runner: runner, Conn: conn}
-	admin.Conn.Database = "postgres"
-	names, err := ListRoles(ctx, admin)
-	if err != nil {
-		return nil, []string{"database attributes not applied: list users on target: " + err.Error()}
-	}
-	roles := map[string]bool{}
-	for _, n := range names {
-		roles[n] = true
-	}
-	a, err := ParseDatabaseSQL(sql, target, roles)
-	if err != nil {
-		return nil, []string{"database attributes not applied: " + err.Error()}
-	}
-	return a, a.Warnings
 }
 
 // SettingsOnly keeps only ALTER DATABASE … SET (how the data reads: TimeZone,

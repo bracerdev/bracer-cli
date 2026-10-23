@@ -59,7 +59,7 @@ func TestIntegrationContainer(t *testing.T) {
 	if err != nil || major < 10 {
 		t.Fatal(num, major, err)
 	}
-	dbs, err := cl.ListDatabases(ctx)
+	dbs, err := cl.ListCandidates(ctx)
 	if err != nil || len(dbs) == 0 {
 		t.Fatal(dbs, err)
 	}

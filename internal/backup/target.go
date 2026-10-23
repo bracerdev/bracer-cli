@@ -1,4 +1,4 @@
-// Package backup is the pipeline dump → [age] → bucket → manifest → retention
+// Package backup is the pipeline dump → [age] → bucket → run.json → retention
 // (spec backup/backup). The CLI only parses flags and prints the result.
 package backup
 
@@ -68,9 +68,6 @@ func Target(in config.Instance, s *config.Secrets) (pg.Where, pg.Conn, error) {
 			return pg.Where{}, conn, fmt.Errorf("instance %s: %s: %w", in.Name, in.URLEnv, err)
 		}
 		return pg.Where{}, conn, nil
-	}
-	if legacy := in.Legacy(); legacy != "" {
-		return pg.Where{}, pg.Conn{}, fmt.Errorf("instance %s: %s no longer supported (ADR-0013)", in.Name, legacy)
 	}
 	return pg.Where{}, pg.Conn{}, fmt.Errorf("instance %s: invalid connection", in.Name)
 }

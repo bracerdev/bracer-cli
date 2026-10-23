@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,33 +12,36 @@ import (
 	"bracer.dev/bracer/internal/crypto"
 )
 
-// rotateFixture creates an app.yaml with age encryption and a key file in a temp directory.
+// rotateFixture creates app shop with age encryption and its age.key in the test's home.
 func rotateFixture(t *testing.T) (cfgPath, keyPath string, kp crypto.Keypair) {
 	t.Helper()
-	dir := t.TempDir()
+	home := testHome(t)
 	kp, err := crypto.Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyPath = filepath.Join(dir, "shop.key")
+	keyPath = filepath.Join(config.AppDir(home, "shop"), config.KeyFile)
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := crypto.WriteIdentityFile(keyPath, kp); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.App{App: "shop", Encryption: "age", AgeRecipient: kp.Recipient, AgeIdentityFile: keyPath,
-		Instances: []config.Instance{{Name: "main", Container: "db", User: "postgres", Databases: config.Databases{All: true}}}}
-	cfgPath = filepath.Join(dir, "app.yaml")
-	if err := config.Save(cfgPath, cfg); err != nil {
-		t.Fatal(err)
-	}
-	return cfgPath, keyPath, kp
+	cfg := testApp(home, "shop")
+	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", kp.Recipient, keyPath
+	return writeApp(t, cfg), keyPath, kp
 }
 
 func TestRotateKey(t *testing.T) {
 	cfgPath, keyPath, old := rotateFixture(t)
 	var out, errb bytes.Buffer
-	code := runRotateKey(context.Background(), []string{"-c", cfgPath}, strings.NewReader("y\n"), &out, &errb)
+	code := runRotateKey(context.Background(), []string{"shop"}, strings.NewReader("y\nlater\ncopied\n"), &out, &errb)
 	if code != exitOK {
 		t.Fatalf("code=%d err=%s", code, errb.String())
+	}
+	s := out.String()
+	if strings.Count(s, "Type copied when done") != 2 {
+		t.Errorf("the new key must be confirmed copied (ADR-0022):\n%s", s)
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -55,12 +57,12 @@ func TestRotateKey(t *testing.T) {
 	if st, _ := os.Stat(keyPath); st.Mode().Perm() != 0o600 {
 		t.Errorf("key file mode %v", st.Mode().Perm())
 	}
-	s := out.String()
-	if !strings.Contains(s, cfg.AgeRecipient) || !strings.Contains(s, "1 older key(s) kept") || !strings.Contains(s, "AGE-SECRET-KEY-1") {
+	if !strings.Contains(s, "New public key:  "+cfg.AgeRecipient) || !strings.Contains(s, "1 older key(s) kept") {
 		t.Errorf("output:\n%s", s)
 	}
-	if strings.Contains(s, old.Identity) {
-		t.Error("old private key must not be printed")
+	// The private key is never printed: age.key is the rescue card (ADR-0022).
+	if strings.Contains(s+errb.String(), "AGE-SECRET-KEY") {
+		t.Errorf("a private key was printed:\n%s\n%s", s, errb.String())
 	}
 	// Old backups (old key) and new ones both decrypt with the key file.
 	for _, r := range []string{old.Recipient, cfg.AgeRecipient} {
@@ -72,80 +74,100 @@ func TestRotateKey(t *testing.T) {
 
 func TestRotateKeyDeclineAndGuards(t *testing.T) {
 	cfgPath, keyPath, old := rotateFixture(t)
+	run := func(in string, args ...string) (int, string) {
+		var out, errb bytes.Buffer
+		code := runRotateKey(context.Background(), args, strings.NewReader(in), &out, &errb)
+		return code, errb.String()
+	}
+	untouched := func(what string) {
+		t.Helper()
+		if _, recips, _ := crypto.ReadIdentities(keyPath); len(recips) != 1 {
+			t.Errorf("%s: the key file must not change", what)
+		}
+		if cfg, _ := config.Load(cfgPath); cfg == nil || cfg.AgeRecipient != old.Recipient {
+			t.Errorf("%s: app.yaml must not change", what)
+		}
+	}
+	// Answer n, or no answer: nothing is written.
+	for _, in := range []string{"n\n", ""} {
+		if code, err := run(in, "shop"); code != exitError || !strings.Contains(err, "not rotated") {
+			t.Errorf("%q: code=%d err=%s", in, code, err)
+		}
+		untouched("declined")
+	}
+	// No flags, one app.
+	for _, args := range [][]string{{"shop", "--yes"}, {"shop", "--json"}, {"shop", "extra"}, {}} {
+		if code, _ := run("y\ncopied\n", args...); code != exitUsage {
+			t.Errorf("%v: code=%d", args, code)
+		}
+		untouched("usage")
+	}
+	// stdin a file that is not a terminal: nobody can confirm the copy.
+	f, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("y\ncopied\n")
+	f.Seek(0, 0)
+	defer f.Close()
 	var out, errb bytes.Buffer
-	// Answer n: nothing is written.
-	if code := runRotateKey(context.Background(), []string{"-c", cfgPath}, strings.NewReader("n\n"), &out, &errb); code != exitError {
-		t.Errorf("decline: code=%d", code)
+	if code := runRotateKey(context.Background(), []string{"shop"}, f, &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "run it in a terminal") {
+		t.Errorf("not a terminal: code=%d err=%s", code, errb.String())
 	}
-	if _, recips, _ := crypto.ReadIdentities(keyPath); len(recips) != 1 {
-		t.Error("declined rotation must not touch the key file")
-	}
-	cfg, _ := config.Load(cfgPath)
-	if cfg.AgeRecipient != old.Recipient {
-		t.Error("declined rotation must not touch app.yaml")
-	}
+	untouched("not a terminal")
 	// encryption: none → exit 2.
+	cfg, _ := config.Load(cfgPath)
 	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "none", "", ""
 	if err := config.Save(cfgPath, cfg); err != nil {
 		t.Fatal(err)
 	}
-	errb.Reset()
-	if code := runRotateKey(context.Background(), []string{"-c", cfgPath, "--yes"}, strings.NewReader(""), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "not enabled") {
-		t.Errorf("none: code=%d err=%s", code, errb.String())
-	}
-	// stdin ends while asking → exit 2 with a hint about --yes.
-	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", old.Recipient, keyPath
-	if err := config.Save(cfgPath, cfg); err != nil {
-		t.Fatal(err)
-	}
-	errb.Reset()
-	if code := runRotateKey(context.Background(), []string{"-c", cfgPath}, strings.NewReader(""), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "--yes") {
-		t.Errorf("no input: code=%d err=%s", code, errb.String())
-	}
-	// Extra argument → exit 2.
-	if code := runRotateKey(context.Background(), []string{"-c", cfgPath, "extra"}, strings.NewReader(""), &out, &errb); code != exitUsage {
-		t.Errorf("extra arg: code=%d", code)
+	if code, err := run("y\n", "shop"); code != exitUsage || !strings.Contains(err, "encryption is not enabled for this app\nFix: bracer remove shop, then bracer init shop") {
+		t.Errorf("none: code=%d err=%s", code, err)
 	}
 }
 
-func TestRotateKeyMissingFileAndJSON(t *testing.T) {
+// Rotating over a lost key would leave the old backups unopenable without
+// anyone noticing (ADR-0022): a missing key file, or one without the current
+// key, is refused before anything is asked or written.
+func TestRotateKeyRefusesMissingKey(t *testing.T) {
 	cfgPath, keyPath, old := rotateFixture(t)
 	os.Remove(keyPath)
 	var out, errb bytes.Buffer
-	// Without --yes, answer n to the question about creating a new file.
-	if code := runRotateKey(context.Background(), []string{"-c", cfgPath}, strings.NewReader("n\n"), &out, &errb); code != exitError {
-		t.Errorf("code=%d", code)
+	if code := runRotateKey(context.Background(), []string{"shop"}, strings.NewReader("y\ncopied\n"), &out, &errb); code != exitError || !strings.Contains(errb.String(), "is missing: backups made with "+old.Recipient+" cannot be opened without it") || !strings.Contains(errb.String(), "Fix: copy age.key back") {
+		t.Errorf("missing: code=%d err=%s", code, errb.String())
 	}
-	if _, err := os.Stat(keyPath); err == nil {
-		t.Error("declined: key file must not be created")
+	if _, err := os.Stat(keyPath); !os.IsNotExist(err) {
+		t.Error("a missing key file must not be created")
+	}
+	if strings.Contains(out.String(), "[y/N]") {
+		t.Errorf("nothing may be asked:\n%s", out.String())
+	}
+	other, _ := crypto.Generate()
+	if err := crypto.WriteIdentityFile(keyPath, other); err != nil {
+		t.Fatal(err)
 	}
 	errb.Reset()
-	out.Reset()
-	code := runRotateKey(context.Background(), []string{"-c", cfgPath, "--yes", "--json"}, strings.NewReader(""), &out, &errb)
-	if code != exitOK {
-		t.Fatalf("code=%d err=%s", code, errb.String())
+	if code := runRotateKey(context.Background(), []string{"shop"}, strings.NewReader("y\ncopied\n"), &out, &errb); code != exitError || !strings.Contains(errb.String(), "does not hold the key for "+old.Recipient) {
+		t.Errorf("wrong key: code=%d err=%s", code, errb.String())
 	}
-	if !strings.Contains(errb.String(), "is missing") {
-		t.Errorf("missing-file warning expected on stderr: %s", errb.String())
+	if _, recips, _ := crypto.ReadIdentities(keyPath); len(recips) != 1 {
+		t.Error("the key file must not change")
 	}
-	var res rotateResult
-	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
-		t.Fatalf("stdout must be JSON only: %v\n%s", err, out.String())
+	if cfg, _ := config.Load(cfgPath); cfg.AgeRecipient != old.Recipient {
+		t.Error("app.yaml must not change")
 	}
-	if res.Kind != "rotate-key" || !res.OK || len(res.OldRecipients) != 0 || res.NewRecipient == old.Recipient {
-		t.Errorf("%+v", res)
+}
+
+// Input ending at the copy question: the new key is already in use, and the
+// message says so.
+func TestRotateKeyCopyNotConfirmed(t *testing.T) {
+	cfgPath, _, old := rotateFixture(t)
+	var out, errb bytes.Buffer
+	if code := runRotateKey(context.Background(), []string{"shop"}, strings.NewReader("y\n"), &out, &errb); code != exitUsage || !strings.Contains(errb.String(), "the new key is in use: copy ") {
+		t.Errorf("code=%d err=%s", code, errb.String())
 	}
-	if strings.Contains(out.String(), "AGE-SECRET-KEY") {
-		t.Error("private key must never be in JSON")
-	}
-	if !strings.Contains(errb.String(), "AGE-SECRET-KEY-1") {
-		t.Error("with --json the private key goes to stderr once")
-	}
-	if _, recips, err := crypto.ReadIdentities(keyPath); err != nil || len(recips) != 1 || recips[0] != res.NewRecipient {
-		t.Errorf("new key file: %v %v", recips, err)
-	}
-	if st, _ := os.Stat(keyPath); st.Mode().Perm() != 0o600 {
-		t.Errorf("mode %v", st.Mode().Perm())
+	if cfg, _ := config.Load(cfgPath); cfg.AgeRecipient == old.Recipient {
+		t.Error("app.yaml must point at the new key once it is written")
 	}
 }
 
@@ -155,8 +177,7 @@ func TestWriteAtomicKeepsMode(t *testing.T) {
 	if err := os.WriteFile(p, []byte("app: x\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.App{App: "shop", Instances: []config.Instance{{Name: "main", Container: "db", User: "postgres", Databases: config.Databases{All: true}}}}
-	if err := config.Save(p, cfg); err != nil {
+	if err := config.Save(p, testApp(dir, "shop")); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := os.Stat(p); st.Mode().Perm() != 0o600 {

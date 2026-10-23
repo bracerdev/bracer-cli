@@ -7,446 +7,513 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
 
 	"golang.org/x/term"
 
-	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
-	"bracer.dev/bracer/internal/crypto"
 	"bracer.dev/bracer/internal/pg"
 	"bracer.dev/bracer/internal/restore"
 	"bracer.dev/bracer/internal/storage"
 )
 
-// multiFlag is a flag that can be repeated.
-type multiFlag []string
-
-func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
-func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
-
-// runRestore is `bracer restore` (spec backup/fetch-restore, ADR-0015).
+// runRestore is `bracer restore` (spec backup/restore, ADR-0022, ADR-0023):
+// one attended session that starts from the bucket, never from an app
+// directory on this machine. Every choice is asked; the only flag is --verbose.
 func runRestore(ctx context.Context, args []string, d backupDeps) int {
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
-	cfgPath := fs.String("c", "app.yaml", "path of app.yaml (missing: asked for, read from the bucket)")
-	envFile := fs.String("env-file", "", "dotenv file with secrets (overrides secrets_file, overridden by the environment)")
-	var o restore.Options
-	var dbs multiFlag
-	fs.StringVar(&o.Instance, "instance", "", "source instance in the bucket (default: the only one with backups)")
-	fs.Var(&dbs, "database", "source database to restore; repeat for several (default: every database of the run)")
-	fs.StringVar(&o.TS, "ts", "", "backup run as shown by fetch --list (default: the latest)")
-	fs.StringVar(&o.File, "file", "", "preview a file fetched earlier instead of the bucket")
-	fs.StringVar(&o.IntoContainer, "into-container", "", "target: name of a PostgreSQL container on this machine")
-	fs.IntVar(&o.IntoLocal, "into-local", 0, "target: port of PostgreSQL installed on this machine (over its socket)")
-	fs.StringVar(&o.SocketDir, "socket-dir", "", "with --into-local: socket directory (default /var/run/postgresql)")
-	fs.BoolVar(&o.IntoURL, "into-url", false, "target: ask for a postgres:// URL (not echoed, not stored)")
-	fs.StringVar(&o.IntoURLEnv, "into-url-env", "", "target: name of an environment variable holding a postgres:// URL")
-	fs.StringVar(&o.PasswordEnv, "password-env", "", "with --into-container or --into-local: environment variable holding the target superuser's password, when its socket asks for one")
-	fs.BoolVar(&o.Preview, "preview", false, "restore the data to look at only: no owners, privileges or users; CREATEDB is enough")
-	fs.StringVar(&o.SQLDir, "sql-dir", "", "directory for the env-up/env-down/data-down SQL (default ./bracer-restore-<app>-<instance>-<ts>)")
-	fs.BoolVar(&o.AppURL, "app-url", false, "after the load, ask for the app's URL and check it connects and reads the tables it can read (SELECT on the table, USAGE on its schema)")
-	fs.StringVar(&o.AppURLEnv, "app-url-env", "", "as --app-url, from an environment variable")
-	fs.BoolVar(&o.DryRun, "dry-run", false, "show source, target and the comparison; write and change nothing")
-	removedInto := fs.String("into", "", "removed: use --into-container, --into-local or --into-url")
-	removedSkip := fs.Bool("skip-disk-check", false, "removed: free disk is only a warning now")
-	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
 	verbose := fs.Bool("verbose", false, "log every docker and pg_* command")
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseArgs(fs, args)
+	if err != nil {
 		return exitUsage
 	}
-	o.Databases = dbs
 	fail := func(code int, format string, a ...interface{}) int {
 		fmt.Fprintf(d.stderr, "bracer restore: "+format+"\n", a...)
 		return code
 	}
-	if *removedInto != "" {
-		return fail(exitUsage, "--into was removed; use --into-container <name>, --into-local <port> or --into-url")
+	if len(pos) > 0 {
+		return fail(exitUsage, "restore takes no app name: it starts from the bucket")
 	}
-	if *removedSkip {
-		return fail(exitUsage, "--skip-disk-check was removed: free disk is only a warning now")
+	if !isTerminal(d.stdin) || !isTerminal(d.stdout) {
+		return fail(exitUsage, "restore needs a terminal")
 	}
 	logger := newLogger(d.stderr, *verbose)
-	if sh, ok := d.shell.(pg.ExecShell); ok {
-		sh.Verbose = *verbose
-		d.shell = sh
-	}
-
-	var cfg *config.App
-	var secrets *config.Secrets
-	var st storage.Store
-	if _, err := os.Stat(*cfgPath); errors.Is(err, os.ErrNotExist) && isTerminal(d.stdin) {
-		fmt.Fprintf(d.stderr, "%s not found: reading the app's configuration from its bucket (nothing is written to disk)\n", *cfgPath)
-		cfg, secrets, st, err = loadFromBucket(ctx, newPrompter(d.stdin, d.stderr), d)
-		if err != nil {
-			return fail(exitUsage, "%v", err)
+	d = d.verbose(*verbose)
+	// Docker, as step 0 of init: usable by this user; no systemd, no sudo.
+	if it, _, _ := checkDocker(ctx, defaultEnvDeps(d.shell)); !it.OK {
+		fmt.Fprintf(d.stderr, "bracer restore: %s\n", it.Detail)
+		for _, f := range it.Fix {
+			fmt.Fprintf(d.stderr, "Fix: %s\n", f)
 		}
-	} else {
-		var code int
-		cfg, secrets, st, code, err = loadAppAndStore(*cfgPath, *envFile, d, logger)
-		if err != nil {
-			return fail(code, "%v", err)
-		}
+		return exitUsage
 	}
-	d = d.withRuntime(cfg)
-	started := false
-	deps := restore.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, Timeout: cfg.DrillTimeout(),
-		AskURL:      askHidden(d.stdin, d.stderr, "Target URL (postgres://user:password@host:port/postgres, not shown, not stored): "),
-		AskAppURL:   askHidden(d.stdin, d.stderr, "The app's URL, exactly as the app uses it (not shown, not stored): "),
-		AskPassword: askHidden(d.stdin, d.stderr, "The target asks for a password. Password of its superuser (not shown, not stored): ")}
-	if !*asJSON {
-		deps.Started = func(res *restore.Result) {
-			started = true
-			printRestoreHead(d.stdout, res)
-			printChecks(d.stdout, res.Checks, false)
-			fmt.Fprintln(d.stdout, "loading the data…")
-		}
-	}
-	res, err := restore.Run(ctx, cfg, o, deps)
-	rerun := "bracer restore " + shellJoin(args)
+	r := &restoreRun{ctx: ctx, d: d, p: newPrompter(d.stdin, d.stdout), w: d.stdout, log: logger}
+	code, err := r.run()
 	if err != nil {
-		var ue *restore.UsageError
-		usage := errors.As(err, &ue) || errors.Is(err, restore.ErrPreflight)
-		if res != nil && errors.Is(err, restore.ErrPreflight) {
-			if *asJSON {
-				printJSON(d.stdout, res)
-			} else {
-				printRestoreHead(d.stdout, res)
-				printNotReady(d.stdout, res, rerun)
-			}
-			return exitUsage
+		if errors.Is(err, ErrNoInput) || errors.Is(err, errQuit) {
+			return fail(exitUsage, "nothing was loaded")
 		}
-		if res != nil && *asJSON {
-			res.Error = err.Error()
-			printJSON(d.stdout, res)
-		}
-		if usage {
-			return fail(exitUsage, "%v", err)
-		}
-		if res != nil && !*asJSON {
-			for _, w := range res.Warnings {
-				fmt.Fprintf(d.stderr, "warning: %s\n", w)
-			}
-		}
-		return fail(exitError, "%v", err)
+		return fail(code, "%v", err)
 	}
-	if *asJSON {
-		printJSON(d.stdout, res)
-	} else {
-		if !started {
-			printRestoreHead(d.stdout, res)
-			if res.Mode != restore.ModePreview {
-				printChecks(d.stdout, res.Checks, false)
-			}
-		}
-		printRestoreResult(d.stdout, res, args)
-	}
-	if !res.OK && !res.DryRun {
-		return exitError
-	}
-	return exitOK
+	return code
 }
 
-func isTerminal(in io.Reader) bool {
-	f, ok := in.(*os.File)
-	return ok && term.IsTerminal(int(f.Fd()))
+type restoreRun struct {
+	ctx        context.Context
+	d          backupDeps
+	p          *prompter
+	w          io.Writer
+	log        *slog.Logger
+	st         storage.Store
+	bucketName string
+	s          *restore.Session
+	choice     restore.TargetChoice
 }
 
-// loadFromBucket asks where the bucket is, reads the copy of app.yaml that
-// backup keeps there and decrypts it with the age key (ADR-0015 § 3).
-func loadFromBucket(ctx context.Context, p *prompter, d backupDeps) (*config.App, *config.Secrets, storage.Store, error) {
-	endpoint, err := p.askRequired("S3 endpoint (https://…)")
+func (r *restoreRun) printf(format string, a ...interface{}) { fmt.Fprintf(r.w, format, a...) }
+
+func (r *restoreRun) run() (int, error) {
+	folders, err := r.bucket()
 	if err != nil {
-		return nil, nil, nil, err
+		return exitUsage, err
 	}
-	bucket, err := p.askRequired("Bucket")
+	f, err := r.pickApp(folders)
 	if err != nil {
-		return nil, nil, nil, err
+		return exitUsage, err
 	}
-	prefix, err := p.ask("Prefix (Enter for none)", "")
+	r.s = restore.NewSession(restore.Deps{Shell: r.d.shell, Store: r.st, Tools: r.d.tools(), Log: r.log}, f)
+	if err := r.key(); err != nil {
+		return exitUsage, err
+	}
+	if err := r.pickInstance(); err != nil {
+		return exitUsage, err
+	}
+	if err := r.pickRun(); err != nil {
+		return exitUsage, err
+	}
+	if err := r.untilReady(); err != nil {
+		return exitUsage, err
+	}
+	appURL, err := r.appURL()
 	if err != nil {
-		return nil, nil, nil, err
+		return exitUsage, err
 	}
-	app, err := p.askRequired("App name")
-	if err != nil {
-		return nil, nil, nil, err
+	if err := r.confirm(); err != nil {
+		return exitUsage, err
 	}
-	region, err := p.ask("Region", "auto")
-	if err != nil {
-		return nil, nil, nil, err
+	r.printf("loading the data…\n")
+	out := r.s.Load(r.ctx, appURL)
+	r.printOutcome(out)
+	if !out.OK {
+		return exitError, nil
 	}
-	pathStyle, err := p.yesNo("Path-style URLs (MinIO, Garage)?", false)
-	if err != nil {
-		return nil, nil, nil, err
+	return exitOK, nil
+}
+
+// bucket asks where the backups are and lists the app folders under
+// bracer/ (ADR-0027); a wrong answer is shown as the bucket said it, then
+// asked again.
+func (r *restoreRun) bucket() ([]restore.Folder, error) {
+	c := storage.S3Config{Region: "auto"}
+	for {
+		var err error
+		if c.Endpoint, err = r.askDefault("S3 endpoint URL", c.Endpoint); err != nil {
+			return nil, err
+		}
+		if c.Bucket, err = r.askDefault("Bucket", c.Bucket); err != nil {
+			return nil, err
+		}
+		if c.Region, err = r.p.ask("Region", c.Region); err != nil {
+			return nil, err
+		}
+		if c.PathStyle, err = r.p.yesNo("Path-style URLs (needed for MinIO/Garage)?", c.PathStyle); err != nil {
+			return nil, err
+		}
+		if c.AccessKey, err = r.secretDefault("Access key", c.AccessKey); err != nil {
+			return nil, err
+		}
+		if c.SecretKey, err = r.secretDefault("Secret key", c.SecretKey); err != nil {
+			return nil, err
+		}
+		st, err := r.d.newStore(c)
+		var folders []restore.Folder
+		if err == nil {
+			folders, err = restore.ListFolders(r.ctx, st)
+		}
+		if err == nil && len(folders) == 0 {
+			err = fmt.Errorf("no bracer backups in %s (nothing under %s/)", c.Bucket, config.BucketPrefix)
+		}
+		if err == nil {
+			r.st, r.bucketName = st, c.Bucket
+			return folders, nil
+		}
+		r.printf("  ✗ %v\n", err)
+		_, key, err := r.p.choose("[r] enter again  [q] quit", 0, "r", "q")
+		if err != nil {
+			return nil, err
+		}
+		if key == "q" {
+			return nil, errQuit
+		}
 	}
-	ak, err := p.askSecret("Access key (not shown)")
-	if err != nil {
-		return nil, nil, nil, err
+}
+
+// askDefault asks for a required value; Enter keeps def when there is one.
+func (r *restoreRun) askDefault(prompt, def string) (string, error) {
+	if def == "" {
+		return r.p.askRequired(prompt)
 	}
-	sk, err := p.askSecret("Secret key (not shown)")
-	if err != nil {
-		return nil, nil, nil, err
+	return r.p.ask(prompt, def)
+}
+
+// secretDefault asks without echo; Enter keeps the value typed before.
+func (r *restoreRun) secretDefault(prompt, def string) (string, error) {
+	if def != "" {
+		prompt += " (Enter keeps the one typed before)"
 	}
-	keyPath, err := p.ask("Path of the age key file (Enter if backups are not encrypted)", "")
-	if err != nil {
-		return nil, nil, nil, err
+	for {
+		v, err := r.p.askSecret(prompt)
+		if err != nil {
+			return "", err
+		}
+		v = strings.TrimSpace(v)
+		switch {
+		case v != "":
+			return v, nil
+		case def != "":
+			return def, nil
+		}
 	}
-	st, err := d.newStore(storage.S3Config{Endpoint: endpoint, Bucket: bucket, Region: region, AccessKey: ak, SecretKey: sk, PathStyle: pathStyle})
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	var data []byte
-	for _, enc := range []bool{true, false} {
-		key := backup.AppYAMLKey(prefix, app, enc)
-		rc, gerr := st.Get(ctx, key)
-		if errors.Is(gerr, storage.ErrNotFound) {
+}
+
+// pickApp lists the app folders with the place that writes each and how its
+// newest run went (ADR-0023, ADR-0026).
+func (r *restoreRun) pickApp(folders []restore.Folder) (restore.Folder, error) {
+	r.printf("\nApps in %s:\n", r.bucketName)
+	for i, f := range folders {
+		if f.Err != nil {
+			r.printf("  %d) %s  run.json unreadable: %v\n", i+1, f.Name, firstLine(f.Err.Error()))
 			continue
 		}
-		if gerr != nil {
-			return nil, nil, nil, fmt.Errorf("read %s: %w", key, gerr)
+		n := f.Newest
+		where := "-"
+		if n.Writer.ID != "" {
+			where = n.Writer.Hostname + ":" + n.Writer.Path
 		}
-		var r io.Reader = rc
-		if enc {
-			if keyPath == "" {
-				rc.Close()
-				return nil, nil, nil, fmt.Errorf("%s is encrypted: give the path of the age key file", key)
-			}
-			path, _ := config.ExpandHome(keyPath)
-			ids, _, ierr := crypto.ReadIdentities(path)
-			if ierr != nil {
-				rc.Close()
-				return nil, nil, nil, ierr
-			}
-			if r, err = crypto.Decrypt(rc, ids); err != nil {
-				rc.Close()
-				return nil, nil, nil, fmt.Errorf("decrypt %s: %w", key, err)
-			}
-		}
-		data, err = io.ReadAll(io.LimitReader(r, 1<<20))
-		rc.Close()
+		r.printf("  %d) %s  %s  latest run %s: %s\n", i+1, n.App, where, n.TS, n.Verdict())
+	}
+	for {
+		i, _, err := r.p.choose(fmt.Sprintf("App to restore [1-%d]", len(folders)), len(folders))
 		if err != nil {
-			return nil, nil, nil, err
+			return restore.Folder{}, err
 		}
-		break
+		if folders[i].Err != nil {
+			r.printf("%s cannot be restored: its newest run.json is unreadable\n", folders[i].Name)
+			continue
+		}
+		return folders[i], nil
 	}
-	if data == nil {
-		return nil, nil, nil, fmt.Errorf("no copy of app.yaml under %s in bucket %s (backup writes it on every run since ADR-0015)", storage.Join(prefix, app), bucket)
-	}
-	cfg, err := config.Parse(data)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if keyPath != "" {
-		cfg.AgeIdentityFile = keyPath
-	}
-	vals := map[string]string{}
-	for _, kv := range os.Environ() {
-		k, v, _ := strings.Cut(kv, "=")
-		vals[k] = v
-	}
-	vals[cfg.Storage.AccessKeyEnv], vals[cfg.Storage.SecretKeyEnv] = ak, sk
-	cfg.Runtime = nil
-	return cfg, config.NewSecrets(vals, "terminal"), st, nil
 }
 
-func printJSON(w io.Writer, v interface{}) {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
-}
-
-// askHidden reads one value without echo; nil when stdin is not a terminal.
-func askHidden(in io.Reader, out io.Writer, prompt string) func() (string, error) {
-	f, ok := in.(*os.File)
-	if !ok || !term.IsTerminal(int(f.Fd())) {
+// key asks for the age key when the backups are encrypted: the age.key the
+// rescue card of init told the customer to copy.
+func (r *restoreRun) key() error {
+	newest := r.s.Newest()
+	if !newest.Encrypted() {
 		return nil
 	}
-	return func() (string, error) {
-		fmt.Fprint(out, prompt)
-		b, err := term.ReadPassword(int(f.Fd()))
-		fmt.Fprintln(out)
-		return string(b), err
-	}
-}
-
-// printRestoreHead: source run, target and mode.
-func printRestoreHead(w io.Writer, res *restore.Result) {
-	t := res.Target
-	role := "superuser"
-	if !t.Superuser {
-		role = "not superuser"
-	}
-	if res.Source.TS != "" {
-		fmt.Fprintf(w, "source: instance %s, run %s (%s)\n", res.Source.Instance, res.Source.TS, orDash(res.Source.Kind))
-	}
-	fmt.Fprintf(w, "target: %s, PostgreSQL %s via %s, user %s (%s)\n", targetLabel(t), t.PgVersion, t.Runner, t.User, role)
-	switch res.Mode {
-	case restore.ModeFull:
-		fmt.Fprintln(w, "mode: full (users, settings and every database of the run)")
-	case restore.ModeData:
-		fmt.Fprintln(w, "mode: data (the source was a URL: databases only, owned by the connecting user)")
-	case restore.ModePreview:
-		if res.Preflight != nil && res.Preflight.OK {
-			printPreviewBanner(w, res)
+	recipient := newest.Recipient()
+	for {
+		path, err := r.p.askRequired("Path of the age key file (age.key, as on the rescue card)")
+		if err != nil {
+			return err
 		}
-	}
-}
-
-func orDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-// printChecks lists the comparison: ✗ always, ✓ only when all is set.
-func printChecks(w io.Writer, checks []restore.Check, onlyFailed bool) {
-	for _, c := range checks {
-		mark := "✓"
-		switch {
-		case !c.OK:
-			mark = "✗"
-		case c.Warn:
-			mark = "!"
-		case onlyFailed:
+		if p, err := config.ExpandHome(path); err == nil {
+			path = p
+		}
+		if err := r.s.UseKey(path, recipient); err != nil {
+			r.printf("  ✗ %v\n", err)
 			continue
 		}
-		line := fmt.Sprintf("%s %s %s", mark, c.Area, c.Name)
-		if c.Detail != "" {
-			line += ": " + c.Detail
-		}
-		fmt.Fprintln(w, line)
-		switch {
-		case c.Fix == restore.FixSQL && c.Manual != "":
-			fmt.Fprintf(w, "    fix: in env-up; %s\n", c.Manual)
-		case c.Fix == restore.FixSQL:
-			fmt.Fprintln(w, "    fix: in env-up")
-		case c.Fix == restore.FixRerun:
-			fmt.Fprintln(w, "    checked on the next run, after env-up")
-		case c.Manual != "":
-			fmt.Fprintf(w, "    fix: %s\n", c.Manual)
-		}
+		return nil
 	}
 }
 
-func printPreviewBanner(w io.Writer, res *restore.Result) {
-	var names, drops []string
-	for _, db := range res.Databases {
-		if db.TargetDB != "" {
-			names = append(names, db.TargetDB)
-			drops = append(drops, "DROP DATABASE "+pg.QuoteIdent(db.TargetDB)+";")
-		}
+// pickInstance asks which instance of the newest run (spec restore AC).
+func (r *restoreRun) pickInstance() error {
+	newest := r.s.Newest()
+	names := newest.InstanceNames()
+	switch len(names) {
+	case 0:
+		return fmt.Errorf("the newest run of %s has no instance", newest.App)
+	case 1:
+		r.s.Instance = names[0]
+		r.printf("instance: %s\n", names[0])
+		return nil
 	}
-	if len(names) == 0 {
-		return
+	r.printf("\nInstances:\n")
+	for i, n := range names {
+		r.printf("  %d) %s (%s)\n", i+1, n, orDash(newest.Instances[n].Kind))
 	}
-	fmt.Fprintln(w, "PREVIEW: data only, for looking at. Owners, privileges and users were not restored;")
-	fmt.Fprintf(w, "an app connected to %s will not work as before.\n", strings.Join(names, ", "))
-	fmt.Fprintln(w, "To bring the app back, run bracer restore without --preview.")
-	fmt.Fprintf(w, "When done: %s\n", strings.Join(drops, " "))
+	i, _, err := r.p.choose(fmt.Sprintf("Instance to restore [1-%d]", len(names)), len(names))
+	if err != nil {
+		return err
+	}
+	r.s.Instance = names[i]
+	return nil
 }
 
-func targetLabel(t restore.Target) string {
+// pickRun lists the runs, newest first; restore never picks one (ADR-0016).
+func (r *restoreRun) pickRun() error {
+	runs, err := r.s.ListRuns(r.ctx)
+	if err != nil {
+		return err
+	}
+	if len(runs) == 0 {
+		return fmt.Errorf("no run of %s in the bucket can be restored for %s", r.s.Newest().App, r.s.Instance)
+	}
+	r.printf("\nRuns of %s (newest first):\n", r.s.Instance)
+	for i, run := range runs {
+		for j, line := range restore.RunLines(run) {
+			if j == 0 {
+				r.printf("  %2d) %s\n", i+1, line)
+			} else {
+				r.printf("      %s\n", line)
+			}
+		}
+	}
+	for {
+		i, key, err := r.p.choose(fmt.Sprintf("Run to restore [1-%d] (q to quit)", len(runs)), len(runs), "q")
+		if err != nil {
+			return err
+		}
+		if key == "q" {
+			return errQuit
+		}
+		if err := r.s.PickRun(r.ctx, runs[i].TS); err != nil {
+			r.printf("  ✗ %v\n", err)
+			continue
+		}
+		return nil
+	}
+}
+
+// pickTarget lists the Postgres found on this machine as init does, and a URL.
+func (r *restoreRun) pickTarget() error {
+	r.printf("\nLooking for Postgres on this machine (Docker containers, sockets)...\n")
+	containers, err := pg.Docker{Shell: r.d.shell}.ListPostgresContainers(r.ctx)
+	if err != nil {
+		r.printf("  ! %v\n", firstLine(err.Error()))
+	}
+	disc := pg.Discover(r.ctx, containers, pg.ScanHost(r.ctx, r.d.shell), pg.ProbeSSLRequest)
+	var cands []pg.Candidate
+	for _, c := range disc.Candidates {
+		if c.Local != nil || c.Container != nil && c.Container.Running {
+			cands = append(cands, c)
+		}
+	}
+	for i, c := range cands {
+		r.printf("  %d) %s\n", i+1, c.Label())
+	}
+	r.printf("  u) enter a URL\n")
+	i, key, err := r.p.choose(fmt.Sprintf("Restore into [1-%d/u]", len(cands)), len(cands), "u")
+	if err != nil {
+		return err
+	}
 	switch {
-	case t.Container != "":
-		return "container " + t.Container
-	case t.Local != "":
-		return "local " + t.Local
-	case t.Host != "":
-		if t.URLEnv != "" {
-			return t.Host + " ($" + t.URLEnv + ")"
+	case key == "u":
+		v, err := r.p.askSecret("Target URL (postgres://user:password@host:port/postgres, not shown, not stored)")
+		if err != nil {
+			return err
 		}
-		return t.Host
+		r.choice = restore.TargetChoice{URL: strings.TrimSpace(v)}
+	case cands[i].Container != nil:
+		r.choice = restore.TargetChoice{Container: cands[i].Container.Name}
+	default:
+		l := *cands[i].Local
+		r.choice = restore.TargetChoice{Local: &l}
 	}
-	return "$" + t.URLEnv
+	return nil
 }
 
-// printNotReady explains what the customer changes on the target before running again.
-func printNotReady(w io.Writer, res *restore.Result, rerun string) {
-	if res.Mode == restore.ModePreview {
-		pf := res.Preflight
-		if n := len(pf.NeedsSuperuser); n > 0 {
-			shown, more := pf.NeedsSuperuser, ""
-			if n > 10 {
-				shown, more = shown[:10], fmt.Sprintf("\n  (+%d more)", n-10)
-			}
-			fmt.Fprintf(w, "user %s is not a superuser and cannot restore these; nothing was created:\n  %s%s\n", res.Target.User, strings.Join(shown, "\n  "), more)
-			fmt.Fprintln(w, "Run with a superuser target.")
+// connect connects to the chosen target, asking for its password when the
+// socket wants one.
+func (r *restoreRun) connect() error {
+	for {
+		err := r.s.Connect(r.ctx, r.choice)
+		if !errors.Is(err, restore.ErrNeedPassword) {
+			return err
 		}
-		fmt.Fprintf(w, "then run again: %s\n", rerun)
-		return
-	}
-	printChecks(w, res.Checks, true)
-	fmt.Fprintln(w, "The target is not ready for this backup; nothing was loaded.")
-	if res.EnvUp != "" {
-		fmt.Fprintf(w, "SQL for the target (read it first):\n  env-up:   %s\n  env-down: %s (puts the target back as it was)\n", res.EnvUp, res.EnvDown)
-		fmt.Fprintf(w, "apply with: %s\n", strings.Replace(res.Apply, "<file>", res.EnvUp, 1))
-		if res.Restart != "" {
-			fmt.Fprintf(w, "then restart: %s\n", res.Restart)
+		pw, aerr := r.p.askSecret("The target asks for a password. Password of its superuser (not shown, not stored)")
+		if aerr != nil {
+			return aerr
 		}
-		if res.Mode == restore.ModeFull {
-			fmt.Fprintf(w, "env-up may hold password hashes: delete %s when done\n", res.SQLDir)
-		}
-	} else if res.DryRun {
-		fmt.Fprintln(w, "Dry run: no SQL written.")
-	}
-	fmt.Fprintf(w, "then run again: %s\n", rerun)
-	for _, n := range res.Notes {
-		fmt.Fprintf(w, "note: %s\n", n)
-	}
-	for _, wmsg := range res.Warnings {
-		fmt.Fprintf(w, "warning: %s\n", wmsg)
+		r.choice.Password = pw
 	}
 }
 
-func printRestoreResult(w io.Writer, res *restore.Result, args []string) {
-	if res.DryRun {
-		for _, db := range res.Databases {
-			src := res.Source.File
-			if src == "" {
-				src = fmt.Sprintf("%s (%s)", db.Key, humanBytes(db.Bytes))
-			}
-			state := ""
-			if db.State != "" {
-				state = fmt.Sprintf(" (%s on the target: %s)", db.SourceDB, db.State)
-			}
-			fmt.Fprintf(w, "  %s: %s → %s%s\n", db.SourceDB, src, db.TargetDB, state)
+// untilReady picks a target and compares it with the run until nothing
+// blocks: the customer applies the fixes in another terminal and presses
+// Enter (spec restore § compare).
+func (r *restoreRun) untilReady() error {
+	for {
+		if err := r.pickTarget(); err != nil {
+			return err
 		}
-		if dc := res.Disk; dc != nil && dc.Checked {
-			fmt.Fprintf(w, "  disk: %s free at %s, about %s needed\n", humanBytes(dc.FreeBytes), dc.DataDirectory, humanBytes(dc.NeedBytes))
+		if err := r.connect(); err != nil {
+			r.printf("  ✗ %v\n", err)
+			continue
 		}
-		if res.Mode == restore.ModePreview {
-			printPreviewBanner(w, res)
+		t := r.s.Target
+		role := "superuser"
+		if !t.Superuser {
+			role = "not superuser"
 		}
-		fmt.Fprintln(w, "Dry run: nothing was changed.")
-		for _, wmsg := range res.Warnings {
-			fmt.Fprintf(w, "warning: %s\n", wmsg)
+		r.printf("target: %s, PostgreSQL %s, user %s (%s)\n", t.Label, t.Version, t.User, role)
+		ready, err := r.compareLoop()
+		if err != nil {
+			return err
 		}
-		return
+		if ready {
+			return nil
+		}
 	}
-	var failed []string
-	for _, db := range res.Databases {
+}
+
+// compareLoop compares until the target is ready (true), or the target
+// cannot take the run and another must be picked (false).
+func (r *restoreRun) compareLoop() (bool, error) {
+	first := true
+	for {
+		plan, err := r.s.Compare(r.ctx)
+		var pt *restore.ErrPickTarget
+		if errors.As(err, &pt) {
+			r.printf("  ✗ %s\n", pt.Msg)
+			return false, nil
+		}
+		if err == nil {
+			if first && r.s.Mode() == restore.ModeData {
+				r.printf("this backup has databases only (source was a URL): restoring data owned by %s, without users or privileges\n", r.s.Target.User)
+			}
+			first = false
+			printChecks(r.w, plan.Checks)
+			for _, n := range plan.Notes {
+				r.printf("note: %s\n", n)
+			}
+			if plan.OK() {
+				return true, nil
+			}
+			if err := r.printFixes(plan); err != nil {
+				return false, err
+			}
+		} else {
+			r.printf("  ✗ %v\n", err)
+		}
+		r.printf("Apply the fixes above in another terminal, then press Enter to check again (q to quit): ")
+		for {
+			line, err := r.p.line()
+			if err != nil {
+				return false, err
+			}
+			if strings.TrimSpace(line) == "q" {
+				return false, errQuit
+			}
+			// Connect again: the target may have been recreated or restarted.
+			if err := r.connect(); err != nil {
+				r.printf("  ✗ %v\nPress Enter to check again (q to quit): ", err)
+				continue
+			}
+			break
+		}
+	}
+}
+
+// printFixes writes the SQL files when the plan has SQL and says how to apply them.
+func (r *restoreRun) printFixes(plan *restore.Plan) error {
+	if len(plan.Up) == 0 {
+		return nil
+	}
+	up, down, fresh, err := r.s.WriteFixes()
+	if err != nil {
+		return fmt.Errorf("write the SQL files: %w", err)
+	}
+	if fresh {
+		r.printf("SQL for the target (read it first):\n")
+	} else {
+		r.printf("Same SQL as before, not applied yet:\n")
+	}
+	r.printf("  env-up:   %s\n  env-down: %s (puts the target back as it was)\n", up, down)
+	r.printf("apply with: %s\n", strings.Replace(r.s.Apply(), "<file>", up, 1))
+	if plan.Restart {
+		r.printf("then restart: %s\n", plan.RestartCmd)
+	}
+	if r.s.Mode() == restore.ModeFull {
+		r.printf("env-up may hold password hashes: delete %s when done\n", r.s.SQLDir())
+	}
+	return nil
+}
+
+// appURL asks for the app's URL as in its config: the restore must prove the
+// app connects (ADR-0016). Never stored, never logged.
+func (r *restoreRun) appURL() (string, error) {
+	for {
+		v, err := r.p.askSecret("URL the app connects with, as in its config (postgres://user:password@host:port/db)")
+		if err != nil {
+			return "", err
+		}
+		v = strings.TrimSpace(v)
+		switch {
+		case v == "q":
+			return "", errQuit
+		case v == "":
+			r.printf("the app check needs the app's URL (q to quit)\n")
+			continue
+		}
+		if _, err := pg.ParseURL(v); err != nil {
+			r.printf("  ✗ %v\n", err)
+			continue
+		}
+		return v, nil
+	}
+}
+
+func (r *restoreRun) confirm() error {
+	r.printf("\n")
+	for i, dp := range r.s.Plan.DBs {
+		r.printf("  %s → %s, %s\n", dp.Source, dp.Target, humanBytes(r.s.Run.DBs[i].Bytes))
+	}
+	ok, err := r.p.yesNo(fmt.Sprintf("Load %d databases into %s now?", len(r.s.Plan.DBs), r.s.Target.Label), false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errQuit
+	}
+	return nil
+}
+
+// printOutcome prints one line per database, the proof, then how to switch
+// the app over and how to undo (spec restore § result).
+func (r *restoreRun) printOutcome(out *restore.Outcome) {
+	for _, db := range out.DBs {
 		mark := "✓"
 		if !db.OK {
 			mark = "✗"
-			failed = append(failed, db.SourceDB)
 		}
-		cmp := fmt.Sprintf("%d tables", db.TablesFound)
-		if res.Source.File == "" {
-			cmp = fmt.Sprintf("%d/%d tables", db.TablesFound, db.TablesExpected)
-		}
-		fmt.Fprintf(w, "%s %s → %s: loaded in %.1f s, %s\n", mark, db.SourceDB, db.TargetDB, db.RestoreSeconds, cmp)
+		r.printf("%s %s → %s: loaded in %.1f s, %d/%d tables\n", mark, db.Source, db.Target, db.Seconds, db.TablesFound, db.TablesExpected)
 		if db.Error != "" {
-			fmt.Fprintf(w, "    %s\n", strings.ReplaceAll(db.Error, "\n", "\n    "))
+			r.printf("    %s\n", strings.ReplaceAll(db.Error, "\n", "\n    "))
 		}
 		if n := len(db.MissingTables); n > 0 {
 			shown, more := db.MissingTables, ""
 			if n > 10 {
 				shown, more = shown[:10], fmt.Sprintf(" (+%d more)", n-10)
 			}
-			fmt.Fprintf(w, "    missing tables: %s%s\n", strings.Join(shown, ", "), more)
+			r.printf("    missing tables: %s%s\n", strings.Join(shown, ", "), more)
 		}
 		for _, m := range db.RowMismatches {
 			kind := "rows"
@@ -457,110 +524,99 @@ func printRestoreResult(w io.Writer, res *restore.Result, args []string) {
 			if m.Extension != "" {
 				note = fmt.Sprintf(" (table of extension %s, managed at runtime: warning only)", m.Extension)
 			}
-			fmt.Fprintf(w, "    %s: %s expected %d, found %d%s\n", m.Table, kind, m.Expected, m.Found, note)
+			r.printf("    %s: %s expected %d, found %d%s\n", m.Table, kind, m.Expected, m.Found, note)
 		}
-		for _, c := range db.Checks {
-			if c.OK {
-				fmt.Fprintf(w, "    ✓ check %s\n", c.Name)
-			} else {
-				fmt.Fprintf(w, "    ✗ check %s: %s\n", c.Name, c.Error)
+	}
+	if len(out.Verify) > 0 {
+		r.printf("✗ after the load the target no longer matches the backup:\n")
+		printChecks(r.w, out.Verify)
+	}
+	if ac := out.App; ac != nil {
+		if ac.OK {
+			r.printf("✓ the app's URL connects as %s (network %s) to %s and reads %d of %d tables (those it has SELECT on, in schemas it has USAGE on)\n", ac.User, ac.Network, ac.Database, ac.Readable, ac.Tables)
+		} else {
+			r.printf("✗ the app's URL: %s\n", strings.ReplaceAll(ac.Error, "\n", "\n    "))
+		}
+	}
+	var kept []*restore.DBResult
+	for _, db := range out.DBs {
+		if db.Kept {
+			kept = append(kept, db)
+		}
+	}
+	if out.OK {
+		stamp := time.Now().UTC().Format("20060102_1504")
+		r.printf("\nTo switch the app over, either:\n")
+		r.printf("  1. stop the app, then in psql:\n")
+		for _, db := range out.DBs {
+			if r.s.TargetHas(db.Source) {
+				r.printf("       ALTER DATABASE %s RENAME TO %s;\n", pg.QuoteIdent(db.Source), pg.QuoteIdent(db.Source+"_old_"+stamp))
+			}
+			r.printf("       ALTER DATABASE %s RENAME TO %s;\n", pg.QuoteIdent(db.Target), pg.QuoteIdent(db.Source))
+		}
+		r.printf("     and start the app again;\n")
+		r.printf("  2. or point the app's config at the new databases.\n")
+	}
+	if len(kept) > 0 {
+		r.printf("\nTo undo, before renaming anything:\n")
+		for _, db := range kept {
+			r.printf("  %s\n", db.Drop)
+		}
+		if downs := r.s.EnvDowns(); len(downs) > 0 {
+			for _, f := range downs {
+				r.printf("  %s\n", strings.Replace(r.s.Apply(), "<file>", f, 1))
 			}
 		}
-		printAttributes(w, db.Attributes)
 	}
-	if len(res.Verify) > 0 {
-		fmt.Fprintln(w, "✗ after the load the target no longer matches the backup:")
-		printChecks(w, res.Verify, true)
-	} else if res.Mode != restore.ModePreview && len(failed) == 0 {
-		fmt.Fprintln(w, "✓ environment checked again after the load: same or more than the backup")
+	if _, err := os.Stat(r.s.SQLDir()); err == nil {
+		r.printf("SQL files are in %s (env-up holds password hashes: delete the directory when done)\n", r.s.SQLDir())
 	}
-	if ac := res.AppCheck; ac != nil {
-		if ac.OK {
-			fmt.Fprintf(w, "✓ the app's URL connects as %s (network %s) to %s and reads %d of %d tables (those it has SELECT on, in schemas it has USAGE on)\n", ac.User, ac.Network, ac.Database, ac.Readable, ac.Tables)
-		} else {
-			fmt.Fprintf(w, "✗ the app's URL: %s\n", strings.ReplaceAll(ac.Error, "\n", "\n    "))
-		}
-	}
-	for _, db := range res.Databases {
-		if db.State != restore.StateHasData || !db.OK || db.TargetDB == db.SourceDB {
-			continue
-		}
-		today := restoreNow().UTC().Format("20060102")
-		old := db.SourceDB + "_old_" + today
-		fmt.Fprintf(w, "%s was restored as %s next to the current %s. To switch:\n", db.SourceDB, db.TargetDB, db.SourceDB)
-		fmt.Fprintln(w, "  1. stop the app")
-		fmt.Fprintf(w, "  2. psql: ALTER DATABASE %s RENAME TO %s;\n", pg.QuoteIdent(db.SourceDB), pg.QuoteIdent(old))
-		fmt.Fprintf(w, "           ALTER DATABASE %s RENAME TO %s;\n", pg.QuoteIdent(db.TargetDB), pg.QuoteIdent(db.SourceDB))
-		fmt.Fprintln(w, "  3. start the app")
-		fmt.Fprintf(w, "  4. when sure: DROP DATABASE %s;\n", pg.QuoteIdent(old))
-	}
-	if res.Mode == restore.ModePreview {
-		printPreviewBanner(w, res)
-	}
-	if res.DataDown != "" {
-		fmt.Fprintf(w, "to empty the loaded databases again: %s\n", strings.Replace(res.Apply, "<file>", res.DataDown, 1))
-	}
-	if res.SQLDir != "" {
-		fmt.Fprintf(w, "SQL files are in %s (env-up holds password hashes: delete the directory when done)\n", res.SQLDir)
-	}
-	if len(failed) > 0 && res.Source.File == "" {
-		fmt.Fprintf(w, "to run again for the failed databases only: bracer restore %s\n", shellJoin(withDatabases(args, failed)))
-	}
-	for _, n := range res.Notes {
-		fmt.Fprintf(w, "note: %s\n", n)
-	}
-	for _, wmsg := range res.Warnings {
-		fmt.Fprintf(w, "warning: %s\n", wmsg)
+	if app := r.s.Newest().App; !containsStr(config.KnownApps(userHome()), app) {
+		r.printf("to back up this server: bracer init %s\n", app)
 	}
 }
 
-// restoreNow dates the old database in the swap steps; tests replace it.
-var restoreNow = time.Now
-
-// withDatabases replaces the --database flags in args with dbs.
-func withDatabases(args, dbs []string) []string {
-	var out []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		name := strings.TrimLeft(a, "-")
-		if strings.HasPrefix(a, "-") && (name == "database") {
-			i++ // its value
-			continue
+// printChecks lists the comparison: one line per check, the fix under a ✗.
+func printChecks(w io.Writer, checks []restore.Check) {
+	for _, c := range checks {
+		mark := "✓"
+		switch {
+		case !c.OK:
+			mark = "✗"
+		case c.Warn:
+			mark = "!"
 		}
-		if strings.HasPrefix(a, "-") && strings.HasPrefix(name, "database=") {
-			continue
+		line := fmt.Sprintf("%s %s %s", mark, c.Area, c.Name)
+		if c.Detail != "" {
+			line += ": " + c.Detail
 		}
-		out = append(out, a)
+		fmt.Fprintln(w, line)
+		switch {
+		case c.OK:
+		case c.Fix == restore.FixSQL && c.Manual != "":
+			fmt.Fprintf(w, "    fix: in env-up; %s\n", c.Manual)
+		case c.Fix == restore.FixSQL:
+			fmt.Fprintln(w, "    fix: in env-up")
+		case c.Manual != "":
+			fmt.Fprintf(w, "    fix: %s\n", c.Manual)
+		}
 	}
-	for _, db := range dbs {
-		out = append(out, "--database", db)
-	}
-	return out
 }
 
-// shellJoin quotes args for a POSIX shell where needed.
-func shellJoin(args []string) string {
-	out := make([]string, len(args))
-	for i, a := range args {
-		if a != "" && strings.Trim(a, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./=:@,") == "" {
-			out[i] = a
-		} else {
-			out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
-		}
-	}
-	return strings.Join(out, " ")
+func isTerminal(f interface{}) bool {
+	file, ok := f.(*os.File)
+	return ok && term.IsTerminal(int(file.Fd()))
 }
 
-// printAttributes lists what differs between the database attributes in the
-// archive and the restored database (spec fetch-restore § Flow 8).
-func printAttributes(w io.Writer, a *restore.AttrResult) {
-	if a == nil {
-		return
+func orDash(s string) string {
+	if s == "" {
+		return "-"
 	}
-	if a.Error != "" {
-		fmt.Fprintf(w, "    %s\n", a.Error)
-	}
-	for _, m := range a.Mismatches {
-		fmt.Fprintf(w, "    database attribute: %s\n", m)
-	}
+	return s
+}
+
+func printJSON(w io.Writer, v interface{}) {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
 }

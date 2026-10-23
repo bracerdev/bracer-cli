@@ -39,21 +39,22 @@ func (c *Client) UserObjects(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// outOfScopeSQL lists what depends on files or processes outside Postgres,
+// externalSQL lists what depends on something outside Postgres,
 // which a dump does not carry (ADR-0015 § 2): functions in untrusted
 // languages, C functions outside $libdir that no extension owns, file_fdw servers.
-var outOfScopeSQL = "select 'function ' || p.oid::regprocedure::text || ' (language ' || l.lanname || ')' from pg_proc p join pg_language l on l.oid = p.prolang join pg_namespace n on n.oid = p.pronamespace " +
+var externalSQL = "select 'function ' || p.oid::regprocedure::text || ' (language ' || l.lanname || ')' from pg_proc p join pg_language l on l.oid = p.prolang join pg_namespace n on n.oid = p.pronamespace " +
 	"where not l.lanpltrusted and l.lanname not in ('c', 'internal') and n.nspname not in ('pg_catalog','information_schema') and " + notExtensionMember("pg_proc", "p.oid") +
 	" union all select 'function ' || p.oid::regprocedure::text || ' (C library ' || p.probin || ')' from pg_proc p join pg_language l on l.oid = p.prolang " +
 	"where l.lanname = 'c' and p.probin is not null and p.probin not like '$libdir%' and " + notExtensionMember("pg_proc", "p.oid") +
 	" union all select 'foreign server ' || s.srvname || ' (file_fdw)' from pg_foreign_server s join pg_foreign_data_wrapper w on w.oid = s.srvfdw where w.fdwname = 'file_fdw'" +
 	" order by 1"
 
-// OutOfScope lists what a restore of the connected database cannot
-// guarantee. Subscriptions are read apart: pg_subscription may be closed to
+// External lists what depends on something outside Postgres that a dump
+// cannot carry: a restore brings it back but cannot promise it works.
+// Subscriptions are read apart: pg_subscription may be closed to
 // the user, and then they are not listed.
-func (c *Client) OutOfScope(ctx context.Context) ([]string, error) {
-	rows, err := c.Query(ctx, outOfScopeSQL)
+func (c *Client) External(ctx context.Context) ([]string, error) {
+	rows, err := c.Query(ctx, externalSQL)
 	if err != nil {
 		return nil, err
 	}

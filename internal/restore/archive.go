@@ -14,7 +14,7 @@ import (
 )
 
 // What the archive's table of contents says, read before anything is created
-// on the target (spec fetch-restore § Flow 5): which users the database needs
+// on the target (spec restore § Flow 5): which users the database needs
 // (data_only) and what needs a superuser (preview).
 
 // headSizes: the table of contents is usually small; try a small head first and
@@ -251,7 +251,7 @@ var (
 )
 
 // SuperuserObjects lists what a restore by a user that is not a superuser
-// cannot create (spec fetch-restore AC preview): extensions that are not
+// cannot create (spec restore AC preview): extensions that are not
 // trusted on the target, functions in untrusted languages, procedural
 // languages, event triggers, foreign-data wrappers, and tables with FORCE ROW
 // LEVEL SECURITY (the restoring user owns them, so row counts would be wrong).

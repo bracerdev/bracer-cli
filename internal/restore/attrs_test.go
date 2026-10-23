@@ -65,7 +65,7 @@ SECURITY LABEL FOR selinux ON DATABASE shop IS 'system_u:object_r:sepgsql_db_t:s
 \unrestrict abc123
 `
 
-// spec fetch-restore § Flow 5b: keep only the database's attributes, rebuilt
+// spec restore § Flow 5b: keep only the database's attributes, rebuilt
 // for the target name; drop what names a missing user, the template/connection
 // switches, and security labels, each with a warning.
 func TestParseDatabaseSQL(t *testing.T) {
@@ -103,7 +103,7 @@ GRANT ALL ON DATABASE "shop_restored" TO app`
 	}
 }
 
-// spec fetch-restore AC: the owner is missing on the target → no OWNER TO, a
+// spec restore AC: the owner is missing on the target → no OWNER TO, a
 // warning with Fix naming the target database.
 func TestParseDatabaseSQLMissingOwner(t *testing.T) {
 	a, err := ParseDatabaseSQL([]byte(shopAttrSQL), "shop_restored", map[string]bool{"postgres": true})

@@ -26,6 +26,9 @@ func (f *fakeShell) Run(_ context.Context, c Cmd) (Result, error) {
 	}
 	for p, o := range f.out {
 		if strings.HasPrefix(key, p) {
+			if strings.Contains(key, " psql ") && hasArg(c.Args, "-0") && !strings.Contains(o, "\x00") {
+				o = strings.ReplaceAll(o, "\n", "\x00")
+			}
 			if c.Stdout != nil {
 				io.WriteString(c.Stdout, o)
 				return Result{}, nil
@@ -211,17 +214,17 @@ func TestRunnersBuildDockerArgsWithoutSecrets(t *testing.T) {
 
 func TestClientQueries(t *testing.T) {
 	sh := &fakeShell{out: map[string]string{
-		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c show server_version_num": "170011\n",
-		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c select datname":          "postgres\nshop\n",
-		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -c select current_user":     "bracer_backup\x1ff\x1ft\x1ff\n",
+		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c show server_version_num": "170011\n",
+		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c select datname":          "postgres\nshop\n",
+		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c select current_user":     "bracer_backup\x1ff\x1ft\x1ff\n",
 	}}
 	cl := &Client{Runner: ExecRunner{Shell: sh, Container: "c"}, Conn: Conn{User: "bracer_backup"}}
 	ctx := context.Background()
 	if num, major, err := cl.ServerVersionNum(ctx); err != nil || num != 170011 || major != 17 {
 		t.Errorf("version: %d %d %v", num, major, err)
 	}
-	if dbs, err := cl.ListDatabases(ctx); err != nil || len(dbs) != 2 || dbs[1] != "shop" {
-		t.Errorf("dbs: %v %v", dbs, err)
+	if c, err := cl.ListCandidates(ctx); err != nil || strings.Join(c, ",") != "postgres,shop" {
+		t.Errorf("candidates: %+v %v", c, err)
 	}
 	p, err := cl.Privileges(ctx)
 	if err != nil || p.Role != "bracer_backup" || p.Superuser || !p.ReadAllData || p.BypassRLS || p.CanDump() {
@@ -323,4 +326,13 @@ func TestExtensionPackagesFollowsAlternatives(t *testing.T) {
 	if want := "postgis=postgresql-18-postgis-3-scripts postgis=postgresql-18-postgis-3 vector=postgresql-18-pgvector"; strings.Join(got, " ") != want {
 		t.Errorf("pkgs %v, want %s", got, want)
 	}
+}
+
+func hasArg(args []string, a string) bool {
+	for _, x := range args {
+		if x == a {
+			return true
+		}
+	}
+	return false
 }

@@ -21,18 +21,25 @@ type Client struct {
 // Query runs one SQL statement with psql -At, returning rows with columns separated by \x1f.
 func (c *Client) Query(ctx context.Context, sql string) ([][]string, error) {
 	var out bytes.Buffer
-	args := []string{"-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-F", "\x1f", "-c", sql}
+	args := []string{"-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-F", "\x1f", "-0", "-c", sql}
 	if err := c.Runner.Run(ctx, c.Conn, "psql", args, nil, &out); err != nil {
 		return nil, err
 	}
+	return parseRows(out.String()), nil
+}
+
+// parseRows splits the output of psql -A -t -F \x1f -0: each row ends with a
+// NUL byte, columns are separated by \x1f. A value may hold newlines (a
+// multi-line comment on a role or database), never a NUL.
+func parseRows(out string) [][]string {
 	var rows [][]string
-	for _, line := range strings.Split(strings.TrimRight(out.String(), "\n"), "\n") {
-		if line == "" {
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" {
 			continue
 		}
-		rows = append(rows, strings.Split(line, "\x1f"))
+		rows = append(rows, strings.Split(rec, "\x1f"))
 	}
-	return rows, nil
+	return rows
 }
 
 // scalarOrEmpty is scalar where an empty value is a valid answer.
@@ -103,17 +110,49 @@ func InitdbTime(systemID string) time.Time {
 	return time.Unix(int64(n>>32), 0).UTC()
 }
 
-// ListDatabases lists dumpable databases: not templates, connections allowed.
-func (c *Client) ListDatabases(ctx context.Context) ([]string, error) {
-	rows, err := c.Query(ctx, "select datname from pg_database where not datistemplate and datallowconn order by datname")
+// ListCandidates lists the databases init offers to back up: every
+// database that allows connections but template0, and template1 only when it
+// holds objects (it is copied into every new database). ADR-0024
+func (c *Client) ListCandidates(ctx context.Context) ([]string, error) {
+	rows, err := c.Query(ctx, "select datname from pg_database where datallowconn and datname <> 'template0' order by datname")
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(rows))
+	var out []string
 	for _, r := range rows {
-		out = append(out, r[0])
+		if len(r) != 1 {
+			return nil, fmt.Errorf("pg_database: unexpected row %v", r)
+		}
+		name := r[0]
+		if name == "template1" {
+			used, err := TemplateInUse(ctx, c.WithDB(name))
+			if err != nil {
+				return nil, fmt.Errorf("check template1 for objects: %w", err)
+			}
+			if !used {
+				continue
+			}
+		}
+		out = append(out, name)
 	}
 	return out, nil
+}
+
+// TemplateInUse: the connected database (template1) holds objects of a user
+// or an extension besides plpgsql.
+func TemplateInUse(ctx context.Context, c *Client) (bool, error) {
+	n, err := c.UserObjects(ctx)
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	exts, err := c.Extensions(ctx)
+	if err != nil {
+		return false, err
+	}
+	return len(exts) > 0, nil
 }
 
 // Privileges are the privileges of the connected user. → ADR-0006
@@ -142,6 +181,19 @@ func (c *Client) Privileges(ctx context.Context) (Privileges, error) {
 	}
 	r := rows[0]
 	return Privileges{Role: r[0], Superuser: r[1] == "t", ReadAllData: r[2] == "t", BypassRLS: r[3] == "t"}, nil
+}
+
+// BootstrapSuperuser is the role created by initdb (oid 10): always a
+// superuser and impossible to drop. pg_roles is readable by every user.
+func (c *Client) BootstrapSuperuser(ctx context.Context) (string, error) {
+	rows, err := c.Query(ctx, "select rolname from pg_roles where oid = 10")
+	if err != nil {
+		return "", err
+	}
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		return "", fmt.Errorf("pg_roles: unexpected result %v", rows)
+	}
+	return rows[0][0], nil
 }
 
 // AdminPrivileges are current_user's privileges to create databases/users, for the restore target.

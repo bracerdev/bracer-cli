@@ -14,6 +14,9 @@ type Extension struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 	Schema  string `json:"schema,omitempty"` // empty in manifests written before ADR-0015
+	// Config: the extension has configuration tables (extconfig), whose rows
+	// the dump carries as of Version (spec restore § extensions).
+	Config bool `json:"config,omitempty"`
 }
 
 func (e Extension) String() string { return e.Name + " " + e.Version }
@@ -21,7 +24,7 @@ func (e Extension) String() string { return e.Name + " " + e.Version }
 // Extensions reads pg_extension of the connected database, skipping plpgsql
 // (every database has it, every image has it).
 func (c *Client) Extensions(ctx context.Context) ([]Extension, error) {
-	rows, err := c.Query(ctx, "select extname, extversion, extnamespace::regnamespace::text from pg_extension where extname <> 'plpgsql' order by extname")
+	rows, err := c.Query(ctx, "select extname, extversion, extnamespace::regnamespace::text, extconfig is not null from pg_extension where extname <> 'plpgsql' order by extname")
 	if err != nil {
 		return nil, err
 	}
@@ -34,6 +37,7 @@ func (c *Client) Extensions(ctx context.Context) ([]Extension, error) {
 		if len(r) > 2 {
 			e.Schema = strings.Trim(r[2], `"`)
 		}
+		e.Config = len(r) > 3 && r[3] == "t"
 		out = append(out, e)
 	}
 	return out, nil

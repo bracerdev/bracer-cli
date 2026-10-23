@@ -18,7 +18,7 @@ import (
 )
 
 // Needs Docker, the bracer-test-pg container (orders table with 500 rows) and a local S3
-// (see backup/integration_test.go). Runs a real backup, then a real drill.
+// (see backup/integration_test.go). Runs a real backup whose last step is a real drill.
 func TestIntegrationDrill(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -43,28 +43,61 @@ func TestIntegrationDrill(t *testing.T) {
 	if err := crypto.WriteIdentityFile(keyPath, kp); err != nil {
 		t.Fatal(err)
 	}
-	prefix := "dtest-" + time.Now().UTC().Format("150405")
+	stamp := time.Now().UTC().Format("150405")
 	cfg := &config.App{
 		App:             "shop",
-		Instances:       []config.Instance{{Name: "main", Container: "bracer-test-pg", User: "postgres", PgMajor: 17, Databases: config.Databases{List: []config.Database{{Name: "shop"}}}}},
-		Storage:         &config.Storage{Endpoint: endpoint, Bucket: "backups", Prefix: prefix, AccessKeyEnv: "A", SecretKeyEnv: "S", PathStyle: true},
+		SecretsFile:     filepath.Join(t.TempDir(), "secrets.env"),
+		Instances:       []config.Instance{{Name: "main", Connection: config.Connection{Container: "bracer-test-pg", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone}, Databases: config.Databases([]config.Database{{Name: "shop"}})}},
+		Storage:         &config.Storage{Endpoint: endpoint, Bucket: "backups", Folder: "shop-" + stamp, AccessKeyEnv: "A", SecretKeyEnv: "S", PathStyle: true},
 		Encryption:      "age",
 		AgeRecipient:    kp.Recipient,
 		AgeIdentityFile: keyPath,
-		Drill:           &config.Drill{Timeout: "10m", Checks: []config.Check{{Name: "orders exist", SQL: "select 1 from orders limit 1"}, {Name: "never", SQL: "select 1 where false"}}},
+		Schedule:        &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		// The run's app.yaml is read back strictly: runtime is required, unused here.
+		Runtime: &config.Runtime{User: "test", Path: "/usr/bin:/bin", Docker: "/usr/bin/docker"},
 	}
+	here := backup.Writer{ID: "dtest"}
 
-	// 1. Encrypted backup: the manifest must have orders rows=500 (counted in the snapshot).
-	bres, err := backup.Run(ctx, cfg, backup.Deps{Shell: sh, Store: st})
-	if err != nil || !bres.OK {
+	// 1. Encrypted backup (init's first real run creates the folder) with the
+	// drill as its last step (ADR-0026): decrypts, restores into a new
+	// database, compares to the 500 rows counted in the snapshot, records
+	// the outcome in run.json, and the container is cleaned up.
+	var dres *Result
+	bres, err := backup.Backup(ctx, cfg, backup.Deps{Shell: sh, Store: st, Here: here, Create: true,
+		Drill: Step(cfg, Deps{Shell: sh, Store: st}, func(r *Result) { dres = r })})
+	if err != nil || !bres.OK || bres.Status != backup.ResultOK {
 		t.Fatalf("backup: %v %+v", err, bres)
 	}
-	manifestKey := storage.Join(prefix, "shop", "manifest.json")
-	m, err := backup.LoadManifest(ctx, st, manifestKey, "shop")
+	if dres == nil || !dres.OK || dres.TS != bres.TS || len(dres.Instances) != 1 || len(dres.Instances[0].Databases) != 1 {
+		t.Fatalf("drill result: %+v", dres)
+	}
+	ir := dres.Instances[0]
+	dr := ir.Databases[0]
+	if dr.Error != "" || len(dr.MissingTables) != 0 || len(dr.RowMismatches) != 0 || dr.TablesFound != 1 || dr.TablesExpected != 1 {
+		t.Errorf("db: %+v", dr)
+	}
+	if ir.Result != backup.DrillPassed || !ir.OK || ir.Mode != "full" || ir.TookSeconds <= 0 {
+		t.Errorf("instance: %+v", ir)
+	}
+	if !strings.HasPrefix(dr.RestoredAs, "shop_restored_") {
+		t.Errorf("restored as: %s", dr.RestoredAs)
+	}
+	// ADR-0022: the source container's own image, by ID only.
+	if !strings.HasPrefix(ir.Image, "sha256:") {
+		t.Errorf("image: %s", ir.Image)
+	}
+	if bir := bres.Instance("main"); bir.DrillFailed != nil || bir.Drill != ir {
+		t.Errorf("backup result: failed=%v drill=%+v", bir.DrillFailed, bir.Drill)
+	}
+	// run.json, written after the drill, keeps the outcome.
+	run, _, err := backup.Newest(ctx, st, backup.Root(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	dump := m.Instances["main"].Databases["shop"].Dumps[0]
+	if d := run.Instances["main"].Drill; run.TS != bres.TS || d == nil || d.Result != backup.DrillPassed || d.TookSeconds != ir.TookSeconds || !run.AllDrillsPassed() {
+		t.Errorf("run.json drill: %+v", d)
+	}
+	dump := run.Instances["main"].Databases["shop"]
 	var orders *pg.Table
 	for i := range dump.Tables {
 		if dump.Tables[i].Name == "orders" {
@@ -72,59 +105,31 @@ func TestIntegrationDrill(t *testing.T) {
 		}
 	}
 	if orders == nil || orders.Rows == nil || *orders.Rows != 500 {
-		t.Fatalf("manifest orders: %+v", orders)
-	}
-
-	// 2. Real drill: decrypts, restores, compares to 500, checks pass/fail correctly, container is cleaned up.
-	res, err := Run(ctx, cfg, Deps{Shell: sh, Store: st})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.OK || len(res.Instances) != 1 || len(res.Instances[0].Databases) != 1 {
-		t.Fatalf("result (check 'never' must fail, rest pass): %+v", res)
-	}
-	ir := res.Instances[0]
-	dr := ir.Databases[0]
-	if dr.Error != "" || len(dr.MissingTables) != 0 || len(dr.RowMismatches) != 0 || dr.TablesFound != 1 || dr.TablesExpected != 1 {
-		t.Errorf("db: %+v", dr)
-	}
-	if ir.Mode != "full" || ir.Source != "container" || ir.TS == "" {
-		t.Errorf("run: %+v", ir)
-	}
-	if len(dr.Checks) != 2 || !dr.Checks[0].OK || dr.Checks[1].OK || dr.Checks[1].Error != "no rows returned" {
-		t.Errorf("checks: %+v", dr.Checks)
-	}
-	// ADR-0015: the source container's own image, by ID when it is on this machine.
-	if !strings.HasPrefix(ir.Image, "sha256:") && ir.Image != "postgres:17-alpine" {
-		t.Errorf("image: %s", ir.Image)
+		t.Fatalf("run.json orders: %+v", orders)
 	}
 	assertNoDrillContainers(t, ctx, sh)
 
-	// 3. Manifest says 499 → the drill must fail with both numbers.
+	// 2. run.json says 499 → the drill must fail with both numbers.
 	*orders.Rows = 499
-	if err := backup.SaveManifest(ctx, st, manifestKey, m, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	cfg.Drill.Checks = nil
-	res, err = Run(ctx, cfg, Deps{Shell: sh, Store: st})
+	res, err := Run(ctx, cfg, run, Deps{Shell: sh, Store: st})
 	if err != nil {
 		t.Fatal(err)
 	}
 	dr = res.Instances[0].Databases[0]
-	if res.OK || len(dr.RowMismatches) != 1 || dr.RowMismatches[0].Expected != 499 || dr.RowMismatches[0].Found != 500 || dr.RowMismatches[0].Estimated {
-		t.Errorf("tampered manifest: %+v", dr)
+	if res.OK || res.Instances[0].Result != backup.DrillFailed || len(dr.RowMismatches) != 1 || dr.RowMismatches[0].Expected != 499 || dr.RowMismatches[0].Found != 500 || dr.RowMismatches[0].Estimated {
+		t.Errorf("tampered run.json: %+v", dr)
 	}
 
-	// 4. Wrong key → fails naming the recipient, no container left behind.
+	// 3. Wrong key → fails naming the recipient, no container left behind.
 	other, _ := crypto.Generate()
 	otherPath := filepath.Join(t.TempDir(), "other.key")
 	crypto.WriteIdentityFile(otherPath, other)
 	cfg.AgeIdentityFile = otherPath
-	res, err = Run(ctx, cfg, Deps{Shell: sh, Store: st})
+	res, err = Run(ctx, cfg, run, Deps{Shell: sh, Store: st})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The environment record of the run is read first: the instance fails naming the recipient.
+	// The run's app.yaml is read first: the instance fails naming the recipient.
 	if ir := res.Instances[0]; res.OK || !strings.Contains(ir.Error, kp.Recipient) || len(ir.Databases) != 0 {
 		t.Errorf("wrong key: %+v", ir)
 	}

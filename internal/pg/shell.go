@@ -55,13 +55,28 @@ type Shell interface {
 // variable names only, no values).
 //
 // Docker and Env carry app.yaml's runtime: (spec init § Data model): `docker` is
-// run as Docker when set, and Env (PATH=…, DOCKER_HOST=…) is the default
-// environment of every child, overridden by the same names in the process
-// environment (a run by hand wins over what init recorded).
+// run as Docker when set, and then PATH and DOCKER_HOST of every child are
+// Env's alone: the process environment does not change which Docker runs, so
+// a run by hand is the run of the timer (ADR-0022).
 type ExecShell struct {
 	Verbose bool
 	Docker  string
 	Env     []string
+}
+
+// baseEnv is the process environment, without PATH and DOCKER_HOST when
+// runtime: is applied.
+func (s ExecShell) baseEnv() []string {
+	if s.Docker == "" {
+		return os.Environ()
+	}
+	var out []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "PATH=") && !strings.HasPrefix(kv, "DOCKER_HOST=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 func (s ExecShell) Run(ctx context.Context, c Cmd) (Result, error) {
@@ -74,8 +89,8 @@ func (s ExecShell) Run(ctx context.Context, c Cmd) (Result, error) {
 	// while the tail of pg_dump's stdout is still waiting to be uploaded (minio-go
 	// does not read the pipe while pushing a part) → spurious backup failure. Hanging
 	// on ctx cancel is handled locally (StartSession closes the session's stdin pipe).
-	// exec keeps the last value of a duplicated key: runtime defaults < process env < c.Env.
-	cmd.Env = append(append(append([]string{}, s.Env...), os.Environ()...), c.Env...)
+	// exec keeps the last value of a duplicated key: process env < runtime < c.Env.
+	cmd.Env = append(append(s.baseEnv(), s.Env...), c.Env...)
 	cmd.Stdin = c.Stdin
 	var stdout, stderr bytes.Buffer
 	if c.Stdout != nil {

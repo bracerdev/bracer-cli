@@ -1,11 +1,12 @@
 module bracer.dev/bracer
 
-go 1.27.1
+go 1.27.3
 
 require (
 	filippo.io/age v1.3.2
 	github.com/goccy/go-yaml v1.19.2
 	github.com/minio/minio-go/v7 v7.4.1
+	golang.org/x/term v0.47.0
 )
 
 require (
@@ -26,7 +27,6 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	gopkg.in/ini.v1 v1.67.3 // indirect
 )

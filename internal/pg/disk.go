@@ -9,8 +9,9 @@ import (
 )
 
 // DiskFreer is a Runner that can measure free space on the Postgres server's
-// own filesystem (spec fetch-restore: disk check before restore). Only docker
-// exec into the server's container has it; an ImageRunner (URL) cannot measure it.
+// own filesystem (spec restore § disk): docker exec into the server's
+// container, or df on this machine for a local cluster. An ImageRunner (URL)
+// cannot measure it.
 type DiskFreer interface {
 	DiskFree(ctx context.Context, dir string) (int64, error)
 }
@@ -41,4 +42,13 @@ func (r ExecRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
 		return 0, err
 	}
 	return ParseDF(out.Bytes())
+}
+
+// DiskFree: `df` on this machine, where the local cluster's data directory is.
+func (r SocketRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
+	res, err := r.Shell.Run(ctx, Cmd{Name: "df", Args: dfArgs(dir)})
+	if err != nil {
+		return 0, err
+	}
+	return ParseDF(res.Stdout)
 }

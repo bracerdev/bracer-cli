@@ -67,12 +67,12 @@ func TestFingerprintDiff(t *testing.T) {
 	b.Names["shop"] = true
 	b.Env.Settings[0].Value = "ISO, DMY"
 	b.AutoConf["datestyle"] = "ISO, DMY"
-	b.DBs["shop"].Connections = []string{"app@local"} // not part of the state
-	got := strings.Join(diffPrints(fingerprint(a, []string{"shop"}), fingerprint(b, []string{"shop"})), "; ")
+	b.DBs["shop"].Owner = "app" // the loaded databases are dropped first: their attributes are not part of the state
+	got := strings.Join(diffPrints(fingerprint(a), fingerprint(b)), "; ")
 	if got != "databases changed; postgresql.auto.conf datestyle was added; setting DateStyle changed" {
 		t.Errorf("diff: %s", got)
 	}
-	if d := diffPrints(fingerprint(a, []string{"shop"}), fingerprint(st(), []string{"shop"})); len(d) != 0 {
+	if d := diffPrints(fingerprint(a), fingerprint(st())); len(d) != 0 {
 		t.Errorf("same state: %v", d)
 	}
 }
@@ -127,4 +127,14 @@ func (s *scriptShell) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 		return pg.Result{}, &pg.ExitError{Cmd: key, Code: 1}
 	}
 	return s.answers[key], nil
+}
+
+func TestDrillLocksPer(t *testing.T) {
+	if got := drillLocksPer(6400); got != 0 {
+		t.Errorf("default is enough: %d", got)
+	}
+	// 2000 tables with a primary key and a text column.
+	if got := drillLocksPer((&pg.LockObjects{Relations: 10000}).Locks()); got != 384 {
+		t.Errorf("large: %d", got)
+	}
 }

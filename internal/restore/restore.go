@@ -12,16 +12,7 @@ import (
 	"bracer.dev/bracer/internal/pg"
 )
 
-// GlobalsResult is the result of restoring globals.
-type GlobalsResult struct {
-	OK            bool     `json:"ok"`
-	IgnoredErrors int      `json:"ignored_errors,omitempty"` // drill: "already exists" ignored
-	Skipped       []string `json:"skipped,omitempty"`        // restore to a clean target: statements left out ("CREATE ROLE postgres")
-	PasswordReset string   `json:"password_reset,omitempty"` // restore to a clean target: the connecting user whose password now comes from the backup
-	Error         string   `json:"error,omitempty"`
-}
-
-// RowMismatch is a table whose row count differs from the manifest.
+// RowMismatch is a table whose row count differs from run.json.
 type RowMismatch struct {
 	Table     string `json:"table"`
 	Expected  int64  `json:"expected"`
@@ -33,7 +24,7 @@ type RowMismatch struct {
 // Blocking: whether this mismatch makes restore/drill fail (an extension table does not).
 func (m RowMismatch) Blocking() bool { return m.Extension == "" }
 
-// Comparison is the result of comparing tables against the manifest.
+// Comparison is the result of comparing tables against run.json.
 type Comparison struct {
 	Found      int
 	Missing    []string
@@ -56,75 +47,6 @@ func (c Comparison) OK() bool {
 
 // StderrTail is the number of stderr lines kept in the error message.
 const StderrTail = 20
-
-// Globals runs globals.sql with psql -v ON_ERROR_STOP=0, ignoring "already
-// exists" (the postgres user is pre-existing), recording other errors without blocking the database.
-func Globals(ctx context.Context, runner pg.Runner, conn pg.Conn, src io.Reader) *GlobalsResult {
-	gr := &GlobalsResult{}
-	conn.Database = "postgres"
-	stderr, err := pg.RunCapture(ctx, runner, conn, "psql", []string{"-X", "-q", "-v", "ON_ERROR_STOP=0", "-f", "-"}, src, io.Discard)
-	ignored, other := splitErrors(stderr)
-	gr.IgnoredErrors = ignored
-	switch {
-	case err != nil:
-		gr.Error = "psql: " + Tail(stderr, StderrTail)
-		if gr.Error == "psql: " {
-			gr.Error = "psql: " + err.Error()
-		}
-	case len(other) > 0:
-		gr.Error = strings.Join(other, "\n")
-	default:
-		gr.OK = true
-	}
-	return gr
-}
-
-// splitErrors counts psql ERROR lines: "already exists" is ignored, the rest are returned.
-func splitErrors(stderr []byte) (ignored int, other []string) {
-	for _, line := range strings.Split(string(stderr), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "ERROR:") {
-			continue
-		}
-		if strings.Contains(line, "already exists") {
-			ignored++
-			continue
-		}
-		other = append(other, line)
-	}
-	return ignored, other
-}
-
-// CreateDatabase creates the database from template0 (avoiding template1's
-// locale/extensions) with the source's exact encoding/locale when the manifest has it (loc != nil;
-// spec fetch-restore § Flow 5). targetMajor > 0 checks the provider before creating;
-// 0 skips the check (drill: the chosen image is ≥ the source server's major).
-func CreateDatabase(ctx context.Context, c *pg.Client, db string, loc *pg.Locale, targetMajor int) error {
-	sql := "create database " + pg.QuoteIdent(db) + " template template0"
-	if loc != nil {
-		opts, err := loc.CreateOptions(targetMajor)
-		if err != nil {
-			return err
-		}
-		sql += opts
-	}
-	if _, err := c.Query(ctx, sql); err != nil {
-		if loc != nil {
-			return fmt.Errorf("%w (the source database has locale %s, which this server must support: install the locale there, or restore into a server that has it; the postgres:N-alpine image accepts any locale name)", err, loc)
-		}
-		return err
-	}
-	return nil
-}
-
-// DatabaseExists queries pg_database.
-func DatabaseExists(ctx context.Context, c *pg.Client, db string) (bool, error) {
-	rows, err := c.Query(ctx, "select 1 from pg_database where datname = "+pg.QuoteLiteral(db))
-	if err != nil {
-		return false, err
-	}
-	return len(rows) > 0, nil
-}
 
 // ErrTimeout: pg_restore exceeded the timeout.
 var ErrTimeout = errors.New("pg_restore timed out")
@@ -256,34 +178,18 @@ func Tail(b []byte, n int) string {
 	return strings.Join(kept, "\n")
 }
 
-// Hint suggests a fix for common pg_restore errors (spec drill, fetch-restore § Edge cases).
+// Hint suggests a fix for common pg_restore errors (spec drill, restore § Edge cases).
 func Hint(stderr []byte) string {
 	switch {
 	case bytes.Contains(stderr, []byte("No space left")):
 		return "\nhint: Docker is out of disk space; check with: docker system df"
 	case bytes.Contains(stderr, []byte("extension")) && bytes.Contains(stderr, []byte("not available")),
 		bytes.Contains(stderr, []byte("could not open extension control file")):
-		return "\nhint: the dump needs extensions this image lacks; set drill.image in app.yaml to an image that has them"
+		return "\nhint: the dump needs extensions this image lacks; set drill.image of the instance in app.yaml to an image that has them"
 	case bytes.Contains(stderr, []byte("role")) && bytes.Contains(stderr, []byte("does not exist")):
 		return "\nhint: users from the source server are missing on this server"
 	}
 	return ""
-}
-
-// ListRoles returns the names of every user on the target (built-in pg_* roles
-// included), to apply database attributes only for users that exist.
-func ListRoles(ctx context.Context, c *pg.Client) ([]string, error) {
-	rows, err := c.Query(ctx, "select rolname from pg_roles order by rolname")
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, r := range rows {
-		if len(r) > 0 && r[0] != "" {
-			names = append(names, r[0])
-		}
-	}
-	return names, nil
 }
 
 // MaxGlobals is the maximum size of globals.sql read into memory (a few KB per user).
@@ -300,9 +206,6 @@ type DiskCheck struct {
 
 // DiskFactor: actual data ≈ DiskFactor × the compressed -Fc dump.
 const DiskFactor = 5
-
-// ErrDiskSpace: the target does not have enough free space.
-var ErrDiskSpace = errors.New("not enough disk space on target")
 
 // CheckDisk queries data_directory, then measures df through the runner if the runner can.
 // Cannot measure → Checked=false with Error set; not a failure.

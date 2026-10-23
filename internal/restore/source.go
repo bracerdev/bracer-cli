@@ -5,19 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
-	"strings"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/pg"
 	"bracer.dev/bracer/internal/storage"
 )
 
-// ErrNoEnv: the run was made before ADR-0015 and has no environment file;
-// it can only be previewed.
-var ErrNoEnv = fmt.Errorf("this backup was made before Bracer recorded the server's environment (ADR-0015), so restore cannot check a target against it")
-
-// RunPick is one run chosen from the manifest: its ts, environment and
+// RunPick is one run chosen for an instance: its ts, environment and
 // globals objects, and the dump of each database.
 type RunPick struct {
 	Instance string
@@ -28,62 +22,49 @@ type RunPick struct {
 	Names    []string
 }
 
-// PickRun chooses the run at ts (default: the latest environment file) and
-// the dump of every database at that ts (dbs empty: all of them).
-func PickRun(im *backup.InstanceManifest, instance, ts string, dbs []string) (*RunPick, error) {
-	if len(im.Env.Dumps) == 0 {
-		return nil, usagef("%v; use --preview to look at the data", ErrNoEnv)
-	}
-	if ts == "" {
-		ts = im.Env.Latest
-	}
-	rp := &RunPick{Instance: instance, TS: ts}
-	for _, d := range im.Env.Dumps {
-		if d.TS == ts {
-			rp.Env = d
-		}
-	}
+// PickRun takes the instance of the run ts and the dump of each database of
+// dbs (the databases of the run's app.yaml). Completeness is checked apart
+// (RunMissing).
+func PickRun(ri *backup.RunInstance, instance, ts string, dbs []string) (*RunPick, error) {
+	rp := &RunPick{Instance: instance, TS: ts, Env: ri.Env, Globals: ri.Globals}
 	if rp.Env == nil {
-		var have []string
-		for _, d := range im.Env.Dumps {
-			have = append(have, d.TS)
-		}
-		return nil, usagef("no backup run of %s at %s (runs with an environment file: %s); an older run can only be previewed (--preview)", instance, ts, strings.Join(have, ", "))
-	}
-	for _, d := range im.Globals.Dumps {
-		if d.TS == ts {
-			rp.Globals = d
-		}
+		return nil, fmt.Errorf("the run %s of %s has no environment file", ts, instance)
 	}
 	if len(dbs) == 0 {
-		for name, dm := range im.Databases {
-			for _, d := range dm.Dumps {
-				if d.TS == ts {
-					dbs = append(dbs, name)
-				}
-			}
-		}
-		sort.Strings(dbs)
-	}
-	if len(dbs) == 0 {
-		return nil, usagef("the run %s of %s has no database dump", ts, instance)
+		return nil, fmt.Errorf("the run %s of %s has no database", ts, instance)
 	}
 	for _, name := range dbs {
-		var dp *backup.Dump
-		if dm := im.Databases[name]; dm != nil {
-			for _, d := range dm.Dumps {
-				if d.TS == ts {
-					dp = d
-				}
-			}
-		}
+		dp := ri.Databases[name]
 		if dp == nil {
-			return nil, usagef("the run %s of %s has no dump of %s; restore takes one run whole", ts, instance, name)
+			return nil, fmt.Errorf("the run %s of %s has no dump of %s", ts, instance, name)
 		}
 		rp.DBs = append(rp.DBs, dp)
 		rp.Names = append(rp.Names, name)
 	}
 	return rp, nil
+}
+
+// RunMissing is what the run lacks of an instance (ADR-0016): the databases
+// of its app.yaml (expected) without a dump, and what backup recorded as
+// missing in run.json.
+func RunMissing(ri *backup.RunInstance, expected []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, name := range expected {
+		if ri.Databases[name] == nil {
+			add(name)
+		}
+	}
+	for _, m := range ri.Missing {
+		add(m)
+	}
+	return out
 }
 
 // MaxEnv is the largest environment file read into memory.
@@ -162,6 +143,24 @@ func (s *SourceRun) Locales() []*pg.Locale {
 		out = append(out, d.Dump.Locale)
 	}
 	return out
+}
+
+// Wants is what ReadTarget reads for this run: the database locales, the
+// locales of the collations the dumps create.
+func (s *SourceRun) Wants() Wants {
+	w := Wants{Locales: s.Locales()}
+	for _, d := range s.DBs {
+		n := d.Dump.RestoreNeeds
+		if n == nil {
+			continue
+		}
+		for i := range n.Collations {
+			if c := &n.Collations[i]; c.Created {
+				w.Locales = append(w.Locales, &c.Locale)
+			}
+		}
+	}
+	return w
 }
 
 // Names are the source database names.

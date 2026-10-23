@@ -21,12 +21,25 @@ type TargetState struct {
 	Avail     map[string]ExtAvail
 	// PkgLib lists the files in the server's library directory; nil when it
 	// cannot be read (not a superuser).
-	PkgLib   map[string]bool
-	AutoConf map[string]string // postgresql.auto.conf now; nil when not readable
-	DBs      map[string]*TargetDB
+	PkgLib map[string]bool
+	// TSData lists SHAREDIR/tsearch_data; nil when it cannot be read.
+	TSData map[string]bool
+	// Collations are the pg_catalog collations of the maintenance database
+	// (the ones a new database gets): name → actual version.
+	Collations map[string]string
+	AutoConf   map[string]string // postgresql.auto.conf now; nil when not readable
+	// Locks sizes the lock table; nil when the settings cannot be read.
+	Locks *pg.LockCapacity
+	// DBs are the databases restore loaded into, read after the load.
+	DBs map[string]*TargetDB
 	// Names is every database on the target.
-	Names    map[string]bool
-	LocaleOK map[string]string // localeKey → "" when the target can create it, else the error
+	Names map[string]bool
+	// CreateDB: the connected user may create databases.
+	CreateDB bool
+	// Effective are the settings in effect for the connected user in the
+	// maintenance database (data mode).
+	Effective []pg.Setting
+	LocaleOK  map[string]string // localeKey → "" when the target can create it, else the error
 }
 
 // ExtAvail is an extension the target's server has files for.
@@ -41,7 +54,7 @@ type HBARule struct {
 	Databases, Users []string
 }
 
-// TargetDB is one database on the target that a restore may load into.
+// TargetDB is a database restore loaded into.
 type TargetDB struct {
 	Name        string
 	Exists      bool
@@ -53,8 +66,6 @@ type TargetDB struct {
 	ACL         map[string]bool   // "grantee privilege" with grantee PUBLIC or a role
 	ACLNull     bool              // datacl is NULL: the default privileges
 	Comment     *string
-	Extensions  []pg.Extension
-	Connections []string
 	Effective   []pg.Setting // data mode: settings in effect in this database for the connected user
 }
 
@@ -67,10 +78,16 @@ type TargetSpec struct {
 	Password  bool // the socket asked for a password: the printed commands pass PGPASSWORD
 }
 
+// Wants is what a target is read for: the source locales to try (databases
+// and created collations).
+type Wants struct {
+	Locales []*pg.Locale
+}
+
 // ReadTarget reads the target through admin (connected to its maintenance
-// database). dbs are the names restore may load into; locales the source
-// locales to try.
-func ReadTarget(ctx context.Context, admin *pg.Client, spec TargetSpec, full bool, dbs []string, locales []*pg.Locale) (*TargetState, error) {
+// database). dbs are the databases restore loaded into: none before the load.
+func ReadTarget(ctx context.Context, admin *pg.Client, spec TargetSpec, full bool, dbs []string, wants Wants) (*TargetState, error) {
+	locales := wants.Locales
 	env, _, err := pg.CollectEnv(ctx, admin, pg.EnvSource{Kind: spec.Kind, Container: spec.Container, Local: spec.Local, Shell: spec.Shell}, nil)
 	if err != nil {
 		return nil, err
@@ -90,21 +107,30 @@ func ReadTarget(ctx context.Context, admin *pg.Client, spec TargetSpec, full boo
 				}
 			}
 		}
-		if rows, err := admin.Query(ctx, "select f from pg_ls_dir((select setting from pg_config where name = 'PKGLIBDIR')) f"); err == nil {
-			st.PkgLib = map[string]bool{}
-			for _, r := range rows {
-				st.PkgLib[r[0]] = true
-			}
-		}
+		st.PkgLib = listDir(ctx, admin, "PKGLIBDIR", "")
+		st.TSData = listDir(ctx, admin, "SHAREDIR", "/tsearch_data")
 		if ac, err := admin.AutoConfSettings(ctx); err == nil {
 			st.AutoConf = ac
+		}
+	}
+	if l, err := admin.LockCapacity(ctx); err == nil {
+		st.Locks = l
+	}
+	rows, err := admin.Query(ctx, "select collname, coalesce(pg_collation_actual_version(oid), '') from pg_collation where collnamespace = 'pg_catalog'::regnamespace")
+	if err != nil {
+		return nil, fmt.Errorf("read collations: %w", err)
+	}
+	st.Collations = map[string]string{}
+	for _, r := range rows {
+		if len(r) == 2 {
+			st.Collations[r[0]] = r[1]
 		}
 	}
 	sql := "select name, coalesce(default_version, ''), false from pg_available_extensions"
 	if st.Major >= 13 {
 		sql = "select e.name, coalesce(e.default_version, ''), coalesce(v.trusted, false) from pg_available_extensions e left join pg_available_extension_versions v on v.name = e.name and v.version = e.default_version"
 	}
-	rows, err := admin.Query(ctx, sql)
+	rows, err = admin.Query(ctx, sql)
 	if err != nil {
 		return nil, fmt.Errorf("read available extensions: %w", err)
 	}
@@ -121,18 +147,17 @@ func ReadTarget(ctx context.Context, admin *pg.Client, spec TargetSpec, full boo
 	for _, r := range rows {
 		st.Names[r[0]] = true
 	}
-	want := map[string]bool{}
-	for _, db := range dbs {
-		want[db] = true
+	priv, err := admin.AdminPrivileges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the privileges of %s: %w", env.CurrentUser, err)
 	}
-	for n := range st.Names {
-		for _, db := range dbs {
-			if strings.HasPrefix(n, cutBytes(db, maxIdent-len("_restored_20060102_1504"))+"_restored_") {
-				want[n] = true
-			}
+	st.CreateDB = priv.CreateDB
+	if !full {
+		if st.Effective, err = admin.EffectiveSettings(ctx); err != nil {
+			return nil, fmt.Errorf("read the settings in effect: %w", err)
 		}
 	}
-	for _, n := range sortedKeys(want) {
+	for _, n := range dbs {
 		td, err := readTargetDB(ctx, admin, n, st.Names[n], st.Major, !full)
 		if err != nil {
 			return nil, err
@@ -186,29 +211,26 @@ func readTargetDB(ctx context.Context, admin *pg.Client, name string, exists boo
 	for _, r := range rows {
 		td.ACL[r[0]+" "+r[1]] = true
 	}
-	rows, err = admin.Query(ctx, "select coalesce(usename, '') || '@' || coalesce(client_addr::text, 'local') || case when application_name <> '' then ' (' || application_name || ')' else '' end from pg_stat_activity where datname = "+lit+" and pid <> pg_backend_pid() and backend_type = 'client backend' order by 1")
-	if err != nil {
-		return nil, fmt.Errorf("read connections to %s: %w", name, err)
-	}
-	for _, r := range rows {
-		td.Connections = append(td.Connections, r[0])
-	}
-	if !allowConn {
-		return td, nil
-	}
-	c := admin.WithDB(name)
-	if td.Objects, err = c.UserObjects(ctx); err != nil {
-		return nil, fmt.Errorf("count objects in %s: %w", name, err)
-	}
-	if td.Extensions, err = c.Extensions(ctx); err != nil {
-		return nil, fmt.Errorf("read extensions of %s: %w", name, err)
-	}
-	if effective {
-		if td.Effective, err = c.EffectiveSettings(ctx); err != nil {
+	if effective && allowConn {
+		if td.Effective, err = admin.WithDB(name).EffectiveSettings(ctx); err != nil {
 			return nil, fmt.Errorf("read settings in %s: %w", name, err)
 		}
 	}
 	return td, nil
+}
+
+// listDir lists a directory under a pg_config directory (superuser); nil
+// when it cannot be read.
+func listDir(ctx context.Context, admin *pg.Client, dir, sub string) map[string]bool {
+	rows, err := admin.Query(ctx, "select f from pg_ls_dir((select setting from pg_config where name = "+pg.QuoteLiteral(dir)+") || "+pg.QuoteLiteral(sub)+") f")
+	if err != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, r := range rows {
+		out[r[0]] = true
+	}
+	return out
 }
 
 // tryLocale creates a collation with the locale in a transaction that rolls

@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -28,12 +30,15 @@ import (
 // fakeRunner fakes psql/pg_dump/pg_dumpall by tool and SQL statement.
 type fakeRunner struct {
 	dbs        []string
+	extraDBs   []string          // on the server but not in app.yaml
 	payload    map[string]string // db → pg_dump contents
 	failDump   string            // db whose pg_dump fails
-	super      bool
-	readAll    bool   // pg_read_all_data
-	sysid      string // system_identifier; empty: pg_control_system() fails (managed)
-	noSettings bool   // shared_preload_libraries unreadable (no pg_read_all_settings)
+	notSuper   bool              // the connected user is not a superuser (default: it is)
+	cfuncs     string            // rows of the C functions query (probin, function)
+	colls      string            // rows of the collations query
+	readAll    bool              // pg_read_all_data
+	sysid      string            // system_identifier; empty: pg_control_system() fails (managed)
+	noSettings bool              // shared_preload_libraries unreadable (no pg_read_all_settings)
 	calls      []string
 }
 
@@ -41,6 +46,9 @@ func (f *fakeRunner) Describe() string { return "fake runner" }
 
 func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []string, stdin io.Reader, stdout io.Writer) error {
 	f.calls = append(f.calls, tool+" "+strings.Join(args, " ")+" db="+conn.Database)
+	if tool == "psql" && hasArg(args, "-0") {
+		stdout = psqlRows{stdout}
+	}
 	switch tool {
 	case "psql":
 		if args[len(args)-1] == "-" { // -f - session: reads statements one by one from stdin
@@ -57,7 +65,7 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 		// Environment record (ADR-0015).
 		case strings.HasPrefix(sql, "select (select rolname from pg_roles where oid = 10)"):
 			su := "f"
-			if f.super {
+			if !f.notSuper {
 				su = "t"
 			}
 			io.WriteString(stdout, "postgres\x1fbackup\x1f"+su+"\x1foff\x1f100\x1f\n")
@@ -70,7 +78,16 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 		case strings.HasPrefix(sql, "select lower(name) from pg_settings"),
 			strings.HasPrefix(sql, "select spcname"),
 			strings.HasPrefix(sql, "select 'function '"),
-			strings.HasPrefix(sql, "select 'subscription '"):
+			strings.HasPrefix(sql, "select 'subscription '"),
+			strings.HasPrefix(sql, "select td.oid::regdictionary"):
+		case strings.HasPrefix(sql, "select p.probin"):
+			io.WriteString(stdout, f.cfuncs)
+		case strings.HasPrefix(sql, "with uses as"):
+			io.WriteString(stdout, f.colls)
+		case strings.HasPrefix(sql, "select encode(sha256(pg_read_binary_file"):
+			io.WriteString(stdout, "5ea1\n")
+		case strings.HasPrefix(sql, "select r.n, f.n from"):
+			io.WriteString(stdout, "412\x1f37\n")
 		case strings.HasPrefix(sql, "select (select count(*) from pg_class"):
 			io.WriteString(stdout, "0\n")
 		case sql == "show shared_preload_libraries":
@@ -79,10 +96,12 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 			}
 			io.WriteString(stdout, "pg_stat_statements,timescaledb\n")
 		case strings.HasPrefix(sql, "select datname"):
-			io.WriteString(stdout, strings.Join(f.dbs, "\n")+"\n")
+			for _, n := range append(append([]string{"template1"}, f.dbs...), f.extraDBs...) {
+				io.WriteString(stdout, n+"\n")
+			}
 		case strings.HasPrefix(sql, "select current_user"):
 			su, ra := "f", "f"
-			if f.super {
+			if !f.notSuper {
 				su = "t"
 			}
 			if f.readAll {
@@ -95,7 +114,7 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 			io.WriteString(stdout, "UTF8\x1fC.UTF-8\x1fC.UTF-8\x1fc\x1f\x1f\n")
 		case strings.HasPrefix(sql, "select extname, extversion"):
 			if conn.Database != "template1" {
-				io.WriteString(stdout, "uuid-ossp\x1f1.1\x1fpublic\n")
+				io.WriteString(stdout, "postgis\x1f3.4.2\x1fpublic\x1ft\nuuid-ossp\x1f1.1\x1fpublic\x1ff\n")
 			}
 		case strings.HasPrefix(sql, "select system_identifier"):
 			if f.sysid == "" {
@@ -108,6 +127,10 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 	case "pg_dump":
 		if len(args) == 1 && args[0] == "--version" {
 			io.WriteString(stdout, "pg_dump (PostgreSQL) 17.11\n")
+			return nil
+		}
+		if slices.Contains(args, "--schema-only") {
+			io.WriteString(stdout, "PGDMP-schema")
 			return nil
 		}
 		if !slices.Contains(args, "--snapshot="+fakeSnapshotID) {
@@ -166,13 +189,20 @@ func (f *fakeRunner) session(conn pg.Conn, stdin io.Reader, stdout io.Writer) er
 	return nil
 }
 
-// memStore is an in-memory bucket.
+// fakeRows is what the fake's shop database totals: events (estimated 5e9),
+// new_table (7) and orders (14300); measurements is a partitioned parent.
+const fakeRows = 5000000000 + 7 + 14300
+
+// root is <prefix>/<folder>/ of baseCfg.
+const root = "bracer/shop-abc123/"
+
+// memStore is an in-memory bucket that records the order of writes and deletes.
 type memStore struct {
-	mu                 sync.Mutex
-	objects            map[string][]byte
-	failPut            string   // Put fails for keys containing this string
-	deletedWhileListed []string // keys deleted while manifest.json still points to them
-	deleted            []string
+	mu      sync.Mutex
+	objects map[string][]byte
+	failPut string   // Put fails for keys containing this string
+	puts    []string // keys written, in order
+	deleted []string // keys deleted, in order
 }
 
 func newMemStore() *memStore { return &memStore{objects: map[string][]byte{}} }
@@ -190,6 +220,7 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.objects[key] = data
+	m.puts = append(m.puts, key)
 	return nil
 }
 func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, error) {
@@ -213,42 +244,103 @@ func (m *memStore) List(_ context.Context, prefix string) ([]storage.Object, err
 func (m *memStore) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if bytes.Contains(m.objects["bracer/shop/manifest.json"], []byte(key)) {
-		m.deletedWhileListed = append(m.deletedWhileListed, key)
-	}
 	delete(m.objects, key)
 	m.deleted = append(m.deleted, key)
 	return nil
 }
 
-func (m *memStore) manifest(t *testing.T) *Manifest {
+// newest loads the newest run.json of the folder: the state of the app.
+func (m *memStore) newest(t *testing.T) *Run {
 	t.Helper()
-	data, ok := m.objects["bracer/shop/manifest.json"]
-	if !ok {
-		t.Fatal("manifest.json missing")
-	}
-	var mf Manifest
-	if err := json.Unmarshal(data, &mf); err != nil {
+	r, _, err := Newest(context.Background(), m, root)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return &mf
+	return r
 }
 
-func baseCfg() *config.App {
+// keysOf lists the keys under the run folder ts, sorted.
+func (m *memStore) keysOf(ts string) []string {
+	var out []string
+	for k := range m.objects {
+		if strings.HasPrefix(k, RunDir(root, ts)) {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// putRun writes r as the run.json of its ts under root and returns it as
+// LoadRun reads it back (keys hydrated).
+func putRun(t *testing.T, st *memStore, r *Run) *Run {
+	t.Helper()
+	r.Schema = runSchema
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.objects[RunKey(root, r.TS)] = data
+	loaded, err := LoadRun(context.Background(), st, root, r.TS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loaded
+}
+
+// oldRun puts an ended run of shop at ts into the bucket: the dump and a
+// run.json written by here, ok, drill off, orders with rows rows. edit
+// changes the run before it is written.
+func oldRun(t *testing.T, st *memStore, ts string, rows int64, edit ...func(*Run)) *Run {
+	t.Helper()
+	key := dumpKey(root, ts, "main", "shop", false)
+	st.objects[key] = []byte("old " + ts)
+	sum := sha256.Sum256(st.objects[key])
+	r := &Run{
+		App: "shop", TS: ts, Writer: here,
+		Backup: Outcome{Result: ResultOK, Reasons: []string{}},
+		Instances: map[string]*RunInstance{"main": {
+			Kind: "container", Missing: []string{}, Drill: &DrillOutcome{Result: DrillOff},
+			Databases: map[string]*Dump{"shop": {Bytes: int64(len(st.objects[key])), SHA256: hex.EncodeToString(sum[:]), Tables: []pg.Table{{Schema: "public", Name: "orders", Rows: &rows}}}},
+		}},
+	}
+	for _, e := range edit {
+		e(r)
+	}
+	return putRun(t, st, r)
+}
+
+// baseCfg backs up dbs (default: shop) of one container instance, keeping
+// every run of the last 2 days; a test that needs another keep sets it.
+func baseCfg(dbs ...string) *config.App {
+	if len(dbs) == 0 {
+		dbs = []string{"shop"}
+	}
+	var list []config.Database
+	for _, n := range dbs {
+		list = append(list, config.Database{Name: n})
+	}
 	return &config.App{
 		App:        "shop",
-		Instances:  []config.Instance{{Name: "main", Container: "shop-db", User: "postgres", PgMajor: 17, Databases: config.Databases{All: true}}},
-		Storage:    &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Prefix: "bracer", AccessKeyEnv: "A", SecretKeyEnv: "S"},
+		Instances:  []config.Instance{{Name: "main", Connection: config.Connection{Container: "shop-db", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone}, Databases: config.Databases(list)}},
+		Storage:    &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Folder: "shop-abc123", AccessKeyEnv: "A", SecretKeyEnv: "S"},
 		Encryption: "none",
-		Retention:  &config.Retention{Keep: 2},
+		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 2},
 	}
 }
+
+// here is the place the tests run from; deps creates its folder when missing.
+var here = Writer{ID: "1111222233334444", Hostname: "vps-1", Path: "/home/deploy/.config/bracer/shop"}
 
 func deps(st storage.Store, r pg.Runner) Deps {
 	clock := time.Date(2026, 10, 16, 3, 0, 0, 0, time.UTC)
 	return Deps{
-		Store: st,
-		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Store:  st,
+		Here:   here,
+		Create: true,
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// The calendar in UTC here; TestKeepSet covers another zone.
+		Location: time.UTC,
 		Now: func() time.Time {
 			clock = clock.Add(time.Second)
 			return clock
@@ -259,75 +351,106 @@ func deps(st storage.Store, r pg.Runner) Deps {
 	}
 }
 
-func TestRunPlainDumpsAndManifest(t *testing.T) {
+// fakeDrill is a drill step that gives every instance the result, failing
+// the instance in the result when the drill failed.
+func fakeDrill(result string, reasons ...string) DrillFunc {
+	return func(_ context.Context, run *Run, res *Result) {
+		for name, ri := range run.Instances {
+			ri.Drill = &DrillOutcome{Result: result, At: time.Date(2026, 10, 16, 3, 5, 0, 0, time.UTC), TookSeconds: 12.5, Reasons: reasons}
+			if result == DrillFailed {
+				res.Instance(name).DrillFailed = reasons
+			}
+		}
+	}
+}
+
+func TestBackupPlainDumpsAndRunJSON(t *testing.T) {
 	st := newMemStore()
-	r := &fakeRunner{dbs: []string{"postgres", "shop"}, payload: map[string]string{"postgres": "PGDMP-postgres", "shop": "PGDMP-shop"}, super: true}
-	res, err := Run(context.Background(), baseCfg(), deps(st, r))
+	r := &fakeRunner{dbs: []string{"postgres", "shop"}, payload: map[string]string{"postgres": "PGDMP-postgres", "shop": "PGDMP-shop"}}
+	res, err := Backup(context.Background(), baseCfg(r.dbs...), deps(st, r))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.OK || len(res.Instances) != 1 || !res.Instances[0].OK || len(res.Instances[0].Databases) != 2 {
+	if !res.OK || res.Status != ResultOK || len(res.Instances) != 1 || !res.Instances[0].OK || len(res.Instances[0].Databases) != 2 || len(res.Instances[0].Missing) != 0 || res.Instances[0].Missing == nil {
 		b, _ := json.MarshalIndent(res, "", " ")
 		t.Fatalf("result:\n%s", b)
 	}
+	// Every object of the run is under one folder <root><ts>/ (ADR-0026).
 	var dumpKeys, globalKeys int
 	for k, v := range st.objects {
+		if !strings.HasPrefix(k, RunDir(root, res.TS)) {
+			t.Errorf("object outside the run folder: %s", k)
+		}
 		switch {
 		case strings.HasSuffix(k, ".dump"):
 			dumpKeys++
-			if !strings.HasPrefix(k, "bracer/shop/main/") || !strings.HasPrefix(string(v), "PGDMP-") {
+			if !strings.HasPrefix(k, RunDir(root, res.TS)+"main/") || !strings.HasPrefix(string(v), "PGDMP-") {
 				t.Errorf("object %s = %q", k, v)
 			}
-		case strings.Contains(k, "/globals/") && strings.HasSuffix(k, ".sql"):
+		case strings.HasSuffix(k, "/main/globals.sql"):
 			globalKeys++
 		}
 	}
 	if dumpKeys != 2 || globalKeys != 1 {
 		t.Errorf("dumps=%d globals=%d (globals must run once per instance)", dumpKeys, globalKeys)
 	}
-	mf := st.manifest(t)
-	im := mf.Instances["main"]
-	if im == nil || im.PgVersion != "17.11" || !im.Globals.HasPasswords || im.Globals.Latest == "" {
-		t.Fatalf("manifest instance: %+v", im)
+	// run.json ends the run: the last object written.
+	if last := st.puts[len(st.puts)-1]; last != RunKey(root, res.TS) {
+		t.Errorf("last object written = %s, want run.json", last)
 	}
-	if im.SharedPreloadLibraries == nil || *im.SharedPreloadLibraries != "pg_stat_statements,timescaledb" {
-		t.Errorf("manifest shared_preload_libraries: %v", im.SharedPreloadLibraries)
+	run := st.newest(t)
+	if run.TS != res.TS || run.App != "shop" || run.Writer != here || run.Verdict() != ResultOK || run.Backup.Result != ResultOK || len(run.Backup.Reasons) != 0 || run.Backup.Fix != "" || run.Backup.StartedAt != res.StartedAt || run.Backup.FinishedAt != res.FinishedAt {
+		t.Fatalf("run.json: %+v", run)
 	}
-	shop := im.Databases["shop"]
-	if shop == nil || len(shop.Dumps) != 1 || shop.Latest != shop.Dumps[0].TS {
-		t.Fatalf("manifest shop: %+v", shop)
+	if run.AppYAML == nil || run.AppYAML.Key != appYAMLKey(root, run.TS, false) || !bytes.Contains(st.objects[run.AppYAML.Key], []byte("app: shop")) {
+		t.Errorf("app.yaml of the run: %+v", run.AppYAML)
 	}
-	d := shop.Dumps[0]
-	if d.Locale == nil || *d.Locale != (pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C.UTF-8"}) {
-		t.Errorf("manifest locale: %+v", d.Locale)
+	ri := run.Instances["main"]
+	if ri == nil || ri.Kind != "container" || ri.PgVersion != "17.11" || ri.ToolVersion == "" || !ri.Whole() || ri.Globals == nil || !ri.Globals.HasPasswords || ri.Globals.Key != globalsKey(root, run.TS, "main", false) {
+		t.Fatalf("run instance: %+v", ri)
 	}
-	if len(d.Extensions) != 1 || d.Extensions[0] != (pg.Extension{Name: "uuid-ossp", Version: "1.1", Schema: "public"}) {
-		t.Errorf("manifest extensions: %+v", d.Extensions)
+	if ri.Drill == nil || ri.Drill.Result != DrillOff {
+		t.Errorf("no drill step given: drill must be off, got %+v", ri.Drill)
 	}
-	// ADR-0015: one ts per run, shared by every dump, the globals and the environment record.
-	im = st.manifest(t).Instances["main"]
-	if im.Kind != "container" || len(im.Env.Dumps) != 1 || im.Env.Latest != d.TS || im.Globals.Latest != d.TS || im.Databases["postgres"].Latest != d.TS {
-		t.Errorf("run ts: kind %s, env %+v, globals %s, shop %s", im.Kind, im.Env, im.Globals.Latest, d.TS)
+	if ri.SharedPreloadLibraries == nil || *ri.SharedPreloadLibraries != "pg_stat_statements,timescaledb" {
+		t.Errorf("shared_preload_libraries: %v", ri.SharedPreloadLibraries)
+	}
+	shop := ri.Databases["shop"]
+	if shop == nil || shop.Key != dumpKey(root, run.TS, "main", "shop", false) || shop.TS != run.TS || shop.ToolVersion != ri.ToolVersion {
+		t.Fatalf("shop (keys must be hydrated from the run): %+v", shop)
+	}
+	if shop.Locale == nil || *shop.Locale != (pg.Locale{Encoding: "UTF8", Collate: "C.UTF-8", Ctype: "C.UTF-8"}) {
+		t.Errorf("locale: %+v", shop.Locale)
+	}
+	if len(shop.Extensions) != 2 || shop.Extensions[0] != (pg.Extension{Name: "postgis", Version: "3.4.2", Schema: "public", Config: true}) || shop.Extensions[1] != (pg.Extension{Name: "uuid-ossp", Version: "1.1", Schema: "public"}) {
+		t.Errorf("extensions: %+v", shop.Extensions)
+	}
+	// ADR-0015: one ts per run, shared by every dump, the globals and the environment file.
+	if ri.Env == nil || ri.Env.Key != envKey(root, run.TS, "main", false) || ri.Env.TS != run.TS || ri.Databases["postgres"].TS != run.TS {
+		t.Errorf("run ts: env %+v, postgres %+v", ri.Env, ri.Databases["postgres"])
 	}
 	var env pg.Env
-	if err := json.Unmarshal(st.objects[im.Env.Dumps[0].Key], &env); err != nil || env.SourceKind != "container" || env.ServerVersionNum != 170011 || !env.HasFileSettings || len(env.Settings) != 1 {
+	if err := json.Unmarshal(st.objects[ri.Env.Key], &env); err != nil || env.SourceKind != "container" || env.ServerVersionNum != 170011 || !env.HasFileSettings || len(env.Settings) != 1 {
 		t.Errorf("environment record: %v %+v", err, env)
 	}
 	sum := sha256.Sum256([]byte("PGDMP-shop"))
-	if d.Bytes != int64(len("PGDMP-shop")) || d.SHA256 != hex.EncodeToString(sum[:]) || d.Encrypted || d.Recipient != nil {
-		t.Errorf("dump entry: %+v", d)
+	if shop.Bytes != int64(len("PGDMP-shop")) || shop.SHA256 != hex.EncodeToString(sum[:]) || shop.Encrypted || shop.Recipient != nil {
+		t.Errorf("dump entry: %+v", shop)
 	}
 	// row_counts auto: events (5e9) is only estimated; new_table (-1) and orders (<1e6) are counted exactly.
 	// measurements is a partitioned parent (relkind p): not counted, no rows_est.
 	want := map[string][2]*int64{"events": {nil, i64(5000000000)}, "measurements": {nil, nil}, "new_table": {i64(7), nil}, "orders": {i64(14300), nil}}
-	if len(d.Tables) != 4 {
-		t.Fatalf("tables: %+v", d.Tables)
+	if len(shop.Tables) != 4 {
+		t.Fatalf("tables: %+v", shop.Tables)
 	}
-	for _, tb := range d.Tables {
+	for _, tb := range shop.Tables {
 		w := want[tb.Name]
 		if !eqI64(tb.Rows, w[0]) || !eqI64(tb.RowsEst, w[1]) {
 			t.Errorf("table %s: rows=%v rows_est=%v", tb.Name, deref(tb.Rows), deref(tb.RowsEst))
 		}
+	}
+	if n, est := TotalRows(shop); n != fakeRows || !est {
+		t.Errorf("total rows = %d est=%v", n, est)
 	}
 	if res.Instances[0].Databases[1].Tables != 4 || res.Instances[0].Databases[1].Bytes == 0 {
 		t.Errorf("database result: %+v", res.Instances[0].Databases[1])
@@ -361,40 +484,7 @@ func eqI64(a, b *int64) bool {
 	return *a == *b
 }
 
-func TestRowCountsModes(t *testing.T) {
-	for _, tc := range []struct {
-		mode               string
-		max                int64
-		events, orders, nt bool
-	}{
-		{"auto", 1_000_000, false, true, true},
-		{"auto", 10_000, false, false, true},
-		{"exact", 1_000_000, true, true, true},
-		{"estimate", 1_000_000, false, false, false},
-	} {
-		r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "x"}, super: true}
-		st := newMemStore()
-		cfg := baseCfg()
-		cfg.RowCounts, cfg.ExactMaxRows = tc.mode, tc.max
-		res, err := Run(context.Background(), cfg, deps(st, r))
-		if err != nil || !res.OK {
-			t.Fatalf("%s: %v %+v", tc.mode, err, res)
-		}
-		d := st.manifest(t).Instances["main"].Databases["shop"].Dumps[0]
-		got := map[string]bool{}
-		for _, tb := range d.Tables {
-			got[tb.Name] = tb.Rows != nil
-			if (tb.Rows != nil) == (tb.RowsEst != nil) && tb.Name != "new_table" && tb.Name != "measurements" {
-				t.Errorf("%s/%s: exactly one of rows/rows_est: %v %v", tc.mode, tb.Name, deref(tb.Rows), deref(tb.RowsEst))
-			}
-		}
-		if got["events"] != tc.events || got["orders"] != tc.orders || got["new_table"] != tc.nt || got["measurements"] {
-			t.Errorf("%s max=%d: counted %v", tc.mode, tc.max, got)
-		}
-	}
-}
-
-func TestRunEncryptedWithAge(t *testing.T) {
+func TestBackupEncryptedWithAge(t *testing.T) {
 	kp, _ := crypto.Generate()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "shop.key")
@@ -402,17 +492,20 @@ func TestRunEncryptedWithAge(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", kp.Recipient, keyPath
 	st := newMemStore()
-	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": strings.Repeat("PGDMP-shop ", 1000)}, super: true}
-	res, err := Run(context.Background(), cfg, deps(st, r))
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": strings.Repeat("PGDMP-shop ", 1000)}}
+	res, err := Backup(context.Background(), cfg, deps(st, r))
 	if err != nil || !res.OK {
 		t.Fatal(err, res)
 	}
 	if len(res.Warnings) != 0 {
 		t.Errorf("unexpected warnings: %v", res.Warnings)
 	}
-	mf := st.manifest(t)
-	d := mf.Instances["main"].Databases["shop"].Dumps[0]
-	if !strings.HasSuffix(d.Key, ".dump.age") || !d.Encrypted || d.Recipient == nil || *d.Recipient != kp.Recipient {
+	run := st.newest(t)
+	if !run.Encrypted() || run.Recipient() != kp.Recipient || run.AppYAML == nil || !strings.HasSuffix(run.AppYAML.Key, "/app.yaml.age") {
+		t.Fatalf("run: encrypted=%v recipient=%q app.yaml=%+v", run.Encrypted(), run.Recipient(), run.AppYAML)
+	}
+	d := run.Instances["main"].Databases["shop"]
+	if d.Key != dumpKey(root, run.TS, "main", "shop", true) || !d.Encrypted || d.Recipient == nil || *d.Recipient != kp.Recipient {
 		t.Fatalf("dump entry: %+v", d)
 	}
 	stored := st.objects[d.Key]
@@ -423,6 +516,10 @@ func TestRunEncryptedWithAge(t *testing.T) {
 	if bytes.Contains(stored, []byte("PGDMP")) {
 		t.Error("stored object is not encrypted")
 	}
+	// run.json itself is plaintext metadata.
+	if !bytes.Contains(st.objects[RunKey(root, run.TS)], []byte(`"result": "ok"`)) {
+		t.Error("run.json must be plaintext")
+	}
 	ids, _, _ := crypto.ReadIdentities(keyPath)
 	rd, err := crypto.Decrypt(bytes.NewReader(stored), ids)
 	if err != nil {
@@ -432,23 +529,32 @@ func TestRunEncryptedWithAge(t *testing.T) {
 	if string(plain) != r.payload["shop"] {
 		t.Error("decrypted payload differs")
 	}
-	// Private key gone → still backs up, with a warning.
+	// Private key gone → still backs up, deletes nothing (not even a run
+	// outside keep), not ok (ADR-0019).
 	os.Remove(keyPath)
-	res, _ = Run(context.Background(), cfg, deps(newMemStore(), r))
-	if !res.OK || len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "drill") {
-		t.Errorf("missing identity must warn but still back up: ok=%v warnings=%v", res.OK, res.Warnings)
+	st2 := newMemStore()
+	old := oldRun(t, st2, "2026-10-01T030000Z", 10)
+	res, _ = Backup(context.Background(), cfg, deps(st2, r))
+	if res.OK || res.Status != ResultFailed || !strings.Contains(res.Error, "nothing is deleted until it can") || !strings.Contains(res.Error, "Fix:") {
+		t.Errorf("key mismatch must back up and fail: ok=%v error=%q", res.OK, res.Error)
+	}
+	if run := st2.newest(t); run.TS == old.TS || run.Instances["main"].Databases["shop"] == nil || run.Verdict() != ResultFailed {
+		t.Errorf("the run must still be written: %+v", run)
+	}
+	if len(st2.deleted) != 0 || len(st2.keysOf(old.TS)) != 2 {
+		t.Errorf("nothing may be deleted: %v", st2.deleted)
 	}
 }
 
-func TestRunOneDatabaseFailsOthersContinue(t *testing.T) {
+func TestBackupOneDatabaseFailsOthersContinue(t *testing.T) {
 	st := newMemStore()
 	r := &fakeRunner{dbs: []string{"bad", "good"}, payload: map[string]string{"good": "PGDMP-good"}, failDump: "bad"}
-	res, err := Run(context.Background(), baseCfg(), deps(st, r))
+	res, err := Backup(context.Background(), baseCfg(r.dbs...), deps(st, r))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.OK || res.Instances[0].OK {
-		t.Error("result must be not ok")
+	if res.OK || res.Status != ResultFailed || res.Instances[0].OK {
+		t.Error("result must be failed")
 	}
 	bad, good := res.Instances[0].Databases[0], res.Instances[0].Databases[1]
 	if bad.OK || !strings.Contains(bad.Error, "row-level security") {
@@ -457,113 +563,247 @@ func TestRunOneDatabaseFailsOthersContinue(t *testing.T) {
 	if !good.OK {
 		t.Errorf("good must still be dumped: %+v", good)
 	}
-	mf := st.manifest(t)
-	if _, exists := mf.Instances["main"].Databases["bad"]; exists {
-		t.Error("failed dump must not enter the manifest")
+	if m := res.Instances[0].Missing; len(m) != 1 || m[0] != "bad" {
+		t.Errorf("missing = %v", m)
+	}
+	run := st.newest(t)
+	ri := run.Instances["main"]
+	if _, exists := ri.Databases["bad"]; exists || ri.Whole() || len(ri.Missing) != 1 || ri.Missing[0] != "bad" {
+		t.Errorf("failed dump must not enter run.json; missing must name it: %+v", ri)
+	}
+	if run.Verdict() != ResultFailed || run.Backup.Result != ResultFailed || len(run.Backup.Reasons) != 1 || !strings.HasPrefix(run.Backup.Reasons[0], "main/bad: ") || run.Backup.Fix != "bracer remove shop, then bracer init shop" {
+		t.Errorf("backup outcome: %+v", run.Backup)
 	}
 	for k := range st.objects {
-		if strings.Contains(k, "/bad/") {
+		if strings.HasSuffix(k, "/bad.dump") {
 			t.Errorf("partial object stored: %s", k)
 		}
 	}
-	// User without pg_read_all_data → globals without passwords.
-	if res.Instances[0].Globals == nil || res.Instances[0].Globals.HasPasswords {
-		t.Errorf("globals: %+v", res.Instances[0].Globals)
-	}
-	if !contains(r.calls, "pg_dumpall --globals-only --no-role-passwords --lock-wait-timeout=60000 db=postgres") {
-		t.Errorf("calls: %v", r.calls)
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "main: this run is missing bad; restore needs an older run") {
+		t.Errorf("warnings: %v", res.Warnings)
 	}
 }
 
-func TestRetentionDeletesOldestAfterUploadOnly(t *testing.T) {
+// ADR-0017: a full source whose user is no longer a superuser is not backed
+// up at all: nothing is dumped and nothing of the instance is written.
+func TestBackupFullSourceNeedsSuperuser(t *testing.T) {
 	st := newMemStore()
-	// Old manifest with 2 dumps of shop (keep=2) and 1 dump of events (keep=5 per database).
-	old := newManifest("shop")
-	im := old.instance("main")
-	for i, ts := range []string{"2026-10-14T030000Z", "2026-10-15T030000Z"} {
-		key := "bracer/shop/main/shop/" + ts + ".dump"
-		st.objects[key] = []byte("old")
-		im.database("shop").addDump(&Dump{TS: ts, Key: key, UploadedAt: time.Date(2026, 10, 14+i, 3, 0, 0, 0, time.UTC)})
-	}
-	st.objects["bracer/shop/main/events/2026-10-15T030000Z.dump"] = []byte("old")
-	im.database("events").addDump(&Dump{TS: "2026-10-15T030000Z", Key: "bracer/shop/main/events/2026-10-15T030000Z.dump", UploadedAt: time.Date(2026, 10, 15, 3, 0, 0, 0, time.UTC)})
-	SaveManifest(context.Background(), st, "bracer/shop/manifest.json", old, time.Now())
-
-	cfg := baseCfg()
-	cfg.Instances[0].Databases = config.Databases{List: []config.Database{{Name: "shop"}, {Name: "events", Retention: &config.Retention{Keep: 5}}}}
-	r := &fakeRunner{payload: map[string]string{"shop": "new", "events": "new"}, super: true}
-	res, err := Run(context.Background(), cfg, deps(st, r))
-	if err != nil || !res.OK {
-		t.Fatal(err, res)
-	}
-	if len(st.deleted) != 1 || st.deleted[0] != "bracer/shop/main/shop/2026-10-14T030000Z.dump" {
-		t.Errorf("deleted = %v (only the oldest shop dump beyond keep=2)", st.deleted)
-	}
-	if len(st.deletedWhileListed) != 0 {
-		t.Errorf("manifest must be rewritten before objects are deleted: %v", st.deletedWhileListed)
-	}
-	mf := st.manifest(t)
-	if n := len(mf.Instances["main"].Databases["shop"].Dumps); n != 2 {
-		t.Errorf("shop dumps in manifest = %d", n)
-	}
-	if n := len(mf.Instances["main"].Databases["events"].Dumps); n != 2 {
-		t.Errorf("events dumps = %d (keep=5, nothing pruned)", n)
-	}
-
-	// Upload fails → nothing is deleted.
-	st2 := newMemStore()
-	for k, v := range st.objects {
-		st2.objects[k] = v
-	}
-	st2.failPut = "/shop/2026-10-16"
-	res, err = Run(context.Background(), cfg, deps(st2, r))
-	if err != nil || res.OK {
-		t.Fatal("put failure must make the run not ok", err)
-	}
-	if len(st2.deleted) != 0 {
-		t.Errorf("nothing may be deleted when upload failed: %v", st2.deleted)
-	}
-}
-
-func TestAllDiffAndCorruptManifest(t *testing.T) {
-	st := newMemStore()
-	old := newManifest("shop")
-	old.instance("main").database("gone")
-	old.instance("main").database("shop")
-	SaveManifest(context.Background(), st, "bracer/shop/manifest.json", old, time.Now())
-	r := &fakeRunner{dbs: []string{"shop", "fresh"}, payload: map[string]string{"shop": "x", "fresh": "y"}, super: true}
-	res, err := Run(context.Background(), baseCfg(), deps(st, r))
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "PGDMP-shop"}, notSuper: true}
+	res, err := Backup(context.Background(), baseCfg(r.dbs...), deps(st, r))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ir := res.Instances[0]
-	if len(ir.Added) != 1 || ir.Added[0] != "fresh" || len(ir.Removed) != 1 || ir.Removed[0] != "gone" {
-		t.Errorf("added=%v removed=%v", ir.Added, ir.Removed)
+	if res.OK || ir.OK || !strings.Contains(ir.Error, "is not a superuser: a full backup (users, settings) needs one; nothing was backed up") || !strings.Contains(ir.Error, "Fix: bracer remove shop, then bracer init shop") {
+		t.Fatalf("instance: %+v", ir)
 	}
-
-	st.objects["bracer/shop/manifest.json"] = []byte("{not json")
-	res, err = Run(context.Background(), baseCfg(), deps(st, r))
-	if err != nil || !res.OK || len(res.Warnings) == 0 || !strings.Contains(res.Warnings[0], "skipping retention") || !strings.Contains(res.Warnings[0], "copied to bracer/shop/manifest.json.corrupt-") {
-		t.Errorf("corrupt manifest: err=%v ok=%v warnings=%v", err, res.OK, res.Warnings)
-	}
-	copies := 0
-	for k, v := range st.objects {
-		if strings.HasPrefix(k, "bracer/shop/manifest.json.corrupt-") && string(v) == "{not json" {
-			copies++
+	for _, c := range r.calls {
+		if strings.HasPrefix(c, "pg_dump") {
+			t.Errorf("must not dump: %s", c)
 		}
 	}
-	if copies != 1 {
-		t.Errorf("corrupt manifest must be kept as a copy, found %d", copies)
+	for k := range st.objects {
+		if strings.Contains(k, "/main/") {
+			t.Errorf("nothing of the instance may be stored: %s", k)
+		}
 	}
-	if _, err := LoadManifest(context.Background(), st, "bracer/shop/manifest.json", "shop"); err != nil {
-		t.Error("manifest must be rewritten as valid JSON after the run")
+	// The run still ends: run.json says what it lacks.
+	ri := st.newest(t).Instances["main"]
+	if ri == nil || ri.Env != nil || ri.Globals != nil || len(ri.Databases) != 0 || strings.Join(ri.Missing, ",") != "shop,env,globals" {
+		t.Errorf("run instance: %+v", ri)
 	}
-	// The corrupt copy cannot be written → the manifest is not overwritten.
-	st.objects["bracer/shop/manifest.json"] = []byte("{still not json")
-	st.failPut = ".corrupt-"
-	res, err = Run(context.Background(), baseCfg(), deps(st, r))
-	if err != nil || string(st.objects["bracer/shop/manifest.json"]) != "{still not json" || !strings.Contains(strings.Join(res.Warnings, "\n"), "left untouched") {
-		t.Errorf("manifest must stay untouched when the copy fails: err=%v obj=%q warnings=%v", err, st.objects["bracer/shop/manifest.json"], res.Warnings)
+}
+
+// ADR-0020, ADR-0026: retention deletes whole run folders outside keep,
+// run.json first; a failed run still ends with run.json and retention runs.
+func TestRetentionDeletesWholeFolders(t *testing.T) {
+	st := newMemStore()
+	// Two old runs, one a day; the newer one also has events; daily: 2.
+	oldRun(t, st, "2026-10-14T030000Z", 10)
+	old15 := oldRun(t, st, "2026-10-15T030000Z", 10, func(r *Run) {
+		r.Instances["main"].Databases["events"] = &Dump{Bytes: 3}
+	})
+	st.objects[dumpKey(root, old15.TS, "main", "events", false)] = []byte("old")
+
+	cfg := baseCfg("shop", "events")
+	r := &fakeRunner{payload: map[string]string{"shop": "new", "events": "new"}}
+	d := deps(st, r)
+	var logged bytes.Buffer
+	d.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	res, err := Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK {
+		t.Fatal(err, res)
+	}
+	if strings.Join(st.deleted, ",") != RunKey(root, "2026-10-14T030000Z")+","+dumpKey(root, "2026-10-14T030000Z", "main", "shop", false) {
+		t.Errorf("deleted = %v (the whole folder older than the last 2 days, run.json first)", st.deleted)
+	}
+	// ADR-0027: one line per removed run, not one per key.
+	if strings.Count(logged.String(), "retention: removed run 2026-10-14T030000Z") != 1 || strings.Contains(logged.String(), "retention: deleted") {
+		t.Errorf("retention log:\n%s", logged.String())
+	}
+	if len(st.keysOf(old15.TS)) != 3 || len(st.keysOf(res.TS)) != 6 {
+		t.Errorf("kept folders: %v %v", st.keysOf(old15.TS), st.keysOf(res.TS))
+	}
+	if n := len(st.deleted) + len(st.objects); st.newest(t).TS != res.TS || n != 11 {
+		t.Errorf("objects: %d", n)
+	}
+
+	// Upload fails → the run is failed, still ends with run.json, and
+	// deletes nothing (ADR-0029).
+	st2 := newMemStore()
+	oldRun(t, st2, "2026-10-14T030000Z", 10)
+	oldRun(t, st2, "2026-10-15T030000Z", 10)
+	st2.failPut = "main/shop.dump"
+	res, err = Backup(context.Background(), cfg, deps(st2, r))
+	if err != nil || res.OK || res.Status != ResultFailed {
+		t.Fatal("put failure must make the run failed", err)
+	}
+	if run := st2.newest(t); run.TS != res.TS || run.Verdict() != ResultFailed || strings.Join(run.Instances["main"].Missing, ",") != "shop" {
+		t.Errorf("failed run.json: %+v", run)
+	}
+	if len(st2.deleted) != 0 || len(st2.keysOf("2026-10-14T030000Z")) != 2 {
+		t.Errorf("deleted = %v; a failed run deletes nothing", st2.deleted)
+	}
+}
+
+// Backup dumps exactly the databases the customer chose: one more on the
+// server is not bracer's business (ADR-0024). A corrupt run.json stops
+// everything before anything is written (ADR-0023).
+func TestOnlyChosenAndCorruptRunJSON(t *testing.T) {
+	st := newMemStore()
+	r := &fakeRunner{dbs: []string{"shop"}, extraDBs: []string{"fresh"}, payload: map[string]string{"shop": "x"}}
+	res, err := Backup(context.Background(), baseCfg(), deps(st, r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ir := res.Instances[0]
+	if !res.OK || res.Status != ResultOK {
+		t.Errorf("ok=%v status=%s", res.OK, res.Status)
+	}
+	if len(ir.Databases) != 1 || ir.Databases[0].Name != "shop" {
+		t.Errorf("only app.yaml's databases are dumped: %+v", ir.Databases)
+	}
+	if run := st.newest(t); run.Backup.Result != ResultOK || len(run.Instances["main"].Databases) != 1 {
+		t.Errorf("run.json: %+v", run)
+	}
+
+	// A corrupt newest run.json: nothing is written, not even over it.
+	key := RunKey(root, res.TS)
+	st.objects[key] = []byte("{not json")
+	before := len(st.objects)
+	r.calls = nil
+	if _, err = Backup(context.Background(), baseCfg(), deps(st, r)); err == nil || !errors.Is(err, ErrRunCorrupt) || !strings.Contains(err.Error(), "not valid JSON") || !strings.Contains(err.Error(), "Fix: bracer remove shop, then bracer init shop") {
+		t.Errorf("corrupt run.json: err=%v", err)
+	}
+	if len(st.objects) != before || string(st.objects[key]) != "{not json" || len(r.calls) != 0 {
+		t.Errorf("nothing may be written or dumped: %d objects, calls %v", len(st.objects), r.calls)
+	}
+}
+
+// ADR-0023: a folder that is missing (outside init's first run) or written
+// by another place is never written to.
+func TestFolderMissingOrAnotherWriter(t *testing.T) {
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "x"}}
+	st := newMemStore()
+	d := deps(st, r)
+	d.Create = false
+	_, err := Backup(context.Background(), baseCfg(), d)
+	if err == nil || err.Error() != "the bucket has no folder shop-abc123: its backups are gone or the bucket settings point elsewhere\nFix: bracer remove shop, then bracer init" || len(st.objects) != 0 || len(r.calls) != 0 {
+		t.Errorf("missing folder: err=%v objects=%d calls=%v", err, len(st.objects), r.calls)
+	}
+	// A folder that did not end (no run.json) is not a folder either.
+	st.objects[RunDir(root, "2026-10-10T030000Z")+"main/shop.dump"] = []byte("half")
+	if _, err := Backup(context.Background(), baseCfg(), d); err == nil || !strings.HasPrefix(err.Error(), "the bucket has no folder shop-abc123") || len(r.calls) != 0 {
+		t.Errorf("folder without run.json: err=%v", err)
+	}
+	// init's first run creates it, owned by here.
+	if _, err := Backup(context.Background(), baseCfg(), deps(st, r)); err != nil {
+		t.Fatal(err)
+	}
+	if run := st.newest(t); run.Writer != here || run.Verdict() != ResultOK || run.Backup.Fix != "" {
+		t.Errorf("created run: %+v", run)
+	}
+	// Another place (a copy of the app directory): nothing is written.
+	n := len(st.objects)
+	d = deps(st, r)
+	d.Here = Writer{ID: "9999888877776666", Hostname: "vps-2", Path: "/home/deploy/.config/bracer/shop2"}
+	r.calls = nil
+	_, err = Backup(context.Background(), baseCfg(), d)
+	if err == nil || err.Error() != "folder shop-abc123 is written by vps-1:/home/deploy/.config/bracer/shop; bracer does not write to it from here\nFix: bracer remove shop, then bracer init shop" || len(st.objects) != n || len(r.calls) != 0 {
+		t.Errorf("another writer: err=%v objects %d→%d calls=%v", err, n, len(st.objects), r.calls)
+	}
+}
+
+func TestHere(t *testing.T) {
+	dir := t.TempDir()
+	MachineIDPath = filepath.Join(dir, "machine-id")
+	defer func() { MachineIDPath = "/etc/machine-id" }()
+	os.WriteFile(MachineIDPath, []byte("0123456789abcdef0123456789abcdef\n"), 0o644)
+	app := filepath.Join(dir, "shop")
+	os.MkdirAll(app, 0o700)
+	os.Symlink(app, filepath.Join(dir, "link"))
+	a, err := Here("shop-abc123", filepath.Join(app, "app.yaml"))
+	if err != nil || len(a.ID) != 16 || a.Path != app && !strings.HasSuffix(a.Path, "/shop") {
+		t.Fatalf("here: %+v %v", a, err)
+	}
+	if b, _ := Here("shop-abc123", filepath.Join(dir, "link", "app.yaml")); b.ID != a.ID {
+		t.Errorf("a symlink to the same directory is the same place: %s %s", a.ID, b.ID)
+	}
+	if c, _ := Here("shop-abc123", filepath.Join(dir, "shop2", "app.yaml")); c.ID == a.ID {
+		t.Error("another directory is another place")
+	}
+	if c, _ := Here("shop-zzz999", filepath.Join(app, "app.yaml")); c.ID == a.ID {
+		t.Error("another folder gives another id")
+	}
+	os.WriteFile(MachineIDPath, []byte("ffffffffffffffffffffffffffffffff\n"), 0o644)
+	if c, _ := Here("shop-abc123", filepath.Join(app, "app.yaml")); c.ID == a.ID {
+		t.Error("another machine is another place")
+	}
+	if strings.Contains(a.ID, "0123") {
+		t.Error("the machine id must not show")
+	}
+	os.Remove(MachineIDPath)
+	if _, err := Here("shop-abc123", filepath.Join(app, "app.yaml")); err == nil {
+		t.Error("no machine-id must be an error")
+	}
+}
+
+// ADR-0027, ADR-0029: run.json stores no verdict; Verdict() computes it
+// from the backup and the drills, ok or failed.
+func TestVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  Run
+		want string
+	}{
+		{"ok", Run{Backup: Outcome{Result: ResultOK}}, ResultOK},
+		{"warnings only", Run{Backup: Outcome{Result: ResultOK, Warnings: []string{"main/shop dropped"}}}, ResultOK},
+		{"backup failed", Run{Backup: Outcome{Result: ResultFailed}}, ResultFailed},
+		{"drill failed", Run{Backup: Outcome{Result: ResultOK}, Instances: map[string]*RunInstance{"main": {Drill: &DrillOutcome{Result: DrillFailed}}}}, ResultFailed},
+		{"drill off", Run{Backup: Outcome{Result: ResultOK}, Instances: map[string]*RunInstance{"main": {Drill: &DrillOutcome{Result: DrillOff}}}}, ResultOK},
+	} {
+		if got := tc.run.Verdict(); got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestNewOutcome(t *testing.T) {
+	started := time.Date(2026, 10, 16, 3, 0, 1, 0, time.UTC)
+	finished := started.Add(2*time.Minute + 10*time.Second)
+	o := NewOutcome(started, finished, []string{"main/auth: database auth does not exist", "main: postgres is not a superuser\n  Fix: bracer remove shop, then bracer init shop"}, []string{"Postgres on main is now 18 (app.yaml says 17); run bracer remove shop, then bracer init shop to record it"}, "bracer remove shop, then bracer init shop")
+	if o.Result != ResultFailed || len(o.Reasons) != 2 || o.Reasons[1] != "main: postgres is not a superuser" || o.Fix != "bracer remove shop, then bracer init shop" || o.StartedAt != started || o.FinishedAt != finished || len(o.Warnings) != 1 {
+		t.Errorf("failed outcome: %+v", o)
+	}
+	// ADR-0029: a warning does not change the result and carries no Fix.
+	if o := NewOutcome(started, finished, nil, []string{"main/shop dropped from 2000 to 100 rows"}, "bracer remove shop, then bracer init shop"); o.Result != ResultOK || o.Fix != "" || len(o.Reasons) != 0 || len(o.Warnings) != 1 {
+		t.Errorf("warning outcome: %+v", o)
+	}
+	if o := NewOutcome(started, finished, nil, nil, "bracer remove shop, then bracer init shop"); o.Result != ResultOK || o.Fix != "" || o.Reasons == nil || len(o.Reasons) != 0 || o.Warnings == nil || len(o.Warnings) != 0 {
+		t.Errorf("ok outcome: %+v", o)
+	}
+	if Worse(ResultOK, ResultFailed) != ResultFailed || Worse(ResultFailed, ResultOK) != ResultFailed || Worse(ResultOK, ResultOK) != ResultOK {
+		t.Error("Worse")
 	}
 }
 
@@ -586,116 +826,101 @@ func TestLock(t *testing.T) {
 	l2.Release()
 }
 
-func TestRetentionNeverPrunesThisRunAndWarnsOrphans(t *testing.T) {
+// The ts of a run always sorts after the newest folder (clock behind → +1 s,
+// warning); a folder without run.json is a run that did not end and goes;
+// keys outside a <ts>/ folder are never touched (ADR-0026).
+func TestClockBehindAndFoldersWithoutRunJSON(t *testing.T) {
 	st := newMemStore()
-	// Two old dumps with uploaded_at in the future (the machine clock ran ahead when they were made).
-	old := newManifest("shop")
-	im := old.instance("main")
-	for i, ts := range []string{"2026-10-20T030000Z", "2026-10-21T030000Z"} {
-		key := "bracer/shop/main/shop/" + ts + ".dump"
-		st.objects[key] = []byte("old")
-		im.database("shop").addDump(&Dump{TS: ts, Key: key, UploadedAt: time.Date(2026, 10, 20+i, 3, 0, 0, 0, time.UTC)})
+	// A run of yesterday and one five minutes ahead of the clock (NTP set it back).
+	oldRun(t, st, "2026-10-15T030000Z", 10)
+	oldRun(t, st, "2026-10-16T030500Z", 10)
+	// A run that did not end, a stray key, the probe and an old layout's key.
+	half := RunDir(root, "2026-10-14T030000Z") + "main/shop.dump"
+	st.objects[half] = []byte("half")
+	strays := []string{root + "stray.dump", ProbeKey("shop-abc123"), root + "drill/main.json"}
+	for _, k := range strays {
+		st.objects[k] = []byte("?")
 	}
-	// One orphan object and a key outside the prefix in the manifest.
-	st.objects["bracer/shop/main/shop/stray.dump"] = []byte("?")
-	im.database("other").addDump(&Dump{TS: "2026-01-01T000000Z", Key: "elsewhere/x.dump", UploadedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)})
-	im.database("other").addDump(&Dump{TS: "2026-01-02T000000Z", Key: "elsewhere/y.dump", UploadedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)})
-	im.database("other").addDump(&Dump{TS: "2026-01-03T000000Z", Key: "elsewhere/z.dump", UploadedAt: time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)})
-	st.objects["bracer/shop/main/other/2026-01-04T000000Z.dump"] = []byte("old")
-	im.database("other").addDump(&Dump{TS: "2026-01-04T000000Z", Key: "bracer/shop/main/other/2026-01-04T000000Z.dump", UploadedAt: time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC)})
-	SaveManifest(context.Background(), st, "bracer/shop/manifest.json", old, time.Now())
 
-	cfg := baseCfg() // keep 2
-	cfg.Instances[0].Databases = config.Databases{List: []config.Database{{Name: "shop"}, {Name: "other"}}}
-	r := &fakeRunner{payload: map[string]string{"shop": "new", "other": "new"}, super: true}
-	res, err := Run(context.Background(), cfg, deps(st, r))
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "new"}}
+	res, err := Backup(context.Background(), baseCfg(), deps(st, r))
 	if err != nil || !res.OK {
 		t.Fatal(err, res)
 	}
-	// shop: 3 dumps, keep 2 → the newest by the clock (2026-10-16, "oldest" when sorted) is the one just created: not deleted, stop.
-	// other: 3 foreign keys + 1 real old dump + the new one, keep 2 → foreign keys are kept (warning) but do not block: the real old dump is deleted.
-	if strings.Join(st.deleted, ",") != "bracer/shop/main/other/2026-01-04T000000Z.dump" {
-		t.Errorf("only the old real dump of `other` may be deleted (never this run's, never keys outside the prefix): %v", st.deleted)
+	if res.TS != "2026-10-16T030501Z" || !slices.Contains(res.Warnings, "clock is behind the last run 2026-10-16T030500Z; this run is 2026-10-16T030501Z") {
+		t.Errorf("ts = %s, warnings %v", res.TS, res.Warnings)
 	}
-	warned := strings.Join(res.Warnings, "\n")
-	for _, k := range []string{"x", "y", "z"} {
-		if !strings.Contains(warned, "elsewhere/"+k+".dump is outside bracer/shop/") {
-			t.Errorf("key outside prefix must be refused: %v", res.Warnings)
+	if st.newest(t).TS != res.TS {
+		t.Error("this run must be the newest")
+	}
+	// keep 2 days: every run of 10-16 (both) and of 10-15 stays (ADR-0029);
+	// the folder without run.json goes.
+	if strings.Join(st.deleted, ",") != half {
+		t.Errorf("deleted = %v", st.deleted)
+	}
+	if len(st.keysOf("2026-10-15T030000Z")) != 2 || len(st.keysOf("2026-10-16T030500Z")) != 2 {
+		t.Error("the runs of 10-15 and the earlier one of 10-16 must stay")
+	}
+	for _, k := range strays {
+		if _, ok := st.objects[k]; !ok {
+			t.Errorf("%s is outside every run folder and must be left alone", k)
 		}
-	}
-	if m, _ := LoadManifest(context.Background(), st, "bracer/shop/manifest.json", "shop"); m == nil || len(m.Instances["main"].Databases["other"].Dumps) != 4 {
-		t.Errorf("manifest must keep the 3 foreign keys and the new dump: %+v", m)
-	}
-	if !strings.Contains(warned, "1 object(s) under bracer/shop/ are not in manifest.json (e.g. bracer/shop/main/shop/stray.dump)") {
-		t.Errorf("orphan warning missing: %v", res.Warnings)
-	}
-	if _, ok := st.objects["bracer/shop/main/shop/stray.dump"]; !ok {
-		t.Error("orphans must be left untouched")
 	}
 }
 
 // Container with password_env (Bitnami demands a password even over the socket): the
-// password must go into Conn so ExecRunner passes -e PGPASSWORD; a pod (before ADR-0013) → clear error.
-func TestTargetPasswordForContainerNotPod(t *testing.T) {
+// password must go into Conn so ExecRunner passes -e PGPASSWORD.
+func TestTargetPasswordForContainer(t *testing.T) {
 	sec := config.NewSecrets(map[string]string{"PW": "s3cret"}, "test")
-	_, conn, err := Target(config.Instance{Name: "c", Container: "db", User: "postgres", PasswordEnv: "PW", Databases: config.Databases{All: true}}, sec)
+	_, conn, err := Target(config.Instance{Name: "c", Connection: config.Connection{Container: "db", User: "postgres", PasswordEnv: "PW"}}, sec)
 	if err != nil || conn.Password != "s3cret" {
 		t.Fatalf("container: conn=%+v err=%v", conn, err)
 	}
-	_, conn, err = Target(config.Instance{Name: "c", Container: "db", User: "postgres", Databases: config.Databases{All: true}}, sec)
+	_, conn, err = Target(config.Instance{Name: "c", Connection: config.Connection{Container: "db", User: "postgres"}}, sec)
 	if err != nil || conn.Password != "" {
 		t.Fatalf("container without password_env: conn=%+v err=%v", conn, err)
 	}
-	if _, _, err = Target(config.Instance{Name: "p", Pod: "ns/pg", User: "postgres", PasswordEnv: "PW", Databases: config.Databases{All: true}}, sec); err == nil || !strings.Contains(err.Error(), "ADR-0013") {
-		t.Fatalf("pod: err=%v", err)
-	}
 }
 
-// spec backup § Flow 3a2: another cluster at the same place is still dumped, but no old
-// dump is deleted; the dumps carry system_id; a different major only warns.
-func TestIdentityChangedHoldsRetention(t *testing.T) {
+// spec backup § Flow 3a2, ADR-0029: another cluster at the same place is
+// still dumped and only warned about, retention as usual; run.json carries
+// system_id; a different major warns too.
+func TestIdentityChangeWarns(t *testing.T) {
 	st := newMemStore()
-	old := newManifest("shop")
-	im := old.instance("main")
-	for i, ts := range []string{"2026-10-14T030000Z", "2026-10-15T030000Z"} {
-		key := "bracer/shop/main/shop/" + ts + ".dump"
-		st.objects[key] = []byte("old")
-		im.database("shop").addDump(&Dump{TS: ts, Key: key, UploadedAt: time.Date(2026, 10, 14+i, 3, 0, 0, 0, time.UTC), SystemID: "7698217040907026472"})
+	for _, ts := range []string{"2026-10-14T030000Z", "2026-10-15T030000Z"} {
+		oldRun(t, st, ts, 10, func(r *Run) { r.Instances["main"].SystemID = "7698217040907026472" })
 	}
-	SaveManifest(context.Background(), st, "bracer/shop/manifest.json", old, time.Now())
 	cfg := baseCfg()
-	cfg.Instances[0].Databases = config.Databases{List: []config.Database{{Name: "shop"}}}
 	cfg.Instances[0].SystemID = "7698217040907026472"
 	cfg.Instances[0].PgMajor = 16
-	r := &fakeRunner{payload: map[string]string{"shop": "new"}, super: true, sysid: "7562871935211888659"}
+	r := &fakeRunner{payload: map[string]string{"shop": "new"}, sysid: "7562871935211888659"}
 	d := deps(st, r)
-	d.ConfigPath = "/srv/shop/app.yaml"
-	res, err := Run(context.Background(), cfg, d)
-	if err != nil || !res.OK {
+	res, err := Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK || res.Status != ResultOK {
 		t.Fatal(err, res)
 	}
 	ir := res.Instances[0]
-	if !ir.IdentityChanged || ir.SystemID != "7562871935211888659" || len(st.deleted) != 0 {
-		t.Errorf("identity_changed=%v system_id=%s deleted=%v", ir.IdentityChanged, ir.SystemID, st.deleted)
+	if !ir.IdentityChanged || ir.SystemID != "7562871935211888659" || !slices.Contains(st.deleted, RunKey(root, "2026-10-14T030000Z")) {
+		t.Errorf("identity_changed=%v system_id=%s deleted=%v (keep 2 days: 10-14 goes as usual)", ir.IdentityChanged, ir.SystemID, st.deleted)
 	}
 	all := strings.Join(res.Warnings, "\n")
-	if !strings.Contains(all, "main is a different Postgres cluster than before (initialized 2025-10-19") || !strings.Contains(all, "Fix: bracer init -c /srv/shop/app.yaml") || !strings.Contains(all, "Postgres on main is now 17 (app.yaml says 16)") {
+	if !strings.Contains(all, "main is a different Postgres cluster than before (initialized 2025-10-19") || !strings.Contains(all, "app.yaml says 7698217040907026472); run bracer remove shop, then bracer init shop to confirm it") || !strings.Contains(all, "Postgres on main is now 17 (app.yaml says 16); run bracer remove shop, then bracer init shop to record it") {
 		t.Errorf("warnings: %v", res.Warnings)
 	}
-	mf := st.manifest(t)
-	dumps := mf.Instances["main"].Databases["shop"].Dumps
-	if len(dumps) != 3 || dumps[2].SystemID != "7562871935211888659" {
-		t.Errorf("dumps: %+v", dumps)
+	run := st.newest(t)
+	if ri := run.Instances["main"]; run.TS != res.TS || run.Verdict() != ResultOK || ri.SystemID != "7562871935211888659" || !ri.IdentityChanged || !reflect.DeepEqual(run.Backup.Warnings, res.Warnings) {
+		t.Errorf("run.json: %+v %+v", run, run.Instances["main"])
 	}
 
-	// Same cluster → retention runs again; managed without pg_control_system() → no check, no failure.
+	// Same cluster → no warning; managed (system_id: none) → no check, no failure.
 	r.sysid = "7562871935211888659"
-	cfg.Instances[0].SystemID = r.sysid
-	if res, err = Run(context.Background(), cfg, d); err != nil || res.Instances[0].IdentityChanged || len(st.deleted) == 0 {
-		t.Errorf("same cluster: %v %+v deleted=%v", err, res.Instances[0], st.deleted)
+	cfg.Instances[0].SystemID, cfg.Instances[0].PgMajor = r.sysid, 17
+	if res, err = Backup(context.Background(), cfg, d); err != nil || res.Status != ResultOK || res.Instances[0].IdentityChanged || strings.Contains(strings.Join(res.Warnings, "\n"), "cluster") {
+		t.Errorf("same cluster: %v %+v", err, res)
 	}
 	r.sysid = ""
-	if res, err = Run(context.Background(), cfg, d); err != nil || !res.OK || res.Instances[0].IdentityChanged {
+	cfg.Instances[0].SystemID = config.SystemIDNone
+	if res, err = Backup(context.Background(), cfg, d); err != nil || res.Status != ResultOK || res.Instances[0].IdentityChanged {
 		t.Errorf("managed: %v %+v", err, res)
 	}
 }
@@ -703,17 +928,419 @@ func TestIdentityChangedHoldsRetention(t *testing.T) {
 // ADR-0014: a backup user without pg_read_all_settings cannot read
 // shared_preload_libraries; the backup still succeeds, the field stays empty
 // and a warning names the GRANT.
-func TestRunPreloadLibrariesUnreadable(t *testing.T) {
+func TestBackupPreloadLibrariesUnreadable(t *testing.T) {
 	st := newMemStore()
-	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "PGDMP-shop"}, super: true, noSettings: true}
-	res, err := Run(context.Background(), baseCfg(), deps(st, r))
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "PGDMP-shop"}, noSettings: true}
+	res, err := Backup(context.Background(), baseCfg(), deps(st, r))
 	if err != nil || !res.OK {
 		t.Fatalf("res %+v, err %v", res, err)
 	}
-	if im := st.manifest(t).Instances["main"]; im.SharedPreloadLibraries != nil {
-		t.Errorf("shared_preload_libraries = %q", *im.SharedPreloadLibraries)
+	if ri := st.newest(t).Instances["main"]; ri.SharedPreloadLibraries != nil {
+		t.Errorf("shared_preload_libraries = %q", *ri.SharedPreloadLibraries)
 	}
 	if w := strings.Join(res.Warnings, "\n"); !strings.Contains(w, "GRANT pg_read_all_settings TO") {
 		t.Errorf("warnings: %s", w)
+	}
+}
+
+// Every run ends with run.json, its instance marked whole or not, and a
+// failed run deletes nothing (ADR-0029): the newest run that passed is
+// never deleted, and the failed runs of the same day stay as long as the
+// window keeps that day.
+func TestFailedRunDeletesNothing(t *testing.T) {
+	st := newMemStore()
+	oldRun(t, st, "2026-10-14T030000Z", 10)
+	oldRun(t, st, "2026-10-15T030000Z", 10)
+	r := &fakeRunner{dbs: []string{"shop", "auth"}, payload: map[string]string{"shop": "PGDMP-shop", "auth": "PGDMP-auth"}}
+	cfg := baseCfg("shop", "auth") // keep 2 days
+	d := deps(st, r)
+	res, err := Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK || len(res.Instances[0].Missing) != 0 {
+		t.Fatalf("first run: %v %+v", err, res.Instances[0])
+	}
+	first := res.TS
+	run := st.newest(t)
+	if run.AppYAML == nil || run.AppYAML.TS != first || run.AppYAML.Key != appYAMLKey(root, first, false) {
+		t.Fatalf("app.yaml of the run: %+v", run.AppYAML)
+	}
+	if _, ok := st.objects[appYAMLKey(root, first, false)]; !ok {
+		t.Error("app.yaml of the run not in the bucket")
+	}
+	wantKeys := []string{appYAMLKey(root, first, false), dumpKey(root, first, "main", "auth", false), envKey(root, first, "main", false), globalsKey(root, first, "main", false), dumpKey(root, first, "main", "shop", false), RunKey(root, first)}
+	if got := st.keysOf(first); strings.Join(got, ",") != strings.Join(wantKeys, ",") {
+		t.Errorf("objects of the run: %v", got)
+	}
+	// The pass run kept 10-16 and 10-15 and removed 10-14.
+	if strings.Join(st.deleted, ",") != RunKey(root, "2026-10-14T030000Z")+","+dumpKey(root, "2026-10-14T030000Z", "main", "shop", false) {
+		t.Errorf("deleted = %v", st.deleted)
+	}
+
+	st.deleted = nil
+	r.failDump = "auth"
+	for i := 0; i < 3; i++ {
+		res, err = Backup(context.Background(), cfg, d)
+		if err != nil || res.OK || res.Status != ResultFailed || len(res.Instances[0].Missing) != 1 || res.Instances[0].Missing[0] != "auth" {
+			t.Fatalf("run with auth failing: %v ok=%v %+v", err, res.OK, res.Instances[0])
+		}
+		if run := st.newest(t); run.TS != res.TS || run.Verdict() != ResultFailed || run.Instances["main"].Whole() || strings.Join(run.Instances["main"].Missing, ",") != "auth" {
+			t.Fatalf("failed run.json: %+v %+v", run, run.Instances["main"])
+		}
+	}
+	if len(st.deleted) != 0 || len(st.keysOf("2026-10-15T030000Z")) != 2 {
+		t.Errorf("a failed run deletes nothing: %v", st.deleted)
+	}
+	if got := st.keysOf(first); strings.Join(got, ",") != strings.Join(wantKeys, ",") {
+		t.Errorf("every object of the run that passed must be kept: %v", got)
+	}
+
+	// The next pass run keeps every run of the window, the failed ones of
+	// today included (they have a dump), and removes 10-15 with keep 1.
+	r.failDump = ""
+	cfg.Schedule.Keep = 1
+	if res, err = Backup(context.Background(), cfg, d); err != nil || !res.OK {
+		t.Fatalf("pass run: %v %+v", err, res)
+	}
+	if strings.Join(st.deleted, ",") != RunKey(root, "2026-10-15T030000Z")+","+dumpKey(root, "2026-10-15T030000Z", "main", "shop", false) {
+		t.Errorf("deleted = %v", st.deleted)
+	}
+	var dumps, runs int
+	for k := range st.objects {
+		if strings.HasSuffix(k, "/shop.dump") {
+			dumps++
+		}
+		if strings.HasSuffix(k, "/"+RunFile) {
+			runs++
+		}
+	}
+	if dumps != 5 || runs != 5 {
+		t.Errorf("shop dumps %d, runs %d: the five runs of today all stay", dumps, runs)
+	}
+}
+
+// psqlRows turns the newline-ended rows the fakes print into what psql -0
+// prints: each row ended by a NUL. The session marker line keeps its newline.
+type psqlRows struct{ w io.Writer }
+
+func (p psqlRows) Write(b []byte) (int, error) {
+	if bytes.HasPrefix(b, []byte("__BRACER_END__")) || bytes.IndexByte(b, 0) >= 0 {
+		return p.w.Write(b)
+	}
+	if _, err := p.w.Write(bytes.ReplaceAll(b, []byte("\n"), []byte{0})); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func hasArg(args []string, a string) bool {
+	for _, x := range args {
+		if x == a {
+			return true
+		}
+	}
+	return false
+}
+
+// spec backup § needs: run.json records the library a C function loads and
+// the collations columns use.
+func TestBackupRecordsNeeds(t *testing.T) {
+	f := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "PGDMP-shop"}}
+	f.cfuncs = "$libdir/mylib\x1fpublic.score(text)\n$libdir/mylib\x1fpublic.rank(text)\n"
+	f.colls = "pg_catalog\x1fsv_SE\x1ff\x1fc\x1fsv_SE.utf8\x1fsv_SE.utf8\x1f\x1f\x1f2.41\x1fpublic.customers.name\n"
+	st := newMemStore()
+	if res, err := Backup(context.Background(), baseCfg(), deps(st, f)); err != nil || !res.OK {
+		t.Fatalf("res %+v, err %v", res, err)
+	}
+	dp := st.newest(t).Instances["main"].Databases["shop"]
+	if dp.RestoreNeeds == nil || len(dp.RestoreNeeds.Libraries) != 1 {
+		t.Fatalf("needs: %+v", dp.RestoreNeeds)
+	}
+	if e := dp.Extensions; len(e) != 2 || !e[0].Config || e[1].Config {
+		t.Errorf("extensions: %+v", e)
+	}
+	if lo := dp.LockObjects; lo == nil || lo.Relations != 412 || lo.ForeignKeys != 37 {
+		t.Errorf("lock objects: %+v", lo)
+	}
+	lib := dp.RestoreNeeds.Libraries[0]
+	if lib.Name != "mylib.so" || strings.Join(lib.UsedBy, ",") != "public.score(text),public.rank(text)" {
+		t.Errorf("library: %+v", lib)
+	}
+	c := dp.RestoreNeeds.Collations
+	if len(c) != 1 || c[0].Name != "sv_SE" || c[0].Created || c[0].Collate != "sv_SE.utf8" || c[0].Provider != "" || c[0].Version != "2.41" || c[0].UsedBy[0] != "public.customers.name" {
+		t.Errorf("collations: %+v", c)
+	}
+}
+
+// ADR-0026, ADR-0029: a failed drill fails the run and the run deletes
+// nothing; a run that passed keeps only the window, whatever drills the
+// older runs passed.
+func TestDrillFailsRunAndDeletesNothing(t *testing.T) {
+	st := newMemStore()
+	passed := oldRun(t, st, "2026-10-14T030000Z", 10, func(r *Run) {
+		r.Instances["main"].Drill = &DrillOutcome{Result: DrillPassed, At: time.Date(2026, 10, 14, 3, 5, 0, 0, time.UTC)}
+	})
+	oldRun(t, st, "2026-10-15T030000Z", 10, func(r *Run) {
+		r.Instances["main"].Drill = &DrillOutcome{Result: DrillFailed, Reasons: []string{"orders: 10 rows, dump says 11"}}
+	})
+	if !passed.AllDrillsPassed() {
+		t.Fatal("seeded run must count as drill-passed")
+	}
+	cfg := baseCfg()
+	cfg.Schedule.Keep = 1
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "new"}}
+	d := deps(st, r) // no drill step: this run's drill is off
+	res, err := Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK {
+		t.Fatal(err, res)
+	}
+	sorted := append([]string(nil), st.deleted...)
+	sort.Strings(sorted)
+	if strings.Join(sorted, ",") != dumpKey(root, "2026-10-14T030000Z", "main", "shop", false)+","+RunKey(root, "2026-10-14T030000Z")+","+dumpKey(root, "2026-10-15T030000Z", "main", "shop", false)+","+RunKey(root, "2026-10-15T030000Z") {
+		t.Errorf("deleted = %v: keep 1 keeps today only, the old drill-pass is not protected", st.deleted)
+	}
+	if strings.Contains(strings.Join(res.Warnings, "\n"), "keeping run") {
+		t.Errorf("warnings: %v", res.Warnings)
+	}
+	if run := st.newest(t); run.AllDrillsPassed() || run.Instances["main"].Drill.Result != DrillOff {
+		t.Errorf("drill off: %+v", run.Instances["main"].Drill)
+	}
+
+	// This run passes its drill.
+	st.deleted = nil
+	d.Drill = fakeDrill(DrillPassed)
+	res, err = Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK || res.Status != ResultOK {
+		t.Fatal(err, res)
+	}
+	run := st.newest(t)
+	if dr := run.Instances["main"].Drill; !run.AllDrillsPassed() || run.Verdict() != ResultOK || dr.TookSeconds != 12.5 || dr.At.IsZero() {
+		t.Errorf("drill outcome: %+v", dr)
+	}
+	if len(st.deleted) != 0 {
+		t.Errorf("deleted = %v: both runs are today", st.deleted)
+	}
+
+	// The drill fails: the backup part is ok, the run is failed (exit 1),
+	// nothing is deleted.
+	d.Drill = fakeDrill(DrillFailed, "orders: 7 rows, dump says 14300")
+	res, err = Backup(context.Background(), cfg, d)
+	if err != nil || res.OK || res.Status != ResultFailed || !slices.Contains(res.Failures(), "main: drill: orders: 7 rows, dump says 14300") || len(res.BackupFailures()) != 0 {
+		t.Fatalf("drill failed: %v ok=%v status=%s failures=%v", err, res.OK, res.Status, res.Failures())
+	}
+	run = st.newest(t)
+	if dr := run.Instances["main"].Drill; run.TS != res.TS || run.Verdict() != ResultFailed || run.Backup.Result != ResultOK || dr.Result != DrillFailed || len(dr.Reasons) != 1 || len(st.deleted) != 0 {
+		t.Errorf("run.json after a failed drill: result=%s backup=%+v drill=%+v deleted=%v", run.Verdict(), run.Backup, dr, st.deleted)
+	}
+}
+
+// ADR-0028, ADR-0029: a database that lost more than half of its rows (from
+// 1000 or more) is a warning of this run, naming the run to restore from,
+// and the run still passes. The comparison is the newest earlier run that
+// dumped the database, so a run without dumps between does not blind it;
+// such a run is deleted by the next pass. The run compared against lives as
+// long as the window keeps it (here: the same day); the next run, rows
+// stable, has no such warning.
+func TestRowDropWarns(t *testing.T) {
+	st := newMemStore()
+	oldRun(t, st, "2026-10-10T030000Z", 10)
+	before := oldRun(t, st, "2026-10-16T020000Z", 20_000_000_000) // an hour ago, by hand
+	// Postgres was down in between: run.json, no dump.
+	putRun(t, st, &Run{
+		App: "shop", TS: "2026-10-16T023000Z", Writer: here,
+		Backup:    Outcome{Result: ResultFailed, Reasons: []string{"main: connection refused"}},
+		Instances: map[string]*RunInstance{"main": {Kind: "container", Missing: []string{"shop"}, Databases: map[string]*Dump{}}},
+	})
+	cfg := baseCfg()
+	cfg.Schedule.Keep = 1
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "new"}}
+	d := deps(st, r)
+	res, err := Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK || res.Status != ResultOK {
+		t.Fatal(err, res)
+	}
+	want := fmt.Sprintf("main/shop dropped from 20000000000 to %d rows since the run %s; if that was not on purpose, restore from it while retention keeps it", fakeRows, before.TS)
+	if !slices.Contains(res.Warnings, want) {
+		t.Errorf("warnings: %v\nwant %s", res.Warnings, want)
+	}
+	run := st.newest(t)
+	if run.Verdict() != ResultOK || run.Backup.Result != ResultOK || !slices.Contains(run.Backup.Warnings, want) || len(run.Backup.Reasons) != 0 || run.Backup.Fix != "" {
+		t.Errorf("run.json outcome: %+v", run.Backup)
+	}
+	// keep 1 keeps today: this run and the one it compared against; the
+	// run without a dump goes, like the 10th.
+	for _, ts := range []string{"2026-10-16T023000Z", "2026-10-10T030000Z"} {
+		if !slices.Contains(st.deleted, RunKey(root, ts)) {
+			t.Errorf("%s must be deleted: %v", ts, st.deleted)
+		}
+	}
+	if slices.Contains(st.deleted, before.Instances["main"].Databases["shop"].Key) || slices.Contains(st.deleted, RunKey(root, before.TS)) {
+		t.Errorf("the run compared against is of today and must stay: %v", st.deleted)
+	}
+	// The next run compares with this one: no drop, no warning.
+	if res, err = Backup(context.Background(), cfg, d); err != nil || !res.OK || res.Status != ResultOK || strings.Contains(strings.Join(res.Warnings, "\n"), "dropped") {
+		t.Errorf("next run: %v %+v", err, res)
+	}
+}
+
+// ADR-0028: the newest folder a little ahead of the clock is bumped past
+// (+1 s, a warning); one an hour or more ahead stops the run before
+// anything is written.
+func TestClockBehindNewestRun(t *testing.T) {
+	st := newMemStore()
+	oldRun(t, st, "2026-10-16T030500Z", 10) // 5 min ahead of the clock
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "new"}}
+	res, err := Backup(context.Background(), baseCfg(), deps(st, r))
+	if err != nil || !res.OK || res.TS != "2026-10-16T030501Z" || !slices.Contains(res.Warnings, "clock is behind the last run 2026-10-16T030500Z; this run is 2026-10-16T030501Z") {
+		t.Fatalf("5 min ahead: %v %+v", err, res)
+	}
+
+	st = newMemStore()
+	oldRun(t, st, "2026-10-16T050000Z", 10) // 2 h ahead
+	puts := len(st.puts)
+	res, err = Backup(context.Background(), baseCfg(), deps(st, r))
+	if err == nil || err.Error() != "the newest run 2026-10-16T050000Z is 2 hours ahead of this machine's clock; fix the clock (or delete that folder in the bucket if the clock was wrong when it ran)" {
+		t.Fatalf("2 h ahead: err=%v res=%+v", err, res)
+	}
+	if len(st.puts) != puts || len(st.deleted) != 0 {
+		t.Errorf("nothing may be written or deleted: puts=%v deleted=%v", st.puts[puts:], st.deleted)
+	}
+	if aheadText(50*time.Hour) != "2 days" || aheadText(90*time.Minute) != "2 hours" {
+		t.Error(aheadText(50*time.Hour), aheadText(90*time.Minute))
+	}
+}
+
+// The run's app.yaml or run.json not writable: the run is failed; without
+// app.yaml every instance misses it, without run.json nothing is deleted.
+func TestAppYAMLOrRunJSONUnwritable(t *testing.T) {
+	r := &fakeRunner{dbs: []string{"shop"}, payload: map[string]string{"shop": "new"}}
+	st := newMemStore()
+	st.failPut = "/app.yaml"
+	res, err := Backup(context.Background(), baseCfg(), deps(st, r))
+	if err != nil || res.OK || res.Status != ResultFailed || !strings.Contains(res.Error, "could not write app.yaml of this run") || strings.Join(res.Instances[0].Missing, ",") != "app.yaml" {
+		t.Fatalf("app.yaml unwritable: %v ok=%v error=%q missing=%v", err, res.OK, res.Error, res.Instances[0].Missing)
+	}
+	run := st.newest(t)
+	if run.AppYAML != nil || run.Verdict() != ResultFailed || strings.Join(run.Instances["main"].Missing, ",") != "app.yaml" || st.puts[len(st.puts)-1] != RunKey(root, run.TS) {
+		t.Errorf("run.json: %+v", run)
+	}
+
+	st2 := newMemStore()
+	old := oldRun(t, st2, "2026-10-01T030000Z", 10)
+	st2.failPut = RunFile
+	res, err = Backup(context.Background(), baseCfg(), deps(st2, r))
+	if err != nil || res.OK || res.Status != ResultFailed || !strings.Contains(res.Error, "run.json could not be written") {
+		t.Fatalf("run.json unwritable: %v ok=%v error=%q", err, res.OK, res.Error)
+	}
+	if len(st2.deleted) != 0 || st2.newest(t).TS != old.TS || len(st2.keysOf(res.TS)) != 4 {
+		t.Errorf("a run without run.json deletes nothing and is not the newest: deleted=%v", st2.deleted)
+	}
+}
+
+func TestSchemaOnlyRun(t *testing.T) {
+	kp, _ := crypto.Generate()
+	cfg := baseCfg()
+	cfg.Encryption, cfg.AgeRecipient = "age", kp.Recipient
+	st := storage.NewMemory(PreflightMaxBytes)
+	r := &fakeRunner{dbs: []string{"shop"}}
+	d := deps(st, r)
+	d.SchemaOnly = true
+	res, err := Backup(context.Background(), cfg, d)
+	if err != nil || !res.OK {
+		t.Fatal(err, res)
+	}
+	objs, _ := st.List(context.Background(), root)
+	if len(objs) == 0 {
+		t.Fatal("nothing dumped")
+	}
+	for _, o := range objs {
+		if strings.HasSuffix(o.Key, ".age") {
+			t.Errorf("schema-only run must not encrypt: %s", o.Key)
+		}
+		if strings.HasSuffix(o.Key, "/"+RunFile) {
+			t.Errorf("schema-only run must not end with run.json: %s", o.Key)
+		}
+	}
+	for _, c := range r.calls {
+		if strings.HasPrefix(c, "pg_dump -Fc") && !strings.Contains(c, "--schema-only") {
+			t.Errorf("data dumped: %s", c)
+		}
+		if strings.HasPrefix(c, "session: select count(*)") {
+			t.Errorf("rows counted: %s", c)
+		}
+	}
+}
+
+// ADR-0029: every run of the last N days, ISO weeks or months that have one;
+// several runs a day all stay.
+func TestKeepSet(t *testing.T) {
+	tss := []string{
+		"2026-10-21T150000Z", "2026-10-21T030000Z", // two runs today: both stay
+		"2026-10-20T030000Z", "2026-10-19T030000Z", // 19 is a Monday: week 43 starts
+		"2026-10-12T030000Z", "2026-10-05T030000Z", // weeks 42, 41
+		"2026-09-30T030000Z", "2026-08-15T030000Z", "2026-07-01T030000Z",
+		"bogus",
+	}
+	check := func(every string, keep int, want ...string) {
+		t.Helper()
+		got := keepSet(tss, every, keep, time.UTC)
+		var keys []string
+		for k := range got {
+			keys = append(keys, k)
+		}
+		want = append(want, "bogus") // never deleted
+		sort.Strings(keys)
+		sort.Strings(want)
+		if strings.Join(keys, ",") != strings.Join(want, ",") {
+			t.Errorf("keepSet(%s, %d) = %v\nwant %v", every, keep, keys, want)
+		}
+	}
+	check(config.EveryDaily, 2, "2026-10-21T150000Z", "2026-10-21T030000Z", "2026-10-20T030000Z")
+	check(config.EveryWeekly, 2, "2026-10-21T150000Z", "2026-10-21T030000Z", "2026-10-20T030000Z", "2026-10-19T030000Z", "2026-10-12T030000Z")
+	check(config.EveryMonthly, 2, "2026-10-21T150000Z", "2026-10-21T030000Z", "2026-10-20T030000Z", "2026-10-19T030000Z", "2026-10-12T030000Z", "2026-10-05T030000Z", "2026-09-30T030000Z")
+	// A week with no run is not counted: the machine was off.
+	got := keepSet([]string{"2026-10-21T030000Z", "2026-09-01T030000Z"}, config.EveryWeekly, 2, time.UTC)
+	if len(got) != 2 {
+		t.Errorf("gap: %v", got)
+	}
+	// ADR-0028: days are the machine's. At UTC+7 a run at 10:00 on the 21st
+	// (03:00Z) and the night run at 03:00 on the 22nd (20:00Z the 21st) are
+	// two days, so keep 1 keeps only the night run and keep 2 keeps both;
+	// in UTC they are one day and keep 1 keeps both.
+	tss = []string{"2026-10-21T200000Z", "2026-10-21T030000Z"}
+	hanoi := time.FixedZone("", 7*3600)
+	if got := keepSet(tss, config.EveryDaily, 2, hanoi); len(got) != 2 {
+		t.Errorf("two local days: %v", got)
+	}
+	if got := keepSet(tss, config.EveryDaily, 1, hanoi); len(got) != 1 || !got["2026-10-21T200000Z"] {
+		t.Errorf("newest local day: %v", got)
+	}
+	if got := keepSet(tss, config.EveryDaily, 1, time.UTC); len(got) != 2 {
+		t.Errorf("one UTC day: %v", got)
+	}
+}
+
+// ListRuns groups the keys of the folder by run and tells which runs ended;
+// a corrupt run.json is ErrRunCorrupt, a missing one ErrNoFolder.
+func TestListRunsAndLoadRun(t *testing.T) {
+	st := newMemStore()
+	oldRun(t, st, "2026-10-14T030000Z", 10)
+	st.objects[RunDir(root, "2026-10-15T030000Z")+"main/shop.dump"] = []byte("half")
+	st.objects[root+"stray"] = []byte("?")
+	st.objects[root+"notats/run.json"] = []byte("{}")
+	refs, err := ListRuns(context.Background(), st, root)
+	if err != nil || len(refs) != 2 || refs[0].TS != "2026-10-15T030000Z" || refs[0].Done || refs[1].TS != "2026-10-14T030000Z" || !refs[1].Done || len(refs[1].Keys) != 2 {
+		t.Fatalf("refs: %+v %v", refs, err)
+	}
+	if NewestDone(refs) != "2026-10-14T030000Z" {
+		t.Error("newest done")
+	}
+	if _, err := LoadRun(context.Background(), st, root, "2026-10-15T030000Z"); !errors.Is(err, ErrNoFolder) {
+		t.Errorf("no run.json: %v", err)
+	}
+	st.objects[RunKey(root, "2026-10-15T030000Z")] = []byte("{")
+	if _, err := LoadRun(context.Background(), st, root, "2026-10-15T030000Z"); !errors.Is(err, ErrRunCorrupt) {
+		t.Errorf("corrupt: %v", err)
+	}
+	if _, _, err := Newest(context.Background(), st, "bracer/empty/"); !errors.Is(err, ErrNoFolder) {
+		t.Errorf("empty folder: %v", err)
 	}
 }

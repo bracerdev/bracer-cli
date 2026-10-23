@@ -1,5 +1,5 @@
-// Command bracer is the Bracer CLI: init, backup, drill, fetch, restore, ping,
-// schedule, rotate-key. The monitoring server is a separate program.
+// Command bracer is the Bracer CLI: init, remove, backup, restore, status,
+// rotate-key. The monitoring server is a separate program.
 package main
 
 import (

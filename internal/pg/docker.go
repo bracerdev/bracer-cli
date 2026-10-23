@@ -65,8 +65,10 @@ func envLooksLikePostgres(env map[string]string) bool {
 	return false
 }
 
-// DefaultUser is the user to try first: POSTGRES_USER, POSTGRESQL_USERNAME,
-// supabase_admin for Supabase images, otherwise postgres.
+// DefaultUser is the bootstrap superuser of the container (ADR-0017):
+// POSTGRES_USER, supabase_admin for Supabase images, otherwise postgres.
+// Bitnami's POSTGRESQL_USERNAME is an ordinary user owning the app's
+// database; its superuser is postgres.
 func (c *Container) DefaultUser() string {
 	return defaultUser(c.Image, c.Env)
 }
@@ -75,13 +77,43 @@ func defaultUser(image string, env map[string]string) string {
 	if u := env["POSTGRES_USER"]; u != "" {
 		return u
 	}
-	if u := env["POSTGRESQL_USERNAME"]; u != "" {
-		return u
-	}
 	if strings.Contains(strings.ToLower(image), "supabase/postgres") {
 		return "supabase_admin"
 	}
 	return "postgres"
+}
+
+// IsBitnami: a Bitnami PostgreSQL image, or one configured with its variables.
+func (c *Container) IsBitnami() bool {
+	if strings.Contains(strings.ToLower(c.Image), "bitnami") {
+		return true
+	}
+	for _, k := range []string{"POSTGRESQL_USERNAME", "POSTGRESQL_PASSWORD", "POSTGRESQL_DATABASE", "POSTGRESQL_POSTGRES_PASSWORD", "POSTGRESQL_POSTGRES_PASSWORD_FILE"} {
+		if _, ok := c.Env[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// SuperuserPassword is the password Bitnami was told to give postgres:
+// POSTGRESQL_POSTGRES_PASSWORD, or the file POSTGRESQL_POSTGRES_PASSWORD_FILE
+// read inside the container. from names the variable; both empty when the
+// container sets none. Bitnami applies it only when the volume is created, so
+// it may no longer be the password in use.
+func (d Docker) SuperuserPassword(ctx context.Context, c *Container) (pw, from string, err error) {
+	if v := c.Env["POSTGRESQL_POSTGRES_PASSWORD"]; v != "" {
+		return v, "POSTGRESQL_POSTGRES_PASSWORD", nil
+	}
+	file := c.Env["POSTGRESQL_POSTGRES_PASSWORD_FILE"]
+	if file == "" {
+		return "", "", nil
+	}
+	res, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"exec", c.Name, "cat", file}})
+	if err != nil {
+		return "", "POSTGRESQL_POSTGRES_PASSWORD_FILE", fmt.Errorf("read %s in %s: %w", file, c.Name, err)
+	}
+	return strings.TrimRight(string(res.Stdout), "\r\n"), "POSTGRESQL_POSTGRES_PASSWORD_FILE", nil
 }
 
 // IsSupabase reports whether the image is supabase/postgres (its pg_hba differs from the official image).
@@ -243,7 +275,7 @@ func (d Docker) ContainerState(ctx context.Context, container string) (string, e
 	res, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"inspect", "--format", "{{.State.Status}}", container}})
 	if err != nil {
 		if strings.Contains(err.Error(), "No such") {
-			return "", fmt.Errorf("container %s does not exist\nFix: docker ps -a to find it, then bracer init -c <app.yaml> if it was renamed", container)
+			return "", fmt.Errorf("container %s does not exist\nFix: docker ps -a to find it; if it was renamed, bracer remove <app>, then bracer init <app>", container)
 		}
 		return "", err
 	}

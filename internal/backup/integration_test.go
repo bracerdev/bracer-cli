@@ -39,25 +39,31 @@ func TestIntegrationBackupPlainAndEncrypted(t *testing.T) {
 	if err := (pg.Docker{Shell: pg.ExecShell{}}).Version(ctx); err != nil {
 		t.Skip("docker not running:", err)
 	}
-	prefix := "itest-" + time.Now().UTC().Format("150405")
+	// One folder per run of the test, so runs never see each other (ADR-0027: bracer/ is fixed).
+	stamp := time.Now().UTC().Format("150405")
 	cfg := &config.App{
 		App:        "shop",
-		Instances:  []config.Instance{{Name: "main", Container: "bracer-test-pg", User: "postgres", PgMajor: 17, Databases: config.Databases{List: []config.Database{{Name: "shop"}}}}},
-		Storage:    &config.Storage{Endpoint: endpoint, Bucket: "backups", Prefix: prefix, AccessKeyEnv: "A", SecretKeyEnv: "S", PathStyle: true},
+		Instances:  []config.Instance{{Name: "main", Container: "bracer-test-pg", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone, Databases: config.Databases([]config.Database{{Name: "shop"}})}},
+		Storage:    &config.Storage{Endpoint: endpoint, Bucket: "backups", Folder: "shop-" + stamp, AccessKeyEnv: "A", SecretKeyEnv: "S", PathStyle: true},
 		Encryption: "none",
+		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
 	}
-	deps := Deps{Shell: pg.ExecShell{}, Store: st}
+	deps := Deps{Shell: pg.ExecShell{}, Store: st, Here: Writer{ID: "itest"}, Create: true}
 
-	// 1. Unencrypted: the downloaded dump must be an archive pg_restore can read, the manifest has tables.
-	res, err := Run(ctx, cfg, deps)
+	// 1. Unencrypted: the downloaded dump must be an archive pg_restore can read, run.json has tables.
+	res, err := Backup(ctx, cfg, deps)
 	if err != nil || !res.OK {
 		t.Fatalf("plain run: %v %+v", err, res)
 	}
-	m, err := LoadManifest(ctx, st, storage.Join(prefix, "shop", "manifest.json"), "shop")
+	run, _, err := Newest(ctx, st, Root(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := m.Instances["main"].Databases["shop"].Dumps[0]
+	if run.TS != res.TS {
+		t.Fatalf("newest run %s, this run %s", run.TS, res.TS)
+	}
+	ri := run.Instances["main"]
+	d := ri.Databases["shop"]
 	var hasOrders bool
 	for _, tb := range d.Tables {
 		if tb.Name == "orders" && tb.Rows != nil && *tb.Rows == 500 && tb.RowsEst == nil {
@@ -65,17 +71,17 @@ func TestIntegrationBackupPlainAndEncrypted(t *testing.T) {
 		}
 	}
 	if !hasOrders {
-		t.Errorf("manifest tables must include orders with exact rows=500: %+v", d.Tables)
+		t.Errorf("run.json tables must include orders with exact rows=500: %+v", d.Tables)
 	}
 	plain := fetch(t, ctx, st, d.Key)
 	if int64(len(plain)) != d.Bytes {
-		t.Errorf("bytes: stored %d, manifest %d", len(plain), d.Bytes)
+		t.Errorf("bytes: stored %d, run.json %d", len(plain), d.Bytes)
 	}
 	assertRestorable(t, ctx, plain)
-	if m.Instances["main"].Globals.Latest == "" || !m.Instances["main"].Globals.HasPasswords {
-		t.Errorf("globals: %+v", m.Instances["main"].Globals)
+	if ri.Globals == nil || !ri.Globals.HasPasswords {
+		t.Fatalf("globals: %+v", ri.Globals)
 	}
-	globals := fetch(t, ctx, st, m.Instances["main"].Globals.Dumps[0].Key)
+	globals := fetch(t, ctx, st, ri.Globals.Key)
 	if !bytes.Contains(globals, []byte("CREATE ROLE")) || !bytes.Contains(globals, []byte("SCRAM-SHA-256")) {
 		t.Error("globals must contain roles with password hashes (superuser)")
 	}
@@ -85,13 +91,16 @@ func TestIntegrationBackupPlainAndEncrypted(t *testing.T) {
 	keyPath := filepath.Join(t.TempDir(), "shop.key")
 	crypto.WriteIdentityFile(keyPath, kp)
 	cfg.Encryption, cfg.AgeRecipient, cfg.AgeIdentityFile = "age", kp.Recipient, keyPath
-	cfg.Storage.Prefix = prefix + "-age"
-	res, err = Run(ctx, cfg, deps)
+	cfg.Storage.Folder = "shop-a" + stamp[1:]
+	res, err = Backup(ctx, cfg, deps)
 	if err != nil || !res.OK || len(res.Warnings) != 0 {
 		t.Fatalf("age run: %v %+v", err, res)
 	}
-	m, _ = LoadManifest(ctx, st, storage.Join(cfg.Storage.Prefix, "shop", "manifest.json"), "shop")
-	d = m.Instances["main"].Databases["shop"].Dumps[0]
+	run, _, err = Newest(ctx, st, Root(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d = run.Instances["main"].Databases["shop"]
 	if !strings.HasSuffix(d.Key, ".dump.age") || !d.Encrypted || *d.Recipient != kp.Recipient {
 		t.Fatalf("age dump entry: %+v", d)
 	}

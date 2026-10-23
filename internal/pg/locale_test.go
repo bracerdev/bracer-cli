@@ -15,7 +15,7 @@ type localeRunner struct {
 
 func (r *localeRunner) Run(_ context.Context, _ Conn, tool string, args []string, _ io.Reader, stdout io.Writer) error {
 	r.sql = args[len(args)-1]
-	io.WriteString(stdout, r.row+"\n")
+	io.WriteString(stdout, r.row+"\x00")
 	return nil
 }
 func (r *localeRunner) Describe() string { return "fake" }

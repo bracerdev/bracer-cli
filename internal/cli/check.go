@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -64,29 +63,16 @@ func (r envReport) Blocked() bool {
 // defaultPath is appended to the docker directory in runtime.path.
 const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-// checkEnv is step 0 of init and the whole of `bracer check`: read-only, no
-// network beyond the local Docker daemon. → ADR-0013
+// checkEnv is step 0 of init: read-only, no network beyond the
+// local Docker daemon. → ADR-0013, ADR-0022
 func checkEnv(ctx context.Context, d envDeps) envReport {
 	var rep envReport
 	add := func(it envItem) { rep.Items = append(rep.Items, it) }
 	who := d.userName()
 	docker := pg.Docker{Shell: d.shell}
 
-	dockerPath, lerr := d.lookPath("docker")
-	switch {
-	case lerr != nil:
-		add(envItem{Name: "docker", Blocking: true, Detail: "the docker command is not installed (bracer runs every Postgres tool through Docker)",
-			Fix: []string{"install Docker Engine: https://docs.docker.com/engine/install/"}})
-	default:
-		if abs, err := filepath.Abs(dockerPath); err == nil {
-			dockerPath = abs
-		}
-		if err := docker.Info(ctx); err != nil {
-			add(dockerInfoItem(err, who))
-		} else {
-			add(envItem{Name: "docker", OK: true, Detail: "docker info answers as " + who + " (" + dockerPath + ")"})
-		}
-	}
+	it, dockerPath, lerr := checkDocker(ctx, d)
+	add(it)
 
 	endpoint := ""
 	if lerr == nil {
@@ -107,9 +93,10 @@ func checkEnv(ctx context.Context, d envDeps) envReport {
 	}
 
 	if d.hasSystemd() {
-		add(envItem{Name: "systemd", OK: true, Detail: "bracer schedule install can set up the nightly timers"})
+		add(envItem{Name: "systemd", OK: true, Detail: "the nightly jobs run as systemd timers"})
 	} else {
-		add(envItem{Name: "systemd", Detail: "not found: bracer schedule will print a cron template instead"})
+		add(envItem{Name: "systemd", Blocking: true, Detail: "not found; bracer runs its nightly jobs with systemd timers",
+			Fix: []string{"run bracer on a Linux machine where systemd is PID 1"}})
 	}
 
 	if rep.Blocked() {
@@ -117,6 +104,24 @@ func checkEnv(ctx context.Context, d envDeps) envReport {
 	}
 	rep.Runtime = &config.Runtime{User: who, Path: joinPath(filepath.Dir(dockerPath), defaultPath), Docker: dockerPath, DockerHost: endpoint}
 	return rep
+}
+
+// checkDocker is the docker line of step 0: the docker command is
+// installed and answers as this user. restore checks only this.
+func checkDocker(ctx context.Context, d envDeps) (envItem, string, error) {
+	who := d.userName()
+	dockerPath, lerr := d.lookPath("docker")
+	if lerr != nil {
+		return envItem{Name: "docker", Blocking: true, Detail: "the docker command is not installed (bracer runs every Postgres tool through Docker)",
+			Fix: []string{"install Docker Engine: https://docs.docker.com/engine/install/"}}, "", lerr
+	}
+	if abs, err := filepath.Abs(dockerPath); err == nil {
+		dockerPath = abs
+	}
+	if err := (pg.Docker{Shell: d.shell}).Info(ctx); err != nil {
+		return dockerInfoItem(err, who), dockerPath, nil
+	}
+	return envItem{Name: "docker", OK: true, Detail: "docker info answers as " + who + " (" + dockerPath + ")"}, dockerPath, nil
 }
 
 // dockerInfoItem explains why `docker info` failed and what to run.
@@ -190,18 +195,3 @@ func commandLine(name string, args []string) string {
 
 // errEnvBlocked: step 0 found something to fix; the table is already printed.
 var errEnvBlocked = errors.New("environment check failed")
-
-// runCheck is `bracer check` (spec init AC): step 0 of init, nothing asked or written.
-func runCheck(ctx context.Context, args []string, d envDeps, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("check", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	if err := fs.Parse(args); err != nil {
-		return exitUsage
-	}
-	rep := checkEnv(ctx, d)
-	printEnv(stdout, rep, commandLine("check", args))
-	if rep.Blocked() {
-		return exitError
-	}
-	return exitOK
-}

@@ -1,18 +1,15 @@
 // Package restore is the part shared by drill and restore: opening a dump
 // stream (bucket or file → [age]), restoring globals/database through a Runner,
-// comparing tables against the manifest (spec backup/drill, backup/fetch-restore).
+// comparing tables against the manifest (spec backup/drill, backup/restore).
 package restore
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
-	"os"
 	"strings"
 
 	"filippo.io/age"
@@ -29,11 +26,11 @@ type Identities struct {
 	Err        error
 }
 
-// ReadIdentities reads age_identity_file (already ExpandHome'd) through read; empty path → Err.
+// ReadIdentities reads the age key file through read; empty path → Err.
 func ReadIdentities(path string, read func(string) ([]age.Identity, []string, error)) *Identities {
 	ids := &Identities{}
 	if path == "" {
-		ids.Err = fmt.Errorf("age_identity_file is not set in app.yaml")
+		ids.Err = fmt.Errorf("no age key file given")
 		return ids
 	}
 	ids.IDs, ids.Recipients, ids.Err = read(path)
@@ -93,6 +90,18 @@ func (rc readCloser) ChecksumErr() error {
 	return nil
 }
 
+// Finish passes shaReader.Finish through the decryption layer.
+func (rc readCloser) Finish() error { return finish(rc.Closer) }
+
+// finish reads what is left of the raw object and returns the SHA-256
+// result; nil when the stream has no checksum to check.
+func finish(r interface{}) error {
+	if f, ok := r.(interface{ Finish() error }); ok {
+		return f.Finish()
+	}
+	return nil
+}
+
 // OpenDump opens a stream of one dump in the bucket: Store.Get → [age]. Touches no disk.
 func OpenDump(ctx context.Context, st storage.Store, dp *backup.Dump, ids *Identities) (io.ReadCloser, error) {
 	raw, err := st.Get(ctx, dp.Key)
@@ -147,23 +156,20 @@ func (s *shaReader) Close() error { return s.r.Close() }
 // ChecksumErr returns the SHA-256 mismatch error if the stream was read to the end and did not match.
 func (s *shaReader) ChecksumErr() error { return s.err }
 
+// Finish reads the raw object to its end (age stops at its last chunk, which
+// may leave bytes unread) and returns the mismatch, or a read error.
+func (s *shaReader) Finish() error {
+	if _, err := io.Copy(io.Discard, s); err != nil && s.err == nil {
+		return err
+	}
+	return s.err
+}
+
 const ageHeader = "age-encryption.org/v1"
 
-// OpenFile opens a fetched dump file; an encrypted dump is recognized by the age header.
-func OpenFile(path string, ids *Identities) (rc io.ReadCloser, encrypted bool, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false, err
-	}
-	br := bufio.NewReader(f)
-	head, _ := br.Peek(len(ageHeader))
-	if !bytes.Equal(head, []byte(ageHeader)) {
-		return readCloser{br, f}, false, nil
-	}
-	plain, err := ids.Decrypt(br, "")
-	if err != nil {
-		f.Close()
-		return nil, true, err
-	}
-	return readCloser{plain, f}, true, nil
+// ErrChecksum: the downloaded object does not match the sha256 in the manifest.
+type ErrChecksum struct{ Want, Got string }
+
+func (e *ErrChecksum) Error() string {
+	return fmt.Sprintf("checksum mismatch: manifest %s, downloaded %s", e.Want, e.Got)
 }

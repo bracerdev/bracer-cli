@@ -1,7 +1,6 @@
 package backup
 
 import (
-	"strings"
 	"testing"
 
 	"bracer.dev/bracer/internal/config"
@@ -18,9 +17,6 @@ func TestTargetBuildsWhereAndConn(t *testing.T) {
 	w, c, err = Target(config.Instance{Name: "b", Container: "bitnami-db", User: "app", PasswordEnv: "PW"}, s)
 	if err != nil || w.Container != "bitnami-db" || c.Password != "s3cret" {
 		t.Errorf("container with password: %+v %+v %v", w, c, err)
-	}
-	if _, _, err = Target(config.Instance{Name: "e", Host: "localhost", Port: 5433}, s); err == nil || !strings.Contains(err.Error(), "ADR-0013") {
-		t.Errorf("legacy host: %v", err)
 	}
 	w, c, err = Target(config.Instance{Name: "f", URLEnv: "URL"}, s)
 	if err != nil || w != (pg.Where{}) || c.Host != "db.example.com" || c.Port != 5433 || c.Params["sslmode"] != "require" {

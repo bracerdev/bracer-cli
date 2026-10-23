@@ -25,23 +25,23 @@ import (
 const localImageRepo = "bracer-drill/"
 
 // chooseImage picks the image for the run's source kind and says how.
-func chooseImage(ctx context.Context, rt *dockerRuntime, cfg *config.App, env *pg.Env, dumps []*backup.Dump, res *Result, instance string) (string, error) {
-	if cfg.Drill != nil && cfg.Drill.Image != "" {
-		return cfg.Drill.Image, nil
+func chooseImage(ctx context.Context, rt *dockerRuntime, cfg *config.App, in config.Instance, env *pg.Env, dumps []*backup.Dump) (string, error) {
+	if image := in.DrillImage(); image != "" {
+		return image, nil
 	}
+	instance := in.Name
 	switch env.SourceKind {
 	case "container":
+		// The exact build of the source, never the tag: it may name another
+		// build now (ADR-0022).
 		ce := env.Container
-		if ce == nil || ce.Image == "" {
-			return "", fmt.Errorf("the environment record has no image of the source container; set drill.image in app.yaml")
+		if ce == nil || ce.ImageID == "" {
+			return "", fmt.Errorf("the environment record has no image id of the source container of %s\nFix: %s", instance, backup.FixReinit(cfg.App))
 		}
-		if ce.ImageID != "" {
-			if _, err := rt.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{.Id}}", ce.ImageID}}); err == nil {
-				return ce.ImageID, nil
-			}
-			res.warn("%s: the source image %s (%s) is not on this machine; using the tag %s, which may now be a different build", instance, ce.Image, shortID(ce.ImageID), ce.Image)
+		if _, err := rt.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{.Id}}", ce.ImageID}}); err != nil {
+			return "", fmt.Errorf("the source image %s (%s) is not on this machine; drill will not use another build\nFix: %s", ce.Image, shortID(ce.ImageID), backup.FixReinit(cfg.App))
 		}
-		return ce.Image, nil
+		return ce.ImageID, nil
 	case "local":
 		return rt.buildLocalImage(ctx, cfg.App, env, dumps)
 	}
@@ -52,7 +52,7 @@ func chooseImage(ctx context.Context, rt *dockerRuntime, cfg *config.App, env *p
 		exts = append(exts, dp.Extensions...)
 	}
 	if n == 0 {
-		return "", fmt.Errorf("cannot pick a Postgres image: the environment record has no server version; set drill.image in app.yaml")
+		return "", fmt.Errorf("cannot pick a Postgres image for %s: the environment record has no server version\nFix: %s", instance, backup.FixReinit(cfg.App))
 	}
 	return pg.ImageForExtensions(n, exts)
 }
@@ -128,14 +128,23 @@ func LocalDockerfile(env *pg.Env, dumps []*backup.Dump) (string, error) {
 	return b.String(), nil
 }
 
-// buildLocalImage builds (or reuses) bracer-drill/<app>:<hash of the Dockerfile>.
+// buildLocalImage builds (or reuses) bracer-drill/<app>:<hash of the
+// Dockerfile and the source's package versions>: apt installs the newest
+// version, so a source that upgraded a package gets a new build.
 func (r *dockerRuntime) buildLocalImage(ctx context.Context, app string, env *pg.Env, dumps []*backup.Dump) (string, error) {
 	df, err := LocalDockerfile(env, dumps)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(df))
-	tag := localImageRepo + app + ":" + hex.EncodeToString(sum[:])[:12]
+	h := sha256.New()
+	h.Write([]byte(df))
+	if env.Local != nil {
+		for _, p := range env.Local.Packages {
+			fmt.Fprintf(h, "%s=%s\n", p.Package, p.Version)
+		}
+	}
+	sum := h.Sum(nil)
+	tag := localImageRepo + app + ":" + hex.EncodeToString(sum)[:12]
 	if _, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{.Id}}", tag}}); err == nil {
 		return tag, nil
 	}
