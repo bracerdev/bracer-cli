@@ -16,10 +16,12 @@ const usage = `bracer — backups proven, crons watched, nothing held.
 
 Usage:
   bracer <command> <app> [flags]
+  bracer status
+  bracer restore
 
 Every file of an app is in ~/.config/bracer/<app>/, and every command names
 its app; only status, without a name, shows every app on this machine, and
-restore starts from the bucket.
+restore takes no app name: it starts from the bucket.
 
 Commands:
   init        create an app: find Postgres, pick databases, prove a backup (test-restored), install the timer

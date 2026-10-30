@@ -54,6 +54,9 @@ func runInstance(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 		return
 	}
 	ir.Image = image
+	if ce := env.Container; ce != nil && image == ce.ImageID {
+		ir.ImageTag = ce.Image
+	}
 	if err := rt.checkOfficial(ctx, image); err != nil {
 		ir.Error = err.Error()
 		return

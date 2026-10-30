@@ -60,8 +60,11 @@ type Result struct {
 type InstanceResult struct {
 	Name string `json:"name"`
 	// Result is passed, failed or off, as run.json records it.
-	Result      string             `json:"result"`
-	Image       string             `json:"image,omitempty"`
+	Result string `json:"result"`
+	Image  string `json:"image,omitempty"`
+	// ImageTag names the build of Image when Image is a digest (a
+	// container source): what the source container runs, for display.
+	ImageTag    string             `json:"image_tag,omitempty"`
 	Mode        string             `json:"mode,omitempty"` // full | data
 	TookSeconds float64            `json:"took_seconds,omitempty"`
 	OK          bool               `json:"ok"`

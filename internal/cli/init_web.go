@@ -130,9 +130,7 @@ func (r *initRun) runInitWeb() error {
 	if err := r.askSchedule(); err != nil {
 		return w.stop(err)
 	}
-	if err := r.askHeartbeat(); err != nil {
-		return w.stop(err)
-	}
+	// No heartbeat question: the hosted dashboard is the monitor.
 	if err := w.state(map[string]any{"step": "confirm"}); err != nil {
 		return w.stop(err)
 	}
@@ -412,6 +410,7 @@ func (w *webSession) pickInstances() ([]config.Instance, error) {
 
 // databases is the chooser's step 8 on the web.
 func (w *webSession) databases(inst *config.Instance, dbs []string) ([]string, error) {
+	w.r.p.printf("  Tick the databases on the web; this terminal waits.\n")
 	if err := w.state(map[string]any{"step": "databases", "databases": map[string]any{"instance_id": w.cur, "names": dbs}}); err != nil {
 		return nil, err
 	}
@@ -454,6 +453,7 @@ func (w *webSession) decision(inst *config.Instance, checks []webCheck) (string,
 		checks[i].InstanceID = w.cur
 	}
 	failed := checks[len(checks)-1]
+	w.r.p.printf("  Decide on the web: retry, skip %s, or skip this instance; this terminal waits.\n", failed.Database)
 	if err := w.state(map[string]any{"step": "checks", "checks": checks}); err != nil {
 		return "", err
 	}

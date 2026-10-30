@@ -45,10 +45,15 @@ func newPrompter(in io.Reader, out io.Writer) *prompter {
 	return p
 }
 
-func (p *prompter) line() (string, error) {
+// hook runs before a question is printed, so what the web shows ("finish
+// in your terminal") is up before the prompt waits for an answer.
+func (p *prompter) hook() {
 	if p.before != nil {
 		p.before()
 	}
+}
+
+func (p *prompter) line() (string, error) {
 	s, err := p.in.ReadString('\n')
 	if err != nil && (err != io.EOF || s == "") {
 		return "", ErrNoInput
@@ -62,6 +67,7 @@ func (p *prompter) printf(format string, args ...interface{}) {
 
 // ask asks for one line; Enter returns def.
 func (p *prompter) ask(prompt, def string) (string, error) {
+	p.hook()
 	if def != "" {
 		fmt.Fprintf(p.out, "%s [%s]: ", prompt, def)
 	} else {
@@ -89,14 +95,13 @@ func (p *prompter) askRequired(prompt string) (string, error) {
 }
 
 func (p *prompter) askSecret(prompt string) (string, error) {
-	if p.before != nil {
-		p.before()
-	}
+	p.hook()
 	return p.secret(prompt + ": ")
 }
 
 // yesNo asks [Y/n] or [y/N].
 func (p *prompter) yesNo(prompt string, def bool) (bool, error) {
+	p.hook()
 	hint := "[y/N]"
 	if def {
 		hint = "[Y/n]"
@@ -115,11 +120,13 @@ func (p *prompter) yesNo(prompt string, def bool) (bool, error) {
 		case "n", "no":
 			return false, nil
 		}
+		fmt.Fprintln(p.out, "Please answer y or n")
 	}
 }
 
 // choose asks for a number 1..n or one of the extra keys; returns (index, "") or (-1, key).
 func (p *prompter) choose(prompt string, n int, extra ...string) (int, string, error) {
+	p.hook()
 	for {
 		fmt.Fprintf(p.out, "%s: ", prompt)
 		s, err := p.line()
@@ -145,6 +152,7 @@ func (p *prompter) choose(prompt string, n int, extra ...string) (int, string, e
 
 // chooseMany asks for a comma-separated list of numbers, or `all`.
 func (p *prompter) chooseMany(prompt string, n int) (all bool, idx []int, err error) {
+	p.hook()
 	for {
 		fmt.Fprintf(p.out, "%s [all]: ", prompt)
 		s, err := p.line()

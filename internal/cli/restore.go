@@ -545,7 +545,7 @@ func (r *restoreRun) printOutcome(out *restore.Outcome) {
 		}
 	}
 	if out.OK {
-		stamp := time.Now().UTC().Format("20060102_1504")
+		stamp := time.Now().UTC().Format("20060102_1504Z")
 		r.printf("\nTo switch the app over, either:\n")
 		r.printf("  1. stop the app, then in psql:\n")
 		for _, db := range out.DBs {

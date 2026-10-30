@@ -13,14 +13,14 @@ const seedTS = "2026-10-16T030000Z"
 
 func TestSideName(t *testing.T) {
 	at := time.Date(2026, 10, 16, 3, 0, 0, 0, time.UTC)
-	taken := map[string]bool{"shop_restored_20261016_0300": true}
+	taken := map[string]bool{"shop_restored_20261016_0300Z": true}
 	name, err := SideName("shop", "restored", at, func(n string) (bool, error) { return taken[n], nil })
-	if err != nil || name != "shop_restored_20261016_0300_2" {
+	if err != nil || name != "shop_restored_20261016_0300Z_2" {
 		t.Errorf("name = %q, %v", name, err)
 	}
 	long := strings.Repeat("é", 40) // 80 bytes
 	name, _ = SideName(long, "restored", at, func(string) (bool, error) { return false, nil })
-	if len(name) > 63 || !strings.HasSuffix(name, "_restored_20261016_0300") || !bytes.HasPrefix([]byte(name), []byte("éé")) || strings.ContainsRune(name, '�') {
+	if len(name) > 63 || !strings.HasSuffix(name, "_restored_20261016_0300Z") || !bytes.HasPrefix([]byte(name), []byte("éé")) || strings.ContainsRune(name, '�') {
 		t.Errorf("long name = %q (%d bytes)", name, len(name))
 	}
 }

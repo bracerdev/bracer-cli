@@ -187,7 +187,9 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 	step := drill.Step(cfg, drillDeps(d, st, logger), func(r *drill.Result) { dres = r })
 	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, Here: here, Create: create, Drill: step})
 	if err != nil {
-		report(ctx, cfg, secrets, d, logger, failureReport("backup", cfg.App, err))
+		if line := report(ctx, cfg, secrets, d, logger, failureReport("backup", cfg.App, err)); line != "" && !*asJSON {
+			fmt.Fprintln(d.stdout, line)
+		}
 		return fail(exitError, "%v", err)
 	}
 	warnings = res.Warnings
@@ -196,7 +198,9 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 	} else {
 		printResult(d.stdout, res, dres)
 	}
-	report(ctx, cfg, secrets, d, logger, res)
+	if line := report(ctx, cfg, secrets, d, logger, res); line != "" && !*asJSON {
+		fmt.Fprintln(d.stdout, line)
+	}
 	return exitOf(res.Status)
 }
 
@@ -591,45 +595,49 @@ func humanBytes(n int64) string {
 // report sends POST /report when app.yaml has hosted: (spec backup § Flow 8,
 // received per spec monitor/backup-report). body is the Result of the run;
 // if it could not start, failureReport is sent. The body also carries the
-// schedule (so hosted knows when the next run is due) and the hostname.
-// Network errors only warn, they do not change the exit code.
-func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d backupDeps, logger *slog.Logger, body any) {
+// schedule and the machine's time zone (so hosted knows when the next run
+// is due) and the hostname. It returns the one line to print about it
+// ("" without hosted:); network errors only warn, they do not change the
+// exit code.
+func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d backupDeps, logger *slog.Logger, body any) string {
 	h := cfg.Hosted
 	if h == nil || d.http == nil {
-		return
+		return ""
+	}
+	server := strings.TrimRight(h.Server, "/")
+	failed := func(why string) string {
+		logger.Warn("hosted: result not reported", "server", server, "why", why)
+		return fmt.Sprintf("✗ not reported to %s: %s", server, why)
 	}
 	token, err := secrets.Require(h.TokenEnv)
 	if err != nil {
-		logger.Warn("hosted: token missing, result not reported", "env", h.TokenEnv)
-		return
+		return failed("token " + h.TokenEnv + " missing from secrets.env")
 	}
 	data, err := reportBody(cfg, body)
 	if err != nil {
-		logger.Warn("hosted: cannot encode result", "err", err)
-		return
+		return failed("cannot encode the result: " + err.Error())
 	}
-	url := strings.TrimRight(h.Server, "/") + "/report"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server+"/report", bytes.NewReader(data))
 	if err != nil {
-		logger.Warn("hosted", "err", err)
-		return
+		return failed(err.Error())
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "bracer/"+Version)
 	resp, err := d.http.Do(req)
 	if err != nil {
-		logger.Warn("hosted: report failed", "err", err)
-		return
+		return failed(firstLine(err.Error()))
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		logger.Warn("hosted: report rejected", "status", resp.Status)
+		return failed("the server answered " + resp.Status)
 	}
+	return fmt.Sprintf("✓ reported to %s", server)
 }
 
-// reportBody is the run's JSON plus schedule and hostname.
+// reportBody is the run's JSON plus schedule, the machine's time zone
+// (`schedule.at` is machine time, run instants are UTC) and hostname.
 func reportBody(cfg *config.App, body any) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -640,6 +648,9 @@ func reportBody(cfg *config.App, body any) ([]byte, error) {
 		return nil, err
 	}
 	m["schedule"] = cfg.Schedule
+	m["timezone"] = machineZone()
+	_, off := time.Now().Zone()
+	m["utc_offset_minutes"] = off / 60
 	m["hostname"], _ = os.Hostname()
 	return json.Marshal(m)
 }

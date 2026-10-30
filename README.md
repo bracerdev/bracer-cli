@@ -120,7 +120,7 @@ drill:                            # the test-restore at the end of every backup
   memory: 2g
 schedule:
   every: daily                    # daily | weekly | monthly
-  at: ["03:00"]                   # one or more HH:MM on this machine
+  at: ["03:00"]                   # one or more HH:MM on this machine; the timer starts up to 5 minutes later
   days: []                        # weekly: [mon, thu]; monthly: [1, 15] or [last]
   keep: 7                         # keep every backup of the last 7 days (weeks, months)
 runtime:                          # what init ran with; the timer uses the same
@@ -202,7 +202,7 @@ Restore always starts from the bucket, on this machine or a new one, so every re
 3. Pick the target: a container or local Postgres it finds, or `[u]` for a URL.
 4. Restore compares the target with the backup: version, extensions, preload libraries, locales, settings that change how SQL behaves, users, privileges, disk space. If anything differs, it writes `env-up.sql` and `env-down.sql` into `./bracer-restore-<app>-<instance>-<ts>/` with the command to apply each, prints what SQL cannot fix (an extension package, a locale), and waits: press Enter to check again.
 5. Enter your app's database URL, as your app uses it. It is not echoed.
-6. Confirm. Each database `<db>` is loaded into a new database `<db>_restored_<YYYYMMDD_HHMM>` with `pg_restore --single-transaction`; your existing databases are never touched. Restore then checks tables and row counts against the run and connects with your app's URL to read what the app can read.
+6. Confirm. Each database `<db>` is loaded into a new database `<db>_restored_<YYYYMMDD_HHMMZ>` (the run's time, UTC) with `pg_restore --single-transaction`; your existing databases are never touched. Restore then checks tables and row counts against the run and connects with your app's URL to read what the app can read.
 
 At the end it prints how to switch your app over (rename the databases, or point the app at the new name) and how to undo (`DROP DATABASE`, then `env-down.sql`). Users that already exist on the target keep the target's password; the app check shows whether the app still gets in. The `env-up.sql` of a full backup holds password hashes: it is written with mode 600; delete the directory when you are done.
 

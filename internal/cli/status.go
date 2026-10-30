@@ -79,6 +79,9 @@ func appStatus(ctx context.Context, home, app string, d scheduleDeps) int {
 		tested = "not test-restored"
 	}
 	fmt.Fprintf(d.stdout, "  schedule: %s (%s)\n", describeSchedule(*sc), tested)
+	if h := cfg.Hosted; h != nil {
+		fmt.Fprintf(d.stdout, "  reports to: %s (every run; the dashboard tells you when one stops coming)\n", strings.TrimRight(h.Server, "/"))
+	}
 	code := exitOK
 	run, err := readNewest(ctx, cfg, d)
 	switch {

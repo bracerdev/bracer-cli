@@ -18,7 +18,8 @@ const tsLayout = "2006-01-02T150405Z"
 // taken says the name exists. <db> is cut (never mid-character) to stay within
 // 63 bytes.
 func SideName(db, kind string, at time.Time, taken func(string) (bool, error)) (string, error) {
-	base := "_" + kind + "_" + at.UTC().Format("20060102_1504")
+	// UTC, said so: run ids are UTC keys, while the CLI prints local time.
+	base := "_" + kind + "_" + at.UTC().Format("20060102_1504Z")
 	for n := 1; n < 100; n++ {
 		suffix := base
 		if n > 1 {

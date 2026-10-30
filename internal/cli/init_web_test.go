@@ -121,8 +121,9 @@ func webHappy(state map[string]any) []string {
 
 var webArgs = []string{"shop", "--web", "--server", "http://app.test/"}
 
-// webAnswers: claim yes, instance name, no drill, schedule, no heartbeat, confirm.
-var webAnswers = answers([]string{"y", ""}, drillOff, schedDefault, []string{"y"})
+// webAnswers: claim yes, instance name, no drill, schedule, confirm. No
+// heartbeat question: hosted is the monitor.
+var webAnswers = answers([]string{"y", ""}, drillOff, sched, []string{"y"})
 
 func TestInitWebFullFlow(t *testing.T) {
 	dir := t.TempDir()
@@ -136,6 +137,9 @@ func TestInitWebFullFlow(t *testing.T) {
 	}
 	if w.server != "http://app.test" || fp.opened != 1 {
 		t.Errorf("server %q opened %d", w.server, fp.opened)
+	}
+	if strings.Contains(out, "Heartbeat URL") {
+		t.Error("init --web asked for a heartbeat URL; hosted is the monitor")
 	}
 	if !strings.Contains(out, "Open http://app.test/pair and enter this code:\n\n  ABCD-EFGH\n") || !strings.Contains(out, "Claimed by k***@example.com on the web. Continue with that account? [y/N]") {
 		t.Errorf("code and claim:\n%s", out)
@@ -315,7 +319,7 @@ func TestInitWebStops(t *testing.T) {
 			fp.react = webHappy
 			fp.finishErr = errAppExists
 		}, answers(s3Answers, noEncryption, webAnswers), false, 1, "Your account already has an app named shop.", "true shop,false shop", 1},
-		{"declined at summary", func(fp *fakePair) { fp.react = webHappy }, answers(s3Answers, noEncryption, []string{"y", ""}, drillOff, schedDefault, []string{"n"}), false, 1, "No app.yaml written.", "false shop", 1},
+		{"declined at summary", func(fp *fakePair) { fp.react = webHappy }, answers(s3Answers, noEncryption, []string{"y", ""}, drillOff, sched, []string{"n"}), false, 1, "No app.yaml written.", "false shop", 1},
 		{"no tty", func(fp *fakePair) {}, nil, true, 2, "", "", 0},
 	}
 	for _, tc := range cases {

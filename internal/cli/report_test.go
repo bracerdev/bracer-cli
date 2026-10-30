@@ -27,5 +27,13 @@ func TestReportBody(t *testing.T) {
 		if sc["every"] != "weekly" || sc["keep"] != float64(4) || m["hostname"] == "" || m["kind"] != "backup" || m["status"] == nil {
 			t.Fatalf("body = %s", data)
 		}
+		// The web places `schedule.at` (machine time) against UTC run
+		// instants with the machine's zone, never by guessing.
+		if tz, _ := m["timezone"].(string); tz == "" {
+			t.Fatalf("no timezone: %s", data)
+		}
+		if _, ok := m["utc_offset_minutes"].(float64); !ok {
+			t.Fatalf("no utc_offset_minutes: %s", data)
+		}
 	}
 }

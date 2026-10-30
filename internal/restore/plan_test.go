@@ -81,7 +81,7 @@ func index(stmts []string, prefix string) int {
 }
 
 // restoredShop is where the run of planSource loads shop: the run's ts, UTC.
-const restoredShop = "shop_restored_20261016_0300"
+const restoredShop = "shop_restored_20261016_0300Z"
 
 // ADR-0015 § 3: a fresh target gets every server-wide gap as SQL, with its
 // undo; the new database is the load's, never env-up's (ADR-0022).
@@ -196,7 +196,7 @@ func TestPlanNewDatabaseName(t *testing.T) {
 	}
 	// No readable run ts: the name takes the time of the restore.
 	src.TS = ""
-	if dp := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Now: time.Date(2026, 10, 17, 5, 6, 0, 0, time.UTC)}).DBs[0]; dp.Target != "shop_restored_20261017_0506" {
+	if dp := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Now: time.Date(2026, 10, 17, 5, 6, 0, 0, time.UTC)}).DBs[0]; dp.Target != "shop_restored_20261017_0506Z" {
 		t.Errorf("no ts: %+v", dp)
 	}
 }

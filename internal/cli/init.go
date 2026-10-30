@@ -474,7 +474,7 @@ func (r *initRun) askDrill() error {
 // days (weekly, monthly) and how many periods to keep every backup of.
 func (r *initRun) askSchedule() error {
 	s := config.DefaultSchedule
-	r.p.printf("\nBackup runs by this machine's clock (%s); the test-restore runs inside each backup.\n", machineZone())
+	r.p.printf("\nBackup runs by this machine's clock (%s), up to %d minutes after the time you pick (the timer spreads the start); the test-restore runs inside each backup.\n", machineZone(), int(timerDelay.Minutes()))
 	rhythms := []string{config.EveryDaily, config.EveryWeekly, config.EveryMonthly}
 	_, key, err := r.p.choose(fmt.Sprintf("[d] daily  [w] weekly  [m] monthly  [Enter] %s", s.Every), 0, "d", "w", "m", "")
 	if err != nil {

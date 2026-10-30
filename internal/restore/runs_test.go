@@ -192,14 +192,14 @@ func TestRunLines(t *testing.T) {
 
 // CheckApp tries the database that was loaded, under the name it got.
 func TestCheckAppFollowsRenamedDatabase(t *testing.T) {
-	loaded := map[string]*backup.Dump{"shop_restored_20261016_0300": {Tables: []pg.Table{{Schema: "public", Name: "orders"}}}}
-	renamed := map[string]string{"shop": "shop_restored_20261016_0300"}
+	loaded := map[string]*backup.Dump{"shop_restored_20261016_0300Z": {Tables: []pg.Table{{Schema: "public", Name: "orders"}}}}
+	renamed := map[string]string{"shop": "shop_restored_20261016_0300Z"}
 	sh := &recShell{}
 	ac := CheckApp(context.Background(), sh, "postgres:17", "host", "postgres://app:pw@db:5432/shop", loaded, renamed)
-	if ac.Database != "shop_restored_20261016_0300" || ac.User != "app" {
+	if ac.Database != "shop_restored_20261016_0300Z" || ac.User != "app" {
 		t.Errorf("check: %+v", ac)
 	}
-	if len(sh.cmds) == 0 || !strings.Contains(strings.Join(append(sh.cmds[0].Args, sh.cmds[0].Env...), " "), "shop_restored_20261016_0300") {
+	if len(sh.cmds) == 0 || !strings.Contains(strings.Join(append(sh.cmds[0].Args, sh.cmds[0].Env...), " "), "shop_restored_20261016_0300Z") {
 		t.Errorf("must connect to the loaded database: %+v", sh.cmds)
 	}
 	ac = CheckApp(context.Background(), &recShell{}, "postgres:17", "host", "postgres://app:pw@db:5432/other", loaded, renamed)
