@@ -52,9 +52,55 @@ func (r *initRun) useLocal(inst *config.Instance, t *target, l pg.Local) {
 	t.where = pg.Where{Local: &l}
 }
 
-// pickInstance is steps 4–10: discover, pick, connect, version, databases,
-// permissions, pooler. Returns nil when this instance is not written.
-func (r *initRun) pickInstance() (*config.Instance, error) {
+// chooser is where init's three decisions are made: the terminal, or the
+// web during `init --web` (spec backup/init-web). Everything else is asked
+// in the terminal in both modes.
+type chooser interface {
+	// databases picks from the server's candidate databases of inst.
+	databases(inst *config.Instance, dbs []string) ([]string, error)
+	// decision answers a failed check: r retry, s skip the database, d drop
+	// the instance, q quit. checks are the results so far, the failure last.
+	decision(inst *config.Instance, checks []webCheck) (string, error)
+	// checked reports every check of inst passed or was answered.
+	checked(inst *config.Instance, checks []webCheck) error
+}
+
+// webCheck is one database's permission check, as the web shows it.
+type webCheck struct {
+	InstanceID string `json:"instance_id"`
+	Database   string `json:"database"`
+	OK         bool   `json:"ok"`
+	Reason     string `json:"reason,omitempty"`
+	SQLHint    string `json:"sql_hint,omitempty"`
+}
+
+// termChooser asks in the terminal: plain `bracer init`.
+type termChooser struct{ r *initRun }
+
+func (t termChooser) databases(_ *config.Instance, dbs []string) ([]string, error) {
+	all, idx, err := t.r.p.chooseMany("Databases to back up (numbers separated by commas, or all)", len(dbs))
+	if err != nil {
+		return nil, err
+	}
+	if all {
+		return dbs, nil
+	}
+	var selected []string
+	for _, i := range idx {
+		selected = append(selected, dbs[i])
+	}
+	return selected, nil
+}
+
+func (t termChooser) decision(_ *config.Instance, _ []webCheck) (string, error) {
+	_, key, err := t.r.p.choose("[r] retry  [s] skip this database  [d] drop this instance  [q] quit", 0, "r", "s", "d", "q")
+	return key, err
+}
+
+func (t termChooser) checked(*config.Instance, []webCheck) error { return nil }
+
+// discover is step 4: every Postgres this machine can see.
+func (r *initRun) discover() (*pg.Discovery, error) {
 	r.p.printf("\nLooking for Postgres (Docker containers, sockets and TCP ports on this machine)...\n")
 	containers, err := r.docker.ListPostgresContainers(r.ctx)
 	if err != nil {
@@ -65,6 +111,16 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 	disc.Kubernetes = append(disc.Kubernetes, pg.KubernetesSigns()...)
 	for _, w := range disc.Warnings {
 		r.warn("%s", w)
+	}
+	return &disc, nil
+}
+
+// pickInstance is steps 4–10 in the terminal: discover, pick one (or type
+// an address), then setupInstance. Returns nil when it is not written.
+func (r *initRun) pickInstance() (*config.Instance, error) {
+	disc, err := r.discover()
+	if err != nil {
+		return nil, err
 	}
 	shown := disc.Candidates
 	r.p.printf("\n")
@@ -88,7 +144,13 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 	if key == "" {
 		cand = &shown[idx]
 	}
+	return r.setupInstance(cand)
+}
 
+// setupInstance is steps 5–10 for one candidate (nil: typed by hand):
+// name, runner, connection, version, pooler, databases, permissions.
+// Returns nil when this instance is not written.
+func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 	inst := config.Instance{}
 	t := target{conn: pg.Conn{Database: "postgres"}}
 	switch {
@@ -472,6 +534,7 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 		}
 	}
 	var skipped []string
+	var checks []webCheck
 	for i := 0; i < len(dbs); i++ {
 		db := dbs[i]
 		c := client.WithDB(db)
@@ -485,6 +548,7 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 		}
 		if problem == "" {
 			r.p.printf("  ✓ %s\n", db)
+			checks = append(checks, webCheck{Database: db, OK: true})
 			keep, err := r.acceptExternal(c, inst, db)
 			if err != nil {
 				return false, err
@@ -495,12 +559,13 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 			continue
 		}
 		r.p.printf("  ✗ %s: %s\n", db, problem)
-		fix := ""
+		fix, hint := "", ""
 		if !priv.CanDump() {
-			fix = fmt.Sprintf("Run this as a superuser to create a backup user, then use it here:\n\n  %s\n%s\n", r.psqlCommand(*inst, client.Conn, db), indent(pg.FixRoleSQL("bracer_backup", inst.PgMajor), "  "))
+			hint = pg.FixRoleSQL("bracer_backup", inst.PgMajor)
+			fix = fmt.Sprintf("Run this as a superuser to create a backup user, then use it here:\n\n  %s\n%s\n", r.psqlCommand(*inst, client.Conn, db), indent(hint, "  "))
 			r.p.printf("\n%s\n", fix)
 		}
-		_, key, err := r.p.choose("[r] retry  [s] skip this database  [d] drop this instance  [q] quit", 0, "r", "s", "d", "q")
+		key, err := r.pick.decision(inst, append(checks, webCheck{Database: db, Reason: problem, SQLHint: hint}))
 		if err != nil {
 			return false, err
 		}
@@ -509,6 +574,7 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 			i--
 		case "s":
 			skipped = append(skipped, db)
+			checks = append(checks, webCheck{Database: db, Reason: "skipped: " + problem})
 		case "d":
 			return false, nil
 		case "q":
@@ -517,6 +583,9 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 			}
 			return false, errQuit
 		}
+	}
+	if err := r.pick.checked(inst, checks); err != nil {
+		return false, err
 	}
 	if len(skipped) > 0 {
 		var keep []config.Database
@@ -587,17 +656,9 @@ func (r *initRun) chooseDatabases(client *pg.Client, inst *config.Instance) ([]s
 	for i, db := range dbs {
 		r.p.printf("  %d) %s\n", i+1, db)
 	}
-	all, idx, err := r.p.chooseMany("Databases to back up (numbers separated by commas, or all)", len(dbs))
+	selected, err := r.pick.databases(inst, dbs)
 	if err != nil {
 		return nil, err
-	}
-	var selected []string
-	if all {
-		selected = dbs
-	} else {
-		for _, i := range idx {
-			selected = append(selected, dbs[i])
-		}
 	}
 	inst.Databases = nil
 	for _, n := range selected {

@@ -588,8 +588,10 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// report sends POST /report when app.yaml has hosted: (contract in spec ping).
-// body is the Result of the run; if it could not start, failureReport is sent.
+// report sends POST /report when app.yaml has hosted: (spec backup § Flow 8,
+// received per spec monitor/backup-report). body is the Result of the run;
+// if it could not start, failureReport is sent. The body also carries the
+// schedule (so hosted knows when the next run is due) and the hostname.
 // Network errors only warn, they do not change the exit code.
 func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d backupDeps, logger *slog.Logger, body any) {
 	h := cfg.Hosted
@@ -601,7 +603,7 @@ func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d bac
 		logger.Warn("hosted: token missing, result not reported", "env", h.TokenEnv)
 		return
 	}
-	data, err := json.Marshal(body)
+	data, err := reportBody(cfg, body)
 	if err != nil {
 		logger.Warn("hosted: cannot encode result", "err", err)
 		return
@@ -625,6 +627,21 @@ func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d bac
 	if resp.StatusCode >= 300 {
 		logger.Warn("hosted: report rejected", "status", resp.Status)
 	}
+}
+
+// reportBody is the run's JSON plus schedule and hostname.
+func reportBody(cfg *config.App, body any) ([]byte, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	m["schedule"] = cfg.Schedule
+	m["hostname"], _ = os.Hostname()
+	return json.Marshal(m)
 }
 
 // failureReport is the minimal body when the command could not start.

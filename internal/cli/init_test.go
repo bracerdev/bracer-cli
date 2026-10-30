@@ -133,6 +133,9 @@ type world struct {
 	// heartbeat answers GET <url>/log; nil: every URL answers.
 	heartbeat func(url string) error
 	hbLog     []string // URLs checked
+	// pair is the hosted server of init --web; server is the URL init used.
+	pair   pairAPI
+	server string
 }
 
 func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, string, string) {
@@ -208,9 +211,14 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 			}
 			return nil
 		},
-		euid:  euid,
-		tty:   !w.noTTY,
-		stdin: in, stdout: &out, stderr: &errb,
+		newPair: func(server string, _ io.Writer) pairAPI {
+			w.server = server
+			return w.pair
+		},
+		hostname: func() (string, error) { return "vps-1", nil },
+		euid:     euid,
+		tty:      !w.noTTY,
+		stdin:    in, stdout: &out, stderr: &errb,
 	}
 	args := []string{"shop"}
 	if w.args != nil {
@@ -375,6 +383,13 @@ func TestInitContainerFullFlow(t *testing.T) {
 	code, out, errOut = runWorld(t, dir, w)
 	if code != exitUsage || out != "" || !strings.Contains(errOut, "bracer init: app shop exists on this machine\nFix: bracer remove shop, then bracer init shop") || w.tty != nil {
 		t.Errorf("init again: %d\n%s\n%s", code, out, errOut)
+	}
+	// --web refuses the same way, before any network (spec init-web).
+	fp := newFakePair()
+	w = &world{sh: containerWorld(), args: webArgs, pair: fp}
+	code, out, errOut = runWorld(t, dir, w)
+	if code != exitUsage || out != "" || !strings.Contains(errOut, "app shop exists on this machine") || fp.opened != 0 {
+		t.Errorf("init --web again: %d opened %d\n%s\n%s", code, fp.opened, out, errOut)
 	}
 }
 
@@ -1104,7 +1119,7 @@ func TestInitByName(t *testing.T) {
 	if err != nil || cfg.App != "shop" || cfg.SecretsFile != filepath.Join(appDir, "secrets.env") {
 		t.Fatalf("%v %+v", err, cfg)
 	}
-	if strings.Contains(out, "App name") || !strings.Contains(out, "New app shop: its files go to "+appDir) {
+	if strings.Contains(out, "App name") || !strings.Contains(out, "New app shop: its files go to "+appDir+".\nHave a Bracer account? bracer init shop --web picks the Postgres in the browser, and every run reports to https://app.bracer.dev.\n") {
 		t.Errorf("output:\n%s", out)
 	}
 	for args, want := range map[string]string{

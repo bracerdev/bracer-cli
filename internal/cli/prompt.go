@@ -21,6 +21,9 @@ type prompter struct {
 	in     *bufio.Reader
 	out    io.Writer
 	secret func(prompt string) (string, error)
+	// before runs before every question; init --web tells the web the
+	// customer is now answering in the terminal (spec init-web § Flow 5).
+	before func()
 }
 
 func newPrompter(in io.Reader, out io.Writer) *prompter {
@@ -43,6 +46,9 @@ func newPrompter(in io.Reader, out io.Writer) *prompter {
 }
 
 func (p *prompter) line() (string, error) {
+	if p.before != nil {
+		p.before()
+	}
 	s, err := p.in.ReadString('\n')
 	if err != nil && (err != io.EOF || s == "") {
 		return "", ErrNoInput
@@ -83,6 +89,9 @@ func (p *prompter) askRequired(prompt string) (string, error) {
 }
 
 func (p *prompter) askSecret(prompt string) (string, error) {
+	if p.before != nil {
+		p.before()
+	}
 	return p.secret(prompt + ": ")
 }
 

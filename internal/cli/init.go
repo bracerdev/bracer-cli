@@ -39,7 +39,10 @@ type initDeps struct {
 	// installTimer writes the app's units and enables its timer (step 17,
 	// ADR-0027); the root work goes through sudo.
 	installTimer func(ctx context.Context, cfg *config.App, cfgPath string) error
-	euid         int
+	// newPair opens the pairing API of a hosted server (init --web).
+	newPair  func(server string, verbose io.Writer) pairAPI
+	hostname func() (string, error)
+	euid     int
 	// tty: stdin and stdout are a terminal.
 	tty    bool
 	stdin  io.Reader
@@ -60,6 +63,8 @@ type initRun struct {
 	appName string
 	again   string            // the command line typed, printed last when it stops for a fix
 	secrets map[string]string // variable name → collected value, not written anywhere yet
+	pick    chooser           // who decides instances, databases, failed checks
+	web     *webSession       // init --web: the pairing session, else nil
 }
 
 func defaultInitDeps(stdin io.Reader, stdout, stderr io.Writer) initDeps {
@@ -75,11 +80,13 @@ func defaultInitDeps(stdin io.Reader, stdout, stderr io.Writer) initDeps {
 		installTimer: func(ctx context.Context, cfg *config.App, cfgPath string) error {
 			return installUnits(ctx, cfg, cfgPath, defaultScheduleDeps(stdin, stdout, stderr))
 		},
-		euid:   os.Geteuid(),
-		tty:    isTerminal(stdin) && isTerminal(stdout),
-		stdin:  stdin,
-		stdout: stdout,
-		stderr: stderr,
+		newPair:  newHTTPPair,
+		hostname: os.Hostname,
+		euid:     os.Geteuid(),
+		tty:      isTerminal(stdin) && isTerminal(stdout),
+		stdin:    stdin,
+		stdout:   stdout,
+		stderr:   stderr,
 	}
 }
 
@@ -91,6 +98,8 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	verbose := fs.Bool("verbose", false, "print every docker and pg_* command")
+	web := fs.Bool("web", false, "pick the Postgres and the databases in the browser, paired with your Bracer account")
+	server := fs.String("server", defaultServer, "the Bracer server to pair with (--web)")
 	fail := func(format string, a ...interface{}) int {
 		fmt.Fprintf(d.stderr, "bracer "+cmd+": "+format+"\n", a...)
 		return exitUsage
@@ -116,6 +125,10 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	if _, err := os.Stat(path); err == nil {
 		return fail("app %s exists on this machine\nFix: %s", name, backup.FixReinit(name))
 	}
+	if *web && !d.tty {
+		// The confirmation and every secret are typed here (spec init-web).
+		return fail("--web needs a terminal: the confirmation and the secrets are typed there")
+	}
 	if sh, ok := d.shell.(pg.ExecShell); ok {
 		sh.Verbose = *verbose
 		d.shell = sh
@@ -124,11 +137,24 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	r := &initRun{initDeps: d, ctx: ctx, p: newPrompter(d.stdin, d.stdout), appName: name, path: path,
 		again: commandLine(cmd, args), docker: pg.Docker{Shell: d.shell}, secrets: map[string]string{}}
 	r.tools = pg.NewTools(d.shell)
+	r.pick = termChooser{r}
+	if *web {
+		var vw io.Writer
+		if *verbose {
+			vw = d.stderr
+		}
+		srv := strings.TrimRight(*server, "/")
+		r.web = newWebSession(r, d.newPair(srv, vw), srv)
+		r.pick = r.web
+	}
 	err = r.run()
 	switch {
 	case err == nil:
 		return exitOK
 	case errors.Is(err, errEnvBlocked), errors.Is(err, errSelfCheck):
+		return exitError
+	case errors.Is(err, errPairStopped):
+		// Why is already printed, with what to run next.
 		return exitError
 	case errors.Is(err, errQuit):
 		fmt.Fprintf(d.stdout, "\n%s Run again when ready:\n  %s\n", r.unchanged(), r.again)
@@ -173,6 +199,9 @@ func (r *initRun) run() error {
 	if err := r.checkMachine(); err != nil {
 		return err
 	}
+	if r.web != nil {
+		return r.runInitWeb()
+	}
 	return r.runInit()
 }
 
@@ -204,6 +233,8 @@ func (r *initRun) checkMachine() error {
 func (r *initRun) runInit() error {
 	r.cfg = &config.App{App: r.appName, Runtime: r.runtime}
 	r.p.printf("\nNew app %s: its files go to %s.\n", r.appName, filepath.Dir(r.path))
+	// The one moment switching to --web costs nothing: before any question.
+	r.p.printf("Have a Bracer account? bracer init %s --web picks the Postgres in the browser, and every run reports to %s.\n", r.appName, defaultServer)
 	// Bucket and encryption first: a wrong bucket stops init before any
 	// discovery (ADR-0022).
 	if err := r.setupStorage(); err != nil {

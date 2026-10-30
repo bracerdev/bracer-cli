@@ -45,10 +45,10 @@ type App struct {
 // backup of. Only init writes it; backup reads Every and Keep for
 // retention, the schedule install turns it into OnCalendar lines.
 type Schedule struct {
-	Every string   `yaml:"every"` // daily, weekly, monthly
-	At    []string `yaml:"at"`    // HH:MM, machine time
-	Days  []string `yaml:"days"`  // weekly: mon…sun; monthly: 1–28 or last; daily: empty
-	Keep  int      `yaml:"keep"`  // every backup of the last Keep periods that have one
+	Every string   `yaml:"every" json:"every"`         // daily, weekly, monthly
+	At    []string `yaml:"at" json:"at"`               // HH:MM, machine time
+	Days  []string `yaml:"days" json:"days,omitempty"` // weekly: mon…sun; monthly: 1–28 or last; daily: empty
+	Keep  int      `yaml:"keep" json:"keep"`           // every backup of the last Keep periods that have one
 }
 
 // The rhythms of Schedule.Every.

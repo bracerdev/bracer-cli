@@ -9,6 +9,8 @@ Encrypted Postgres backups that are proven to restore, run on your own server, w
 
 One static binary, no agent, no daemon. Linux with systemd, Postgres 12 to 18.
 
+On its own, the CLI reports to your bucket and nothing else. With a Bracer account ([app.bracer.dev](https://app.bracer.dev)), `bracer init <app> --web` picks the Postgres in the browser and every run reports to your dashboard, which tells you when a backup stops coming.
+
 Two moments need you: `init` and `restore`. Everything else runs unattended and reports to the bucket.
 
 ## What Bracer promises
@@ -69,6 +71,8 @@ In order, `init`:
 5. asks whether to test-restore on this machine every night, the test-restore's memory limit, the schedule (daily, weekly or monthly, at which times, on which days, and how many days, weeks or months to keep every backup of), and an optional heartbeat URL (see [Know when it stops](#know-when-it-stops));
 6. writes a draft, checks it the way the nightly job will run it (`backup --dry-run`), then runs a real backup, test-restored. With the test-restore on, it stops if Docker's disk has less than 5 × the size of the databases free;
 7. only then replaces `app.yaml`, installs the systemd timer (the unit files are written through `sudo`), and asks you to copy `age.key` off the machine.
+
+With a Bracer account, `bracer init shop --web` runs the same steps but lets you pick the Postgres and the databases in the browser: it prints a link and an 8-character code, you enter the code there, and the terminal keeps the bucket, the keys, the schedule and the final `y`. The app then reports every backup to your dashboard; nothing else changes.
 
 Nothing is written until the check passes. Every file of the app goes to `~/.config/bracer/shop/`, and every command takes the app name. `init` on an app that already exists stops: `bracer remove shop`, then `bracer init shop`.
 

@@ -23,6 +23,7 @@ restore starts from the bucket.
 
 Commands:
   init        create an app: find Postgres, pick databases, prove a backup (test-restored), install the timer
+  init --web  the same, picking the Postgres in the browser; every run then reports to https://app.bracer.dev
   remove      remove an app from this machine (its backups stay in the bucket)
   status      every app on this machine: last run, next run
   backup      dump, encrypt and upload every database in app.yaml
