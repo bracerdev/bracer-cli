@@ -28,7 +28,11 @@ func runRemove(ctx context.Context, args []string, d scheduleDeps) int {
 	if !d.tty {
 		return fail(exitUsage, "remove needs a terminal")
 	}
-	cfgPath, code, err := selectApp(fs, args, d.home(), "remove")
+	home, err := d.home()
+	if err != nil {
+		return fail(exitUsage, "%v", err)
+	}
+	cfgPath, code, err := selectApp(fs, args, home, "remove")
 	if code != exitOK {
 		if err != nil {
 			return fail(code, "%v", err)
@@ -50,8 +54,11 @@ func runRemove(ctx context.Context, args []string, d scheduleDeps) int {
 	} else {
 		fmt.Fprintf(d.stdout, "app %s: where it stores its backups is %s\n", app, where)
 	}
-	p := newPrompter(d.stdin, d.stdout)
+	p := newPrompter(ctx, d.stdin, d.stdout)
 	typed, err := p.ask("Type the app name to remove it", "")
+	if ctx.Err() != nil {
+		return fail(exitError, "interrupted; nothing removed")
+	}
 	if err != nil || strings.TrimSpace(typed) != app {
 		fmt.Fprintln(d.stdout, "nothing removed")
 		return exitUsage

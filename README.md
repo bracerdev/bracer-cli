@@ -9,7 +9,7 @@ Encrypted Postgres backups that are proven to restore, run on your own server, w
 
 One static binary, no agent, no daemon. Linux with systemd, Postgres 12 to 18.
 
-On its own, the CLI reports to your bucket and nothing else. With a Bracer account ([app.bracer.dev](https://app.bracer.dev)), `bracer init <app> --web` picks the Postgres in the browser and every run reports to your dashboard, which tells you when a backup stops coming.
+On its own, the CLI reports to your bucket and nothing else. With a Bracer account ([app.bracer.dev](https://app.bracer.dev)), `bracer init <app> --web` picks the Postgres in the browser and every run reports its result to your dashboard, which tells you when a backup fails or stops coming. The report carries no credentials and no dump contents.
 
 Two moments need you: `init` and `restore`. Everything else runs unattended and reports to the bucket.
 
@@ -36,7 +36,7 @@ A container or local source is always backed up as its superuser: `init` finds i
 
 ## Install
 
-Download the archive for your platform from the [releases page](https://github.com/bracerdev/bracer-cli/releases). Verify it against `checksums.txt`, then put the binary on your `PATH`:
+Download the Linux archive for your machine's architecture (`amd64` or `arm64`) from the [releases page](https://github.com/bracerdev/bracer-cli/releases). Verify it against `checksums.txt`, then put the binary on your `PATH`:
 
 ```bash
 tar xzf bracer_*_linux_amd64.tar.gz
@@ -72,9 +72,9 @@ In order, `init`:
 6. writes a draft, checks it the way the nightly job will run it (`backup --dry-run`), then runs a real backup, test-restored. With the test-restore on, it stops if Docker's disk has less than 5 × the size of the databases free;
 7. only then replaces `app.yaml`, installs the systemd timer (the unit files are written through `sudo`), and asks you to copy `age.key` off the machine.
 
-With a Bracer account, `bracer init shop --web` runs the same steps but lets you pick the Postgres and the databases in the browser: it prints a link and an 8-character code, you enter the code there, and the terminal keeps the bucket, the keys, the schedule and the final `y`. The app then reports every backup to your dashboard; nothing else changes.
+With a Bracer account, `bracer init shop --web` runs the same steps but lets you pick the Postgres and the databases in the browser: it prints a link and an 8-character code, you enter the code there, and the terminal keeps the bucket, the keys, the schedule and the final `y`. The app is added to your account only once the proving backup passes, and then reports every backup to your dashboard; nothing else changes.
 
-Nothing is written until the check passes. Every file of the app goes to `~/.config/bracer/shop/`, and every command takes the app name. `init` on an app that already exists stops: `bracer remove shop`, then `bracer init shop`.
+Nothing is written until the check passes. Every file of the app goes to `~/.config/bracer/shop/` in the home of the user who runs the command (under `sudo`, that is root's), and every command takes the app name. `init` on an app that already exists stops: `bracer remove shop`, then `bracer init shop`.
 
 Bracer backs up exactly the databases you pick, written out by name. A database created on the server later is not backed up until you set the app up again (`bracer remove shop`, then `bracer init shop`); Bracer does not watch for new ones.
 
@@ -123,6 +123,7 @@ schedule:
   at: ["03:00"]                   # one or more HH:MM on this machine; the timer starts up to 5 minutes later
   days: []                        # weekly: [mon, thu]; monthly: [1, 15] or [last]
   keep: 7                         # keep every backup of the last 7 days (weeks, months)
+  since: "2026-11-05T03:12:44Z"   # when this schedule took effect (UTC); init writes it
 runtime:                          # what init ran with; the timer uses the same
   user: me
   path: /usr/local/bin:/usr/bin:/bin
@@ -140,7 +141,7 @@ bracer remove shop
 bracer init shop
 ```
 
-`remove` keeps `age.key`, so the new `init` encrypts with the same key and the old backups stay readable from this machine. The new app gets a new folder in the bucket; the old folder is left as it is, `bracer restore` still lists it, and you delete it at your provider when you no longer need it. Every message that asks you to change something says exactly this: `Fix: bracer remove shop, then bracer init shop`.
+`remove` keeps `age.key`, so the new `init` encrypts with the same key and the old backups stay readable from this machine. The new app gets a new folder in the bucket; the old folder is left as it is, `bracer restore` still lists it, and you delete it at your provider when you no longer need it. Every message that asks you to change something says exactly this: `Fix: bracer remove shop, then bracer init shop`. With a Bracer account, `bracer init shop --web` after `remove` continues the same app on your dashboard, with its history and hostnames.
 
 ### 3. Every night
 
@@ -165,7 +166,7 @@ A dead machine or a stopped timer reports nothing, so something off the machine 
 
 - it gets **one signal per backup run** (by the timer or by hand): `<url>/start` when the run begins, `<url>/<exit code>` when it ends, the test-restore included. A run that passed with warnings sends them as the body of `<url>/0`, so Healthchecks keeps them in the check's log without alerting; nothing else is sent;
 - `init` checks the URL with `<url>/log`, which records an event without changing the check;
-- the service behind the URL does the watching: set its schedule to what `init` prints (a cron expression when one says it), this machine's time zone, and a grace time longer than the backup and its test-restore take. Then it tells you when a signal fails, or does not come at all;
+- the service behind the URL does the watching: set its schedule to what `init` prints, this machine's time zone, and a grace time longer than the backup and its test-restore take. Then it tells you when a signal fails, or does not come at all;
 - a failed send only shows in the journal; the job's result does not change. The URL stays in `secrets.env` and is never printed or logged.
 
 What went wrong is in `bracer status shop` and `journalctl -t bracer`.

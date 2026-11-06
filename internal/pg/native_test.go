@@ -70,7 +70,7 @@ func TestToolsPickFollowsADR0013(t *testing.T) {
 }
 
 func TestToolsResolveAsksVersionThenRepicks(t *testing.T) {
-	psql := "docker run --rm -i --network host"
+	psql := "docker run --rm -i --log-driver none --name bracer-pg-"
 	sh := &fakeShell{out: map[string]string{"docker version": "29\n", psql: "170011\n"}}
 	tl := &Tools{Shell: sh}
 	r, major, err := tl.Resolve(context.Background(), Where{}, Conn{Host: "127.0.0.1", Port: 15432, User: "postgres", Database: "postgres"}, 0)

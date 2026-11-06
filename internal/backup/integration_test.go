@@ -46,7 +46,7 @@ func TestIntegrationBackupPlainAndEncrypted(t *testing.T) {
 		Instances:  []config.Instance{{Name: "main", Container: "bracer-test-pg", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone, Databases: config.Databases([]config.Database{{Name: "shop"}})}},
 		Storage:    &config.Storage{Endpoint: endpoint, Bucket: "backups", Folder: "shop-" + stamp, AccessKeyEnv: "A", SecretKeyEnv: "S", PathStyle: true},
 		Encryption: "none",
-		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7, Since: "2026-10-01T00:00:00Z"},
 	}
 	deps := Deps{Shell: pg.ExecShell{}, Store: st, Here: Writer{ID: "itest"}, Create: true}
 

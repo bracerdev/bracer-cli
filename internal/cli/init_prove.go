@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -26,17 +27,26 @@ func draftPath(abs string) string {
 	return filepath.Join(filepath.Dir(abs), "."+filepath.Base(abs)+".init")
 }
 
-// prove is steps 14–17 up to the rename.
+// resultPath is where `backup --init-draft` writes its Result, next to the
+// draft: init --web reports it once the app is in the account (BR-021).
+func resultPath(draft string) string { return draft + ".result.json" }
+
+// prove is steps 14–17 up to the rename; under --web, the app is created
+// or continued in the account between the real run and the rename.
 func (r *initRun) prove() (err error) {
 	draft := draftPath(r.path)
 	defer func() {
 		if err != nil {
 			_ = os.Remove(draft)
 		}
+		_ = os.Remove(resultPath(draft))
 	}()
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
 		return err
 	}
+	// A draft is a whole app.yaml, since included; realRun stamps it again
+	// right before the run it proves (spec backup/schedule, BR-023).
+	r.cfg.Schedule.Since = config.SinceOf(r.now())
 	if err := config.SaveDraft(draft, r.cfg); err != nil {
 		return err
 	}
@@ -46,16 +56,42 @@ func (r *initRun) prove() (err error) {
 	if err := r.realRun(draft); err != nil {
 		return err
 	}
+	if r.web != nil {
+		if err := r.web.connect(draft); err != nil {
+			return err
+		}
+	}
 	// 17. The draft becomes app.yaml: the unit calls the app by name, so a
-	// timer firing now sees the new file.
+	// timer firing now sees the new file. app.yaml's schedule is in force
+	// from now, just before the timer, and strictly after the real run's
+	// since: the real run above never stands in for a slot the timer owes.
+	r.cfg.Schedule.Since = laterSince(r.cfg.Schedule.Since, r.now())
+	if err := config.SaveDraft(draft, r.cfg); err != nil {
+		return err
+	}
 	if err := os.Chmod(draft, 0o644); err != nil {
 		return err
 	}
 	if err := os.Rename(draft, r.path); err != nil {
 		return err
 	}
+	r.written = true
 	r.p.printf("\nWrote %s.\n", r.path)
+	if r.web != nil {
+		r.web.reportProof(resultPath(draft))
+	}
 	return nil
+}
+
+// laterSince is now as a since, at least a second after since: two
+// stamps within one second would make the real run's period and the
+// timer's one (BR-023).
+func laterSince(since string, now time.Time) string {
+	t := now.UTC().Truncate(time.Second)
+	if prev, err := time.Parse(config.SinceLayout, since); err == nil && !t.After(prev) {
+		t = prev.Add(time.Second)
+	}
+	return config.SinceOf(t)
 }
 
 // drillAny reports an instance whose drill is on.
@@ -91,6 +127,9 @@ func (r *initRun) preflight(draft string) error {
 		r.p.printf("\nChecking as the nightly job will run: bracer %s\n", strings.Join(args, " "))
 		var out bytes.Buffer
 		code := r.runSelf(r.ctx, args, env, &out, r.stderr)
+		if err := r.ctx.Err(); err != nil {
+			return err
+		}
 		var pf preflightResult
 		if jerr := json.Unmarshal(out.Bytes(), &pf); jerr != nil {
 			r.stdout.Write(out.Bytes())
@@ -182,6 +221,9 @@ func (r *initRun) realRun(draft string) error {
 		need := size * restore.DiskFactor
 		free, freeErr := r.dockerFree()
 		switch {
+		case r.ctx.Err() != nil:
+			// The measures were cut short by the interrupt: not a disk problem.
+			return r.ctx.Err()
 		case sizeErr != nil:
 			r.p.printf("  ✗ %v, so the disk the drill needs is unknown; answer n to test-restore on this machine to go on without a drill\n", sizeErr)
 			return r.checkFailed("the disk check", exitError)
@@ -198,9 +240,21 @@ func (r *initRun) realRun(draft string) error {
 	if err != nil {
 		return err
 	}
+	// The real run's period starts now, not when the draft was first
+	// written: time spent at the drill questions must not fall inside it,
+	// or this run could serve a slot that passed meanwhile (BR-023).
+	r.cfg.Schedule.Since = config.SinceOf(r.now())
+	if err := config.SaveDraft(draft, r.cfg); err != nil {
+		return err
+	}
 	args := r.childArgs("backup")
 	r.p.printf("\nRunning: bracer %s\n", strings.Join(args, " "))
-	if code := r.runSelf(r.ctx, args, env, r.stdout, r.stderr); code != exitOK {
+	code := r.runSelf(r.ctx, args, env, r.stdout, r.stderr)
+	if err := r.ctx.Err(); err != nil {
+		// The run cleaned up after itself; say interrupted, not failed.
+		return err
+	}
+	if code != exitOK {
 		return r.checkFailed("the real run", code)
 	}
 	return nil
@@ -256,6 +310,7 @@ func (r *initRun) install() error {
 		r.p.printf("  ✗ %v\n\n%s written; no timer installed\nFix: %s\n", err, r.path, backup.FixReinit(r.appName))
 		return errSelfCheck
 	}
+	r.timer = true
 	return nil
 }
 

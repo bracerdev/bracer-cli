@@ -13,7 +13,8 @@ builds:
     binary: bracer
     env:
       - CGO_ENABLED=0
-    goos: [linux, darwin]
+    # Linux only: bracer needs systemd and Docker.
+    goos: [linux]
     goarch: [amd64, arm64]
     flags:
       - -trimpath

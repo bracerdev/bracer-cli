@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -30,6 +32,7 @@ type backupDeps struct {
 	stdin    io.Reader // restore asks for confirmation
 	stdout   io.Writer
 	stderr   io.Writer
+	now      func() time.Time // nil is time.Now
 }
 
 func defaultBackupDeps(stdin io.Reader, stdout, stderr io.Writer) backupDeps {
@@ -41,6 +44,15 @@ func defaultBackupDeps(stdin io.Reader, stdout, stderr io.Writer) backupDeps {
 		stdout:   stdout,
 		stderr:   stderr,
 	}
+}
+
+// clock is the command's time: started_at and finished_at of a failure
+// report (BR-009).
+func (d backupDeps) clock() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+	return time.Now()
 }
 
 // tools builds pg.Tools from the current shell (after --verbose and runtime: are applied).
@@ -123,13 +135,21 @@ func loadApp(path string, d backupDeps, logger *slog.Logger) (*config.App, *conf
 // runBackup is `bracer backup` (spec backup/backup): one run folder, its
 // drill, run.json, retention.
 func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
+	// A run that stops before the backup begins (most do in loadApp) reports
+	// this as its started_at (BR-009).
+	started := d.clock()
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
 	dryRun := fs.Bool("dry-run", false, "check everything a backup needs; dump the schema only, into memory")
 	asJSON := fs.Bool("json", false, "print the result as JSON on stdout")
 	verbose := fs.Bool("verbose", false, "log every docker and pg_* command")
 	initDraft := fs.Bool("init-draft", false, "internal (bracer init): read the app's draft instead of its app.yaml")
-	cfgPath, code, err := selectAppOrDraft(fs, args, userHome(), "backup", initDraft)
+	home, err := appHome()
+	if err != nil {
+		fmt.Fprintf(d.stderr, "bracer backup: %v\n", err)
+		return exitUsage
+	}
+	cfgPath, code, err := selectAppOrDraft(fs, args, home, "backup", initDraft)
 	if code != exitOK {
 		if err != nil {
 			fmt.Fprintf(d.stderr, "bracer backup: %v\n", err)
@@ -148,9 +168,24 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 		return code
 	}
 
+	// stopped reports a run that stopped before the backup began (spec
+	// backup § Flow 8, BR-003), after its error is printed, redacted: the
+	// journal keeps it and bracer status prints it again (BR-014); the
+	// exit code stays. A dry run and init's run report nothing.
+	stopped := func(code int, cfg *config.App, secrets *config.Secrets, err error) int {
+		code = fail(code, "%s", secrets.Redact(err.Error()))
+		if *dryRun || *initDraft {
+			return code
+		}
+		if line := reportEarly(ctx, cfgPath, cfg, secrets, d, logger, started, err); line != "" && !*asJSON {
+			fmt.Fprintln(d.stdout, line)
+		}
+		return code
+	}
+
 	cfg, secrets, d, code, err := loadApp(cfgPath, d, logger)
 	if err != nil {
-		return fail(code, "%v", err)
+		return stopped(code, nil, nil, err)
 	}
 	// The one signal of the night: /start now, /<exit> at the end, the drill
 	// included (ADR-0025, ADR-0026).
@@ -162,7 +197,7 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 	}
 	here, err := backup.Here(cfg.Storage.Folder, name)
 	if err != nil {
-		return fail(exitError, "%v", err)
+		return stopped(exitError, cfg, secrets, err)
 	}
 	// init's first real run starts the folder; it has no app.yaml yet (ADR-0023).
 	_, statErr := os.Stat(name)
@@ -171,12 +206,12 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 	// too, since its drill removes the app's leftover temporary containers.
 	lock, err := backup.Acquire(name)
 	if err != nil {
-		return fail(exitError, "%v", err)
+		return stopped(exitError, cfg, secrets, err)
 	}
 	defer lock.Release()
 	st, err := openStore(cfg, secrets, d)
 	if err != nil {
-		return fail(exitError, "%v", err)
+		return stopped(exitError, cfg, secrets, err)
 	}
 
 	if *dryRun {
@@ -187,12 +222,25 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 	step := drill.Step(cfg, drillDeps(d, st, logger), func(r *drill.Result) { dres = r })
 	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, Here: here, Create: create, Drill: step})
 	if err != nil {
-		if line := report(ctx, cfg, secrets, d, logger, failureReport("backup", cfg.App, err)); line != "" && !*asJSON {
+		// backup.Backup returns no Result on error: the command's start stands in.
+		body := failureReport("backup", cfg.App, started, d.clock(), err, secrets)
+		if line := report(ctx, cfg, secrets, d, logger, body); line != "" && !*asJSON {
 			fmt.Fprintln(d.stdout, line)
 		}
-		return fail(exitError, "%v", err)
+		return fail(exitError, "%s", secrets.Redact(err.Error()))
 	}
+	// backup.Backup redacted every text of res before run.json (BR-014):
+	// what is printed, sent with the heartbeat and reported is that text.
 	warnings = res.Warnings
+	if *initDraft {
+		// The draft has no hosted: yet; init --web reports this run once
+		// the app is in the account (BR-021). The text is redacted already.
+		if data, err := json.Marshal(res); err != nil {
+			logger.Warn("init: result not kept", "err", err)
+		} else if err := os.WriteFile(resultPath(cfgPath), data, 0o600); err != nil {
+			logger.Warn("init: result not kept", "err", err)
+		}
+	}
 	if *asJSON {
 		printJSON(d.stdout, res)
 	} else {
@@ -331,6 +379,9 @@ func dryRunBackup(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 
 func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create bool, logger *slog.Logger) *preflightResult {
 	p := &preflightResult{Kind: "backup-dry-run", App: cfg.App, OK: true}
+	// An error of a check can quote a credential; the run's own texts come
+	// redacted from backup.Backup (BR-014).
+	why := func(err error) string { return secrets.Redact(err.Error()) }
 	sec := "storage: " + st.Describe()
 	p.add(preflightLine{Section: sec, Text: "secrets_file " + cfg.SecretsFile})
 	// The folder first: nothing is written, not even the probe, to a folder
@@ -338,14 +389,14 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 	folder := preflightLine{Section: sec, Area: "folder", Mark: "✓"}
 	var newest *backup.Run
 	if err := st.Check(ctx); err != nil {
-		folder.Mark, folder.Text = "✗", err.Error()
+		folder.Mark, folder.Text = "✗", why(err)
 		p.add(folder)
 		return p
 	}
 	if create {
 		folder.Text = "folder " + cfg.Storage.Folder + ": started by the first backup"
 	} else if prev, _, err := backup.OpenFolder(ctx, st, cfg, here, false); err != nil {
-		folder.Mark, folder.Text = "✗", err.Error()
+		folder.Mark, folder.Text = "✗", why(err)
 		p.add(folder)
 		return p
 	} else {
@@ -356,9 +407,9 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 	probe := backup.ProbeKey(cfg.Storage.Folder)
 	bucket := preflightLine{Section: sec, Area: "bucket", Mark: "✗"}
 	if err := backup.Probe(ctx, st, probe, time.Now()); errors.Is(err, backup.ErrNoDelete) {
-		bucket.Text, bucket.Fix = err.Error(), "allow the access key to delete objects in the bucket (s3:DeleteObject)"
+		bucket.Text, bucket.Fix = why(err), "allow the access key to delete objects in the bucket (s3:DeleteObject)"
 	} else if err != nil {
-		bucket.Text, bucket.Fix = err.Error(), "allow the access key to write and read objects under "+backup.Root(cfg)
+		bucket.Text, bucket.Fix = why(err), "allow the access key to write and read objects under "+backup.Root(cfg)
 	} else {
 		bucket.Mark, bucket.Text = "✓", "wrote, read back and deleted "+probe
 	}
@@ -371,7 +422,7 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 		sec = fmt.Sprintf("encryption: age, recipient %s, identity %s", cfg.AgeRecipient, cfg.AgeIdentityFile)
 		l := preflightLine{Section: sec, Area: "age", Mark: "✓", Text: "a sample encrypted to the recipient decrypts with age_identity_file"}
 		if err := backup.AgeRoundTrip(cfg); err != nil {
-			l.Mark, l.Text, l.Fix = "✗", err.Error(), "put the private key of "+cfg.AgeRecipient+" back into "+cfg.AgeIdentityFile
+			l.Mark, l.Text, l.Fix = "✗", why(err), "put the private key of "+cfg.AgeRecipient+" back into "+cfg.AgeIdentityFile
 		}
 		p.add(l)
 	default:
@@ -407,7 +458,7 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 	}
 	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: mem, Secrets: secrets, Tools: d.tools(), Log: quiet, SchemaOnly: true, Drill: step})
 	if err != nil {
-		p.add(preflightLine{Section: "backup", Area: "backup", Mark: "✗", Text: err.Error()})
+		p.add(preflightLine{Section: "backup", Area: "backup", Mark: "✗", Text: why(err)})
 		return p
 	}
 	var drillOn []string
@@ -558,7 +609,13 @@ func printDrill(w io.Writer, res *backup.Result, dres *drill.Result) {
 		}
 		switch {
 		case len(ir.DrillFailed) > 0:
-			fmt.Fprintf(w, "✗ %s: backup uploaded; drill failed: %s\n", ir.Name, indentMore(strings.Join(ir.DrillFailed, "; ")))
+			// The drill also fails an instance whose backup did not reach the
+			// bucket whole; the lines above say why.
+			upload := "backup uploaded"
+			if ir.Error != "" || len(ir.Missing) > 0 {
+				upload = "backup incomplete"
+			}
+			fmt.Fprintf(w, "✗ %s: %s; drill failed: %s\n", ir.Name, upload, indentMore(strings.Join(ir.DrillFailed, "; ")))
 			if x != nil {
 				for _, n := range x.Notes {
 					fmt.Fprintf(w, "  note: %s\n", n)
@@ -597,8 +654,19 @@ func humanBytes(n int64) string {
 // if it could not start, failureReport is sent. The body also carries the
 // schedule and the machine's time zone (so hosted knows when the next run
 // is due) and the hostname. It returns the one line to print about it
-// ("" without hosted:); network errors only warn, they do not change the
-// exit code.
+// ("" without hosted:); a report not delivered only warns, it never
+// changes the exit code.
+//
+// Delivered means 202, the server's answer for a stored report; any other
+// answer is not. Redirects are not followed: a 301/302 would make the
+// client send a GET without the body (and the token elsewhere) and take
+// the 200 of whatever answers it as success. A network error, 429 (but not
+// 429 TOO_MANY_RUNS, the app's daily cap) or 5xx is tried again,
+// reportAttempts times in all with waits of 2, 4, 8 s that end at once
+// with ctx, but only when sending again cannot store the run twice: a Result has a ts and
+// the server overwrites (app, ts); a failure report has none and is keyed
+// by its arrival, so it is sent again only when the server surely did not
+// store it (no connection made, 429, 500, 503).
 func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d backupDeps, logger *slog.Logger, body any) string {
 	h := cfg.Hosted
 	if h == nil || d.http == nil {
@@ -609,6 +677,9 @@ func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d bac
 		logger.Warn("hosted: result not reported", "server", server, "why", why)
 		return fmt.Sprintf("✗ not reported to %s: %s", server, why)
 	}
+	if secrets == nil {
+		return failed("cannot read the token " + h.TokenEnv + ": secrets_file unreadable")
+	}
 	token, err := secrets.Require(h.TokenEnv)
 	if err != nil {
 		return failed("token " + h.TokenEnv + " missing from secrets.env")
@@ -617,27 +688,97 @@ func report(ctx context.Context, cfg *config.App, secrets *config.Secrets, d bac
 	if err != nil {
 		return failed("cannot encode the result: " + err.Error())
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server+"/report", bytes.NewReader(data))
-	if err != nil {
-		return failed(err.Error())
+	res, keyed := body.(*backup.Result)
+	keyed = keyed && res.TS != ""
+	client := *d.http
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	why, fix, attempt := "", "", 1
+	for ; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, server+"/report", bytes.NewReader(data))
+		if err != nil {
+			return failed(err.Error())
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "bracer/"+Version)
+		retry := false
+		resp, err := client.Do(req)
+		if err != nil {
+			why, retry = firstLine(err.Error()), keyed || notConnected(err)
+		} else {
+			answer, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusAccepted {
+				return fmt.Sprintf("✓ reported to %s", server)
+			}
+			why = "the server answered " + resp.Status
+			switch c := resp.StatusCode; {
+			case c == http.StatusUnauthorized:
+				// The token is not this app's any more: replaced by a pairing
+				// on another machine, or the app was deleted (ADR-0033 § 11).
+				fix = fmt.Sprintf("app %[1]s was paired again from another machine or deleted on the web; run bracer init %[1]s --web to pair this machine again, or bracer remove %[1]s to stop backups here", cfg.App)
+			case c == http.StatusTooManyRequests:
+				// TOO_MANY_RUNS is the daily cap of the app: it lasts.
+				var e struct {
+					Error string `json:"error"`
+				}
+				json.Unmarshal(answer, &e)
+				retry = e.Error != "TOO_MANY_RUNS"
+				if !retry {
+					why += " (TOO_MANY_RUNS)"
+				}
+			case c == http.StatusInternalServerError, c == http.StatusServiceUnavailable:
+				retry = true
+			case c >= 500:
+				retry = keyed
+			}
+		}
+		if !retry || attempt == reportAttempts || ctx.Err() != nil {
+			break
+		}
+		logger.Debug("hosted: report not delivered, trying again", "server", server, "why", why, "attempt", attempt)
+		reportWait(ctx, time.Duration(1<<attempt)*time.Second)
+		if ctx.Err() != nil {
+			break
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "bracer/"+Version)
-	resp, err := d.http.Do(req)
-	if err != nil {
-		return failed(firstLine(err.Error()))
+	if attempt > 1 {
+		why = fmt.Sprintf("%s (%d attempts)", why, attempt)
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return failed("the server answered " + resp.Status)
+	if fix != "" {
+		return failed(why) + "\nFix: " + fix
 	}
-	return fmt.Sprintf("✓ reported to %s", server)
+	return failed(why)
+}
+
+// reportAttempts bounds the tries of one report: with the 15 s timeout of
+// each request and the waits between them, about 75 s at most.
+const reportAttempts = 4
+
+// reportWait waits d between attempts, or until ctx ends (SIGTERM, Ctrl-C);
+// tests replace it.
+var reportWait = func(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// notConnected: the request failed before a connection was made (refused,
+// no route, name not resolved), so the server cannot have stored it.
+func notConnected(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 // reportBody is the run's JSON plus schedule, the machine's time zone
-// (`schedule.at` is machine time, run instants are UTC) and hostname.
+// (`schedule.at` is machine time, run instants are UTC) and hostname. It
+// redacts nothing: the free text of a Result was redacted by backup.Backup
+// before run.json, a failure report's error by sanitizeError, and the
+// names (app, instances, databases, runner, system_id) are never redacted
+// (BR-014).
 func reportBody(cfg *config.App, body any) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -655,7 +796,63 @@ func reportBody(cfg *config.App, body any) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// failureReport is the minimal body when the command could not start.
-func failureReport(kind, app string, err error) map[string]any {
-	return map[string]any{"kind": kind, "app": app, "status": backup.ResultFailed, "ok": false, "error": err.Error()}
+// failureReport is the minimal body when the command could not start; the
+// error goes through sanitizeError first. started and finished are sent in
+// UTC like a Result's, so hosted grades the run against its schedule slot
+// (BR-009); there is no ts: hosted keys the run by its arrival.
+func failureReport(kind, app string, started, finished time.Time, err error, secrets *config.Secrets) map[string]any {
+	if finished.Before(started) {
+		finished = started
+	}
+	return map[string]any{"kind": kind, "app": app, "status": backup.ResultFailed, "ok": false,
+		"started_at": started.UTC(), "finished_at": finished.UTC(), "error": sanitizeError(err.Error(), secrets)}
+}
+
+// reportEarly sends the failure report of a run that stopped before the
+// backup began (BR-003). cfg and secrets are what was loaded; when app.yaml
+// or secrets_file was refused, they are read again, loosely, only for
+// hosted: and the token. Without hosted: there is nothing to do; without a
+// readable token, only a warning (report says why). started is when the
+// command started.
+func reportEarly(ctx context.Context, path string, cfg *config.App, secrets *config.Secrets, d backupDeps, logger *slog.Logger, started time.Time, cause error) string {
+	if cfg == nil {
+		loose, err := config.LoadLoose(path)
+		if err != nil {
+			logger.Debug("hosted: app.yaml unreadable, nothing reported", "err", err)
+			return ""
+		}
+		cfg = loose
+	}
+	if cfg.Hosted == nil {
+		return ""
+	}
+	if secrets == nil && cfg.SecretsFile != "" {
+		secrets, _, _ = config.LoadSecrets(cfg)
+	}
+	if errors.Is(cause, backup.ErrLocked) {
+		// The lock's own text says another run holds it; the report names it.
+		cause = fmt.Errorf("backup lock held: %w", cause)
+	}
+	return report(ctx, cfg, secrets, d, logger, failureReport("backup", cfg.App, started, d.clock(), cause, secrets))
+}
+
+// maxReportError bounds the error of a failure report.
+const maxReportError = 1000
+
+// sanitizeError is the error text a failure report may carry: redacted by
+// config.Secrets.Redact (every value of secrets_file, URL credentials,
+// password parameters, AWS access keys, age secret keys and SQL passwords
+// replaced by ***), cut to maxReportError bytes on a rune boundary. The
+// server refuses a body that looks like it holds credentials, so a leak
+// would also lose the report.
+func sanitizeError(text string, secrets *config.Secrets) string {
+	text = secrets.Redact(text)
+	if len(text) > maxReportError {
+		cut := maxReportError - len("…")
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut] + "…"
+	}
+	return text
 }

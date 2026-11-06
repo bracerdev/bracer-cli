@@ -59,16 +59,17 @@ var dictsSQL = "select td.oid::regdictionary::text, t.tmplname, coalesce(td.dict
 // collationUsesSQL: collations other than default used by columns, index
 // columns and domains outside the system schemas, and every collation created
 // outside pg_catalog that no extension owns. {cols} are the locale columns.
+// Temporary relations of other sessions are skipped: no dump holds them.
 const collationUsesSQL = `with uses as (
   select a.attcollation as coll, format('%s.%s', a.attrelid::regclass, quote_ident(a.attname)) as what
     from pg_attribute a join pg_class r on r.oid = a.attrelid join pg_namespace n on n.oid = r.relnamespace
     where a.attnum > 0 and not a.attisdropped and a.attcollation <> 0 and r.relkind in ('r','p','v','m','f','c')
-      and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'
+      and r.relpersistence <> 't' and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'
   union all
   select u.coll, i.indexrelid::regclass::text
     from pg_index i join pg_class r on r.oid = i.indexrelid join pg_namespace n on n.oid = r.relnamespace,
       unnest(i.indcollation::oid[]) as u(coll)
-    where u.coll <> 0 and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'
+    where u.coll <> 0 and r.relpersistence <> 't' and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'
   union all
   select t.typcollation, t.oid::regtype::text
     from pg_type t join pg_namespace n on n.oid = t.typnamespace

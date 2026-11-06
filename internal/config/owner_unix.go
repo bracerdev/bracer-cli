@@ -1,5 +1,3 @@
-//go:build !windows
-
 package config
 
 import (
@@ -7,7 +5,7 @@ import (
 	"syscall"
 )
 
-// fileOwner returns the file's uid/gid (unix); Windows has none.
+// fileOwner returns the file's uid/gid.
 func fileOwner(fi os.FileInfo) (int, int, bool) {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {

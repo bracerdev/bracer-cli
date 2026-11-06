@@ -29,13 +29,17 @@ func runStatus(ctx context.Context, args []string, d scheduleDeps) int {
 		}
 		return exitUsage
 	}
-	home := d.home()
+	home, err := d.home()
+	if err != nil {
+		fmt.Fprintf(d.stderr, "bracer status: %v\n", err)
+		return exitUsage
+	}
 	apps := []string{name}
 	if name == "" {
 		apps = config.KnownApps(home)
 	}
 	if len(apps) == 0 {
-		fmt.Fprintf(d.stderr, "bracer status: no app on this machine yet (%s is empty)\nFix: bracer init <name>\n", config.AppsDir(home))
+		fmt.Fprintf(d.stderr, "bracer status: no app on this machine yet (%s is empty)\n%s\n", config.AppsDir(home), fixNoApp("status", ""))
 		return exitUsage
 	}
 	if name != "" {

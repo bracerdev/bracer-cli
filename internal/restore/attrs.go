@@ -199,7 +199,7 @@ func ParseDatabaseSQL(sql []byte, target string, roles map[string]bool) (*Attrib
 			}
 			missing := ""
 			for _, g := range acl.grantees {
-				if g != "PUBLIC" && !roles[g] {
+				if g != publicGrantee && !roles[g] {
 					missing = g
 				}
 			}
@@ -305,10 +305,9 @@ func parseACL(toks []token) (aclStmt, int, error) {
 		case t.isKeyword("WITH"), t.isKeyword("CASCADE"), t.isKeyword("RESTRICT"), t.isKeyword("GRANTED"):
 			return acl, at, nil
 		case t.kind == tokPunct && t.val == ",":
-		case t.isKeyword("PUBLIC"):
-			acl.grantees = append(acl.grantees, "PUBLIC")
 		case t.isKeyword("GROUP"):
 		case t.kind == tokWord || t.kind == tokQuoted:
+			// PUBLIC and "public" fold to publicGrantee; "PUBLIC" is a role.
 			acl.grantees = append(acl.grantees, t.ident())
 		default:
 			return acl, 0, errors.New("unexpected grantee")
@@ -345,7 +344,7 @@ func (a *Attributes) expectedACL(owner string) map[string]bool {
 	for _, p := range dbPrivileges {
 		acl[owner+" "+p] = true
 	}
-	acl["PUBLIC CONNECT"], acl["PUBLIC TEMPORARY"] = true, true
+	acl[publicGrantee+" CONNECT"], acl[publicGrantee+" TEMPORARY"] = true, true
 	for _, s := range a.acl {
 		if s.optionOnly {
 			continue
@@ -368,7 +367,7 @@ func privList(set map[string]bool) string {
 	by := map[string][]string{}
 	for k := range set {
 		g, p := splitACL(k)
-		by[g] = append(by[g], p)
+		by[granteeName(g)] = append(by[granteeName(g)], p)
 	}
 	var names []string
 	for g := range by {
@@ -386,8 +385,8 @@ func privList(set map[string]bool) string {
 	return strings.Join(parts, "; ")
 }
 
-// normSetting compares a stored setting with the archive's: pg_dump splits list
-// settings into literals ('$user', 'public') while the catalog keeps "$user", public.
+// normSetting compares a stored setting other than a list setting with the
+// archive's (sameDumped compares list settings element by element).
 func normSetting(s string) string {
 	return strings.ToLower(strings.NewReplacer(" ", "", `"`, "", "'", "").Replace(s))
 }

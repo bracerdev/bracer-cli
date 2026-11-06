@@ -6,12 +6,16 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"bracer.dev/bracer/internal/config"
 	"bracer.dev/bracer/internal/pg"
 )
+
+// pastedURL holds a pasted URL in init's secrets until the instance is named.
+const pastedURL = "__url__"
 
 // Steps 4–10 of init (spec init § Flow): find a Postgres, connect as the
 // right user, read its version, pick databases, check what a backup needs.
@@ -70,8 +74,11 @@ type webCheck struct {
 	InstanceID string `json:"instance_id"`
 	Database   string `json:"database"`
 	OK         bool   `json:"ok"`
-	Reason     string `json:"reason,omitempty"`
-	SQLHint    string `json:"sql_hint,omitempty"`
+	// Skipped: not backed up, skipped at the web's decision or at the
+	// external question; OK still says whether the check passed.
+	Skipped bool   `json:"skipped,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	SQLHint string `json:"sql_hint,omitempty"`
 }
 
 // termChooser asks in the terminal: plain `bracer init`.
@@ -150,8 +157,15 @@ func (r *initRun) pickInstance() (*config.Instance, error) {
 // setupInstance is steps 5–10 for one candidate (nil: typed by hand):
 // name, runner, connection, version, pooler, databases, permissions.
 // Returns nil when this instance is not written.
-func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
+func (r *initRun) setupInstance(cand *pg.Candidate) (written *config.Instance, err error) {
 	inst := config.Instance{}
+	defer func() {
+		if written == nil {
+			r.forgetSecrets(inst)
+		} else {
+			r.named = append(r.named, *written)
+		}
+	}()
 	t := target{conn: pg.Conn{Database: "postgres"}}
 	switch {
 	case cand != nil && cand.Container != nil:
@@ -182,7 +196,7 @@ func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 				return nil, fmt.Errorf("%v (characters such as @ : / %% in the user or password must be percent-encoded)", err)
 			}
 			t.conn, t.fromURL = c, true
-			r.secrets["__url__"] = s
+			r.secrets[pastedURL] = s
 		} else {
 			host, port, ok := splitHostPort(s)
 			if !ok {
@@ -222,18 +236,19 @@ func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 			return nil, err
 		}
 		name = sanitizeName(name)
-		if name != "" && r.cfg.FindInstance(name) == nil {
+		why := r.nameProblem(name, t.isURL())
+		if why == "" {
 			inst.Name = name
 			break
 		}
-		r.p.printf("Name must be unique in %s and use lowercase letters, digits, - or _.\n", r.path)
+		r.p.printf("%s\n", why)
 	}
 	if inst.URLEnv == "pending" {
 		inst.URLEnv = config.EnvVarName(r.cfg.App, inst.Name, "url")
 	}
 	if t.fromURL {
-		r.secrets[inst.URLEnv] = r.secrets["__url__"]
-		delete(r.secrets, "__url__")
+		r.secrets[inst.URLEnv] = r.secrets[pastedURL]
+		delete(r.secrets, pastedURL)
 	}
 
 	// 7. Test connection; host:port → user + password → URL; auth error → ask.
@@ -259,7 +274,6 @@ func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 	}
 	if err := r.connectLoop(client, &inst, t); err != nil {
 		if errors.Is(err, errSkipInstance) {
-			r.forgetPassword(inst)
 			return nil, nil
 		}
 		return nil, err
@@ -271,7 +285,6 @@ func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 			return nil, err
 		}
 		if !ok {
-			r.forgetPassword(inst)
 			return nil, nil
 		}
 	}
@@ -304,7 +317,6 @@ func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 	// 10. Pooler: pg_dump through a transaction-mode pooler fails (ADR-0019).
 	if ok, why := client.DetectPooler(r.ctx); ok {
 		r.p.printf("✗ this looks like a connection pooler (%s); the instance is not written.\n  Fix: point bracer at Postgres directly (the server's own host and port), then run: %s\n", why, r.again)
-		r.forgetPassword(inst)
 		return nil, nil
 	}
 
@@ -322,6 +334,46 @@ func (r *initRun) setupInstance(cand *pg.Candidate) (*config.Instance, error) {
 		return nil, nil
 	}
 	return &inst, nil
+}
+
+// nameProblem is why name cannot be the next instance's name, "" when it
+// can: the app.yaml rule, unique among the instances of this run, and none
+// of its variables (BRACER_<APP>_<NAME>_URL|PASSWORD) may be one another
+// secret already uses (db-1 and db_1 share theirs). isURL: the instance
+// keeps a URL, else it may keep a password. A URL instance named heartbeat
+// would take the heartbeat URL's variable; plain init asks the heartbeat
+// after the instances, too late to rename one, so the name is refused there
+// whatever the answer will be; init --web has no heartbeat.
+func (r *initRun) nameProblem(name string, isURL bool) string {
+	if !config.ValidInstanceName(name) {
+		return "Name must start with a lowercase letter or digit and use lowercase letters, digits, - or _."
+	}
+	taken := map[string]string{hostedTokenEnv: "the hosted token"}
+	if r.web == nil {
+		taken[config.EnvVarName(r.cfg.App, "heartbeat", "url")] = "the heartbeat URL"
+	}
+	if s := r.cfg.Storage; s != nil {
+		taken[s.AccessKeyEnv], taken[s.SecretKeyEnv] = "the S3 access key", "the S3 secret key"
+	}
+	mine := config.EnvVarName(r.cfg.App, name, "password")
+	if isURL {
+		mine = config.EnvVarName(r.cfg.App, name, "url")
+	}
+	if owner, ok := taken[mine]; ok {
+		return fmt.Sprintf("%s would keep its secret in %s, as %s does; pick another name.", name, mine, owner)
+	}
+	// Between instances both variables count: two names that share one
+	// share the other.
+	stem := config.EnvVarName(r.cfg.App, name)
+	for _, in := range append(slices.Clone(r.cfg.Instances), r.named...) {
+		if in.Name == name {
+			return fmt.Sprintf("%s is already an instance of this app; pick another name.", name)
+		}
+		if config.EnvVarName(r.cfg.App, in.Name) == stem {
+			return fmt.Sprintf("%s would keep its secret in %s_*, as instance %s does; pick another name.", name, stem, in.Name)
+		}
+	}
+	return ""
 }
 
 // askHostLogin asks user and password for Postgres at hostPort, builds the URL
@@ -358,10 +410,15 @@ func (r *initRun) setPassword(inst *config.Instance, pw string) {
 	r.secrets[inst.PasswordEnv] = pw
 }
 
-// forgetPassword drops the password of an instance that is not written.
-func (r *initRun) forgetPassword(inst config.Instance) {
-	if inst.PasswordEnv != "" {
-		delete(r.secrets, inst.PasswordEnv)
+// forgetSecrets drops every secret of an instance that is not written (its
+// URL, its password, a pasted URL not yet named): secrets.env holds only
+// what the final app uses.
+func (r *initRun) forgetSecrets(inst config.Instance) {
+	delete(r.secrets, pastedURL)
+	for _, v := range []string{inst.URLEnv, inst.PasswordEnv} {
+		if v != "" {
+			delete(r.secrets, v)
+		}
 	}
 }
 
@@ -406,6 +463,9 @@ func (r *initRun) connectLoop(client *pg.Client, inst *config.Instance, t target
 		err := client.Ping(r.ctx)
 		if err == nil {
 			return nil
+		}
+		if r.ctx.Err() != nil {
+			return r.ctx.Err()
 		}
 		if isNoSuchDB(err) && client.Conn.Database == "postgres" {
 			client.Conn.Database = "template1"
@@ -555,8 +615,14 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 			}
 			if !keep {
 				skipped = append(skipped, db)
+				checks[len(checks)-1].Skipped = true
+				checks[len(checks)-1].Reason = "depends on something outside Postgres"
 			}
 			continue
+		}
+		if r.ctx.Err() != nil {
+			// Cut short by the interrupt, not a finding: no ✗, no menu.
+			return false, r.ctx.Err()
 		}
 		r.p.printf("  ✗ %s: %s\n", db, problem)
 		fix, hint := "", ""
@@ -574,7 +640,7 @@ func (r *initRun) checkPermissions(client *pg.Client, inst *config.Instance, dbs
 			i--
 		case "s":
 			skipped = append(skipped, db)
-			checks = append(checks, webCheck{Database: db, Reason: "skipped: " + problem})
+			checks = append(checks, webCheck{Database: db, Skipped: true, Reason: problem})
 		case "d":
 			return false, nil
 		case "q":

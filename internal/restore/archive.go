@@ -14,8 +14,7 @@ import (
 )
 
 // What the archive's table of contents says, read before anything is created
-// on the target (spec restore § Flow 5): which users the database needs
-// (data_only) and what needs a superuser (preview).
+// on the target (spec restore § Flow 5): what needs a superuser (preview).
 
 // headSizes: the table of contents is usually small; try a small head first and
 // read up to MaxTOC only when pg_restore needs more.
@@ -113,129 +112,6 @@ func ParseEntries(sql string) []TOCEntry {
 		}
 	}
 	flush()
-	return out
-}
-
-// NeededRoles lists the users the archive names: owners, GRANT/REVOKE grantees
-// and grantors, ALTER DEFAULT PRIVILEGES FOR ROLE, CREATE POLICY … TO, ALTER
-// ROLE … IN DATABASE, USER MAPPING FOR. PUBLIC and built-in pg_* roles are left out.
-func NeededRoles(entries []TOCEntry) (roles map[string]bool, warnings []string) {
-	roles = map[string]bool{}
-	add := func(r string) {
-		if r != "" && r != "-" && !strings.EqualFold(r, "public") && !strings.HasPrefix(r, "pg_") {
-			roles[r] = true
-		}
-	}
-	for _, e := range entries {
-		add(e.Owner)
-		switch e.Type {
-		case "ACL", "DEFAULT ACL", "POLICY", "DATABASE PROPERTIES", "USER MAPPING":
-		default:
-			continue
-		}
-		stmts, err := splitStatements(stripComments(e.Body))
-		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not read the %s entry %s: %v", e.Type, e.Name, err))
-			continue
-		}
-		for _, st := range stmts {
-			if st.meta {
-				continue
-			}
-			toks, err := tokenizeLoose(st.text)
-			if err != nil || len(toks) == 0 {
-				warnings = append(warnings, fmt.Sprintf("could not read the %s entry %s", e.Type, e.Name))
-				continue
-			}
-			for _, r := range rolesIn(toks) {
-				add(r)
-			}
-		}
-	}
-	return roles, warnings
-}
-
-// stripComments drops whole-line -- comments (pg_restore's own), which the
-// statement splitter would otherwise keep as statement text.
-func stripComments(body string) string {
-	var b strings.Builder
-	for _, l := range strings.Split(body, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(l), "--") {
-			continue
-		}
-		b.WriteString(l + "\n")
-	}
-	return b.String()
-}
-
-// rolesIn returns the user names in one GRANT, REVOKE, ALTER DEFAULT
-// PRIVILEGES, CREATE POLICY, ALTER ROLE … IN DATABASE, SET SESSION
-// AUTHORIZATION or CREATE USER MAPPING statement.
-func rolesIn(toks []token) []string {
-	var out []string
-	name := func(t token) bool { return t.kind == tokWord || t.kind == tokQuoted }
-	// names reads a comma-separated list of users from i until a word in stop.
-	names := func(i int, stop ...string) {
-		for ; i < len(toks); i++ {
-			t := toks[i]
-			if t.kind == tokPunct && t.val == "," || t.isKeyword("GROUP") {
-				continue
-			}
-			for _, s := range stop {
-				if t.isKeyword(s) {
-					return
-				}
-			}
-			if !name(t) {
-				return
-			}
-			out = append(out, t.ident())
-		}
-	}
-	kw := func(i int, k string) bool { return i < len(toks) && toks[i].isKeyword(k) }
-	switch {
-	case kw(0, "SET") && kw(1, "SESSION") && kw(2, "AUTHORIZATION") && len(toks) > 3:
-		names(3)
-	case kw(0, "ALTER") && (kw(1, "ROLE") || kw(1, "USER")) && kw(3, "IN"):
-		names(2, "IN")
-	case kw(0, "CREATE") && kw(1, "USER") && kw(2, "MAPPING") && kw(3, "FOR"):
-		names(4, "SERVER")
-	case kw(0, "CREATE") && kw(1, "POLICY"):
-		if i := indexKeyword(toks, "TO"); i > 0 {
-			names(i+1, "USING", "WITH")
-		}
-	case kw(0, "GRANT"), kw(0, "REVOKE"), kw(0, "ALTER") && kw(1, "DEFAULT"):
-		start := 0
-		if kw(0, "ALTER") {
-			// ALTER DEFAULT PRIVILEGES FOR ROLE a, b [IN SCHEMA s] GRANT … TO …
-			if kw(3, "FOR") && (kw(4, "ROLE") || kw(4, "USER")) {
-				names(5, "IN", "GRANT", "REVOKE")
-			}
-			for i, t := range toks {
-				if t.isKeyword("GRANT") || t.isKeyword("REVOKE") {
-					start = i
-					break
-				}
-			}
-		}
-		to := "TO"
-		if toks[start].isKeyword("REVOKE") {
-			to = "FROM"
-		}
-		at := -1
-		for i := len(toks) - 1; i > start; i-- {
-			if toks[i].isKeyword(to) {
-				at = i
-				break
-			}
-		}
-		if at > 0 {
-			names(at+1, "WITH", "GRANTED", "CASCADE", "RESTRICT")
-		}
-		if i := indexKeyword(toks, "GRANTED"); i > 0 && kw(i+1, "BY") {
-			names(i + 2)
-		}
-	}
 	return out
 }
 

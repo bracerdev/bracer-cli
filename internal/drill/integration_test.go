@@ -52,7 +52,7 @@ func TestIntegrationDrill(t *testing.T) {
 		Encryption:      "age",
 		AgeRecipient:    kp.Recipient,
 		AgeIdentityFile: keyPath,
-		Schedule:        &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		Schedule:        &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7, Since: "2026-10-01T00:00:00Z"},
 		// The run's app.yaml is read back strictly: runtime is required, unused here.
 		Runtime: &config.Runtime{User: "test", Path: "/usr/bin:/bin", Docker: "/usr/bin/docker"},
 	}
@@ -94,7 +94,7 @@ func TestIntegrationDrill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := run.Instances["main"].Drill; run.TS != bres.TS || d == nil || d.Result != backup.DrillPassed || d.TookSeconds != ir.TookSeconds || !run.AllDrillsPassed() {
+	if d := run.Instances["main"].Drill; run.TS != bres.TS || d == nil || d.Result != backup.DrillPassed || d.TookSeconds != ir.TookSeconds {
 		t.Errorf("run.json drill: %+v", d)
 	}
 	dump := run.Instances["main"].Databases["shop"]

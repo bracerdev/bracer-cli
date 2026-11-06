@@ -20,16 +20,25 @@ type fakePair struct {
 	opened    int
 	events    []json.RawMessage // what Next hands out next
 	states    []map[string]any  // every state posted
-	finished  []string          // "true shop" / "false shop"
+	finished  []string          // "true" / "false", in order
+	openApp   string            // the app POST /pair named
 	openErr   error
 	nextErr   error
 	finishErr error
+	// finishErrs, when set, answer the confirmed finishes in order (then
+	// finishErr); continued is the answer of a successful one.
+	finishErrs []error
+	continued  bool
+	// onFinish runs at a confirmed finish, before it answers.
+	onFinish func()
+	// stateErr, when set, answers a posted state (after recording it).
+	stateErr func(state map[string]any) error
 	// react returns the events the web sends after seeing a state.
 	react func(state map[string]any) []string
 }
 
 func newFakePair() *fakePair {
-	return &fakePair{events: []json.RawMessage{json.RawMessage(`{"type":"claimed","account":"k***@example.com"}`)}}
+	return &fakePair{events: []json.RawMessage{json.RawMessage(`{"type":"claimed","account":"k***@example.com","app":{"name":"shop","continues":false}}`)}}
 }
 
 func (f *fakePair) push(events ...string) {
@@ -38,8 +47,9 @@ func (f *fakePair) push(events ...string) {
 	}
 }
 
-func (f *fakePair) Open(_ context.Context, cliVersion, hostname string) (*pairOpened, error) {
+func (f *fakePair) Open(_ context.Context, cliVersion, hostname, app string) (*pairOpened, error) {
 	f.opened++
+	f.openApp = app
 	if f.openErr != nil {
 		return nil, f.openErr
 	}
@@ -72,24 +82,38 @@ func (f *fakePair) State(_ context.Context, secret string, body any) error {
 	var m map[string]any
 	json.Unmarshal(data, &m)
 	f.states = append(f.states, m)
+	if f.stateErr != nil {
+		if err := f.stateErr(m); err != nil {
+			return err
+		}
+	}
 	if f.react != nil {
 		f.push(f.react(m)...)
 	}
 	return nil
 }
 
-func (f *fakePair) Finish(_ context.Context, secret string, confirmed bool, app string) (*pairFinished, error) {
+func (f *fakePair) Finish(_ context.Context, secret string, confirmed bool) (*pairFinished, error) {
 	if secret != "s3cret" {
 		return nil, errors.New("bad secret")
 	}
-	f.finished = append(f.finished, fmt.Sprintf("%v %s", confirmed, app))
-	if f.finishErr != nil {
+	f.finished = append(f.finished, fmt.Sprint(confirmed))
+	if confirmed && f.onFinish != nil {
+		f.onFinish()
+	}
+	if confirmed && len(f.finishErrs) > 0 {
+		err := f.finishErrs[0]
+		f.finishErrs = f.finishErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	} else if f.finishErr != nil {
 		return nil, f.finishErr
 	}
 	if !confirmed {
 		return nil, nil
 	}
-	return &pairFinished{AppID: "app-1", Token: "brc_test"}, nil
+	return &pairFinished{AppID: "app-1", Token: "brc_test", Continued: f.continued}, nil
 }
 
 // steps lists the step of every state posted.
@@ -119,7 +143,7 @@ func webHappy(state map[string]any) []string {
 	return nil
 }
 
-var webArgs = []string{"shop", "--web", "--server", "http://app.test/"}
+var webArgs = []string{"shop", "--web", "--server", "https://app.test/"}
 
 // webAnswers: claim yes, instance name, no drill, schedule, confirm. No
 // heartbeat question: hosted is the monitor.
@@ -135,13 +159,13 @@ func TestInitWebFullFlow(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
-	if w.server != "http://app.test" || fp.opened != 1 {
+	if w.server != "https://app.test" || fp.opened != 1 {
 		t.Errorf("server %q opened %d", w.server, fp.opened)
 	}
 	if strings.Contains(out, "Heartbeat URL") {
 		t.Error("init --web asked for a heartbeat URL; hosted is the monitor")
 	}
-	if !strings.Contains(out, "Open http://app.test/pair and enter this code:\n\n  ABCD-EFGH\n") || !strings.Contains(out, "Claimed by k***@example.com on the web. Continue with that account? [y/N]") {
+	if !strings.Contains(out, "Open http://app.test/pair and enter this code:\n\n  ABCD-EFGH\n") || !strings.Contains(out, "Claimed by k***@example.com on the web, to create app shop. Continue with that account? [y/N]") || fp.openApp != "shop" {
 		t.Errorf("code and claim:\n%s", out)
 	}
 	if strings.Contains(out, "Have a Bracer account?") {
@@ -167,14 +191,14 @@ func TestInitWebFullFlow(t *testing.T) {
 	if len(checks) != 1 || checks[0].(map[string]any)["database"] != "shop" || checks[0].(map[string]any)["ok"] != true {
 		t.Errorf("checks for the web: %v", checks)
 	}
-	if strings.Join(fp.finished, ",") != "true shop" {
+	if strings.Join(fp.finished, ",") != "true" {
 		t.Errorf("finish: %v", fp.finished)
 	}
 	cfg, err := config.Load(appYAML(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Hosted == nil || cfg.Hosted.Server != "http://app.test" || cfg.Hosted.TokenEnv != "BRACER_TOKEN" {
+	if cfg.Hosted == nil || cfg.Hosted.Server != "https://app.test" || cfg.Hosted.TokenEnv != "BRACER_TOKEN" {
 		t.Errorf("hosted: %+v", cfg.Hosted)
 	}
 	if got := strings.Join(cfg.Instances[0].Databases.Names(), ","); got != "shop" || cfg.Instances[0].Name != "shop-db" {
@@ -301,7 +325,7 @@ func TestInitWebStops(t *testing.T) {
 		finish  string
 		opened  int
 	}{
-		{"declined at claim", func(fp *fakePair) {}, answers(s3Answers, noEncryption, []string{"n"}), false, 1, "No app.yaml written.", "false shop", 1},
+		{"declined at claim", func(fp *fakePair) {}, answers(s3Answers, noEncryption, []string{"n"}), false, 1, "No app.yaml written.", "false", 1},
 		{"cancelled on the web", func(fp *fakePair) {
 			fp.react = func(state map[string]any) []string {
 				if state["step"] == "instances" {
@@ -310,16 +334,24 @@ func TestInitWebStops(t *testing.T) {
 				return nil
 			}
 		}, answers(s3Answers, noEncryption, []string{"y"}), false, 1, "The setup was cancelled on the web. No app.yaml written.", "", 1},
-		{"trial ended", func(fp *fakePair) {
-			fp.events = []json.RawMessage{json.RawMessage(`{"type":"cancelled","reason":"trial_ended"}`)}
-		}, answers(s3Answers, noEncryption), false, 1, "Your trial on the hosted server has ended", "", 1},
+		{"app deleted on the web before the choices", func(fp *fakePair) {
+			fp.events = []json.RawMessage{json.RawMessage(`{"type":"cancelled","reason":"app_changed"}`)}
+		}, answers(s3Answers, noEncryption), false, 1, "App shop changed or was deleted on the web, so the setup stopped. No app.yaml written.", "", 1},
 		{"expired", func(fp *fakePair) { fp.nextErr = errPairClosed }, answers(s3Answers, noEncryption), false, 1, "pairing expired; run `bracer init shop --web` again, or `bracer init shop`", "", 1},
 		{"pairing off", func(fp *fakePair) { fp.openErr = errPairingOff }, answers(s3Answers, noEncryption), false, 1, "Pairing is switched off on the server right now. No app.yaml written.\nSet the app up in the terminal: bracer init shop", "", 1},
-		{"app exists", func(fp *fakePair) {
+		{"app changed at finish", func(fp *fakePair) {
 			fp.react = webHappy
-			fp.finishErr = errAppExists
-		}, answers(s3Answers, noEncryption, webAnswers), false, 1, "Your account already has an app named shop.", "true shop,false shop", 1},
-		{"declined at summary", func(fp *fakePair) { fp.react = webHappy }, answers(s3Answers, noEncryption, []string{"y", ""}, drillOff, sched, []string{"n"}), false, 1, "No app.yaml written.", "false shop", 1},
+			fp.finishErrs = []error{errAppChanged}
+		}, answers(s3Answers, noEncryption, webAnswers), false, 1, "The backup passed, but app shop was not added to your account: another setup created, continued or deleted it since you confirmed on the web.\nFix: run again: bracer init shop --web --server https://app.test/", "true", 1},
+		{"app limit at finish", func(fp *fakePair) {
+			fp.react = webHappy
+			fp.finishErrs = []error{errAppLimit}
+		}, answers(s3Answers, noEncryption, webAnswers), false, 1, "not added to your account: your plan's app limit is reached.\nFix: delete an app on the web, then run:", "true", 1},
+		{"cancelled during the proof", func(fp *fakePair) {
+			fp.react = webHappy
+			fp.finishErrs = []error{errPairClosed}
+		}, answers(s3Answers, noEncryption, webAnswers), false, 1, "not added to your account: the session was cancelled on the web or expired.", "true", 1},
+		{"declined at summary", func(fp *fakePair) { fp.react = webHappy }, answers(s3Answers, noEncryption, []string{"y", ""}, drillOff, sched, []string{"n"}), false, 1, "No app.yaml written.", "false", 1},
 		{"no tty", func(fp *fakePair) {}, nil, true, 2, "", "", 0},
 	}
 	for _, tc := range cases {

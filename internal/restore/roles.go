@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"bracer.dev/bracer/internal/pg"
 )
@@ -53,6 +54,25 @@ type ParamGrant struct {
 
 func (p ParamGrant) key() string {
 	return strings.ToLower(p.Param) + "\x00" + p.Privilege + "\x00" + p.Grantee
+}
+
+// publicGrantee is the PUBLIC pseudo-role as a grantee (parameter and database privileges). PostgreSQL
+// takes the name public as PUBLIC, and no role can be named public; any other
+// spelling, such as a role created as "PUBLIC" or "Public", is a real role.
+// pg_dumpall writes TO PUBLIC, which the lexer folds to public as PostgreSQL
+// does (a quoted "public" is the same); the target read names it public too.
+const publicGrantee = "public"
+
+// granteeName shows a grantee in a check: PUBLIC for the pseudo-role, a role
+// whose name reads as public (such as "PUBLIC") quoted, any other as it is.
+func granteeName(g string) string {
+	switch {
+	case g == publicGrantee:
+		return "PUBLIC"
+	case strings.EqualFold(g, publicGrantee):
+		return pg.QuoteIdent(g)
+	}
+	return g
 }
 
 // RoleGlobals is the parsed globals dump: users in file order.
@@ -260,11 +280,17 @@ type TargetRoles struct {
 	HasGrantOptions bool
 }
 
+// rolesSessionSQL pins how the role query's session prints timestamps; psql
+// -q runs it with the query in one -c and prints only the query's rows.
+const rolesSessionSQL = "set datestyle = 'ISO'; set timezone = 'UTC'; "
+
 // ReadTargetRoles reads every user of the target; rolpassword only when the
 // connection may read pg_authid (a superuser).
 func ReadTargetRoles(ctx context.Context, admin *pg.Client, major int) (*TargetRoles, error) {
 	tr := &TargetRoles{Roles: map[string]*RoleSpec{}, ParamGrants: map[string]ParamGrant{}, HasGrantOptions: major >= 16}
-	rows, err := admin.Query(ctx, "select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, coalesce(rolvaliduntil::text, '') from pg_roles")
+	// VALID UNTIL is printed in this session's DateStyle and TimeZone: pinned
+	// to ISO and UTC, so sameTime always parses this side as an instant.
+	rows, err := admin.Query(ctx, rolesSessionSQL+"select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit, coalesce(rolvaliduntil::text, '') from pg_roles")
 	if err != nil {
 		return nil, fmt.Errorf("read users: %w", err)
 	}
@@ -277,9 +303,8 @@ func ReadTargetRoles(ctx context.Context, admin *pg.Client, major int) (*TargetR
 			rs.Flags[f] = r[1+i] == "t"
 		}
 		rs.ConnLimit, _ = strconv.Atoi(r[8])
-		if r[9] != "infinity" {
-			rs.ValidUntil = r[9]
-		}
+		// infinity is kept as read: sameTime takes it as no expiry.
+		rs.ValidUntil = r[9]
 		tr.Roles[r[0]] = rs
 	}
 	if rows, err := admin.Query(ctx, "select rolname, coalesce(rolpassword, '') from pg_authid"); err == nil {
@@ -337,7 +362,7 @@ func ReadTargetRoles(ctx context.Context, admin *pg.Client, major int) (*TargetR
 		tr.Roles[r[0]].MemberOf[r[1]] = m
 	}
 	if major >= 15 {
-		rows, err = admin.Query(ctx, "select p.parname, a.privilege_type, case when a.grantee = 0 then 'PUBLIC' else pg_get_userbyid(a.grantee) end, a.is_grantable from pg_parameter_acl p, aclexplode(p.paracl) a")
+		rows, err = admin.Query(ctx, "select p.parname, a.privilege_type, case when a.grantee = 0 then '"+publicGrantee+"' else pg_get_userbyid(a.grantee) end, a.is_grantable from pg_parameter_acl p, aclexplode(p.paracl) a")
 		if err != nil {
 			return nil, fmt.Errorf("read parameter privileges: %w", err)
 		}
@@ -366,14 +391,54 @@ func inheritOf(m Membership, member *RoleSpec) bool {
 
 func setOf(m Membership) bool { return m.Set == nil || *m.Set }
 
-// sameTime compares two timestamptz texts loosely (pg_dumpall and pg_roles may
-// format the zone differently): equal after dropping spaces and a +00 suffix.
+// NoExpiry reports whether a VALID UNTIL value means the role never expires:
+// none, or infinity (pg_dumpall keeps an explicit 'infinity'; ALTER ROLE
+// cannot set it back to none). -infinity is a real value.
+func NoExpiry(s string) bool {
+	s = strings.TrimSpace(s)
+	return s == "" || strings.EqualFold(s, "infinity")
+}
+
+// sameTime compares two VALID UNTIL values. No expiry is the same whether
+// it is empty or 'infinity'. Both sides are printed in ISO and UTC (backup
+// pins the globals dump, ReadTargetRoles the target's session), and the
+// values are compared as instants, so the rule does not depend on how each
+// session printed them. Values that do not parse are compared as text
+// without spaces and a +00 suffix.
 func sameTime(a, b string) bool {
+	if NoExpiry(a) || NoExpiry(b) {
+		return NoExpiry(a) && NoExpiry(b)
+	}
+	ta, okA := parseTimestamptz(a)
+	tb, okB := parseTimestamptz(b)
+	if okA && okB {
+		return ta.Equal(tb)
+	}
 	norm := func(s string) string {
 		s = strings.ReplaceAll(s, " ", "")
 		return strings.TrimSuffix(strings.TrimSuffix(s, "+00:00"), "+00")
 	}
 	return norm(a) == norm(b)
+}
+
+// tzLayouts are the offsets PostgreSQL prints with ISO DateStyle: +07,
+// +05:30, +05:30:45. Fractional seconds parse without being in the layout.
+var tzLayouts = []string{"2006-01-02 15:04:05-07", "2006-01-02 15:04:05-07:00", "2006-01-02 15:04:05-07:00:00"}
+
+// parseTimestamptz reads a timestamptz text such as 2030-01-01 10:00:00.5+07
+// (or with a T separator, or a space before the offset).
+func parseTimestamptz(s string) (time.Time, bool) {
+	f := strings.Fields(strings.Replace(strings.TrimSpace(s), "T", " ", 1))
+	if len(f) < 2 {
+		return time.Time{}, false
+	}
+	s = f[0] + " " + strings.Join(f[1:], "")
+	for _, l := range tzLayouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func sortedKeys[V any](m map[string]V) []string {

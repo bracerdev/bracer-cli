@@ -26,7 +26,7 @@ func testApp(home, app string) *config.App {
 		Storage: &config.Storage{Endpoint: "https://s3.example", Bucket: "b", Folder: app + "-abc123",
 			AccessKeyEnv: config.EnvVarName(app, "s3", "access_key"), SecretKeyEnv: config.EnvVarName(app, "s3", "secret_key")},
 		Encryption: "none",
-		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7, Since: "2026-10-01T00:00:00Z"},
 		Runtime:    &config.Runtime{User: "deploy", Path: "/usr/bin:/bin", Docker: "/usr/bin/docker"},
 	}
 }
@@ -70,9 +70,9 @@ func testDeps(t *testing.T, sc *fakeSystemctl, in string) (scheduleDeps, *bytes.
 		unitDir:    t.TempDir(),
 		systemctl:  sc.run,
 		hasSystemd: func() bool { return true },
-		euid:       0,
 		executable: func() string { return "/usr/local/bin/bracer" },
-		invoker:    func() string { return "deploy" },
+		home:       func() (string, error) { return home, nil },
+		stampDir:   t.TempDir(),
 		lookupUser: func(name string) (account, error) {
 			switch name {
 			case "deploy":
@@ -119,7 +119,7 @@ func fakeRoot(t *testing.T, sc *fakeSystemctl) func(context.Context, string, ...
 var testHomes sync.Map // *testing.T → its home directory
 
 // testHome is the home directory of the test: a temp dir, also $HOME and the
-// home of the sudo invoker in testDeps.
+// home of the commands and of the jobs' user deploy in testDeps.
 func testHome(t *testing.T) string {
 	t.Helper()
 	if h, ok := testHomes.Load(t); ok {
@@ -158,6 +158,9 @@ func setSchedule(t *testing.T, appPath string, sc config.Schedule) {
 	cfg, err := config.Load(appPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if sc.Since == "" {
+		sc.Since = cfg.Schedule.Since
 	}
 	cfg.Schedule = &sc
 	if err := config.Save(appPath, cfg); err != nil {
@@ -244,7 +247,7 @@ func TestInstallUnitsWritesUnitsAndEnables(t *testing.T) {
 	}}
 	d, out, errb := testDeps(t, sc, "")
 	cfgPath := writeAppYAML(t, "shop")
-	setSchedule(t, cfgPath, config.Schedule{Every: "weekly", At: []string{"04:00"}, Days: []string{"mon"}, Keep: 4})
+	setSchedule(t, cfgPath, config.Schedule{Every: "weekly", At: []string{"04:00"}, Days: []string{"mon"}, Keep: 4, Since: "2026-10-01T00:00:00Z"})
 	if err := installUnits(context.Background(), loadAppYAML(t, cfgPath), cfgPath, d); err != nil {
 		t.Fatalf("installUnits: %v\nstderr=%s stdout=%s", err, errb, out)
 	}
@@ -284,21 +287,20 @@ func TestInstallUnitsWritesUnitsAndEnables(t *testing.T) {
 	}
 }
 
-// The backup and drill pairs of the earlier layout are retired (disabled,
-// removed, reset-failed); other apps' units stay. drill.runtime: none on
-// every instance is said on install (ADR-0026).
-func TestInstallUnitsRetiresOldLayout(t *testing.T) {
+// A first install writes the pair, reloads, gives the service a clean
+// slate when systemd remembers it failed, and enables the timer; other
+// apps' units stay. drill.runtime: none on every instance is said on
+// install (ADR-0026).
+func TestInstallUnitsFirstInstall(t *testing.T) {
 	sc := &fakeSystemctl{show: map[string]map[string]string{
-		"bracer-shop-backup.service": {"ActiveState": "failed"},
-		"bracer-shop-drill.service":  {"ActiveState": "failed"},
+		"bracer-shop.service": {"ActiveState": "failed"},
 	}}
 	d, out, errb := testDeps(t, sc, "")
 	cfg := testApp(testHome(t), "shop")
 	cfg.Instances[0].SetDrillOff(true)
 	cfgPath := writeApp(t, cfg)
-	old := []string{"bracer-shop-backup.service", "bracer-shop-backup.timer", "bracer-shop-drill.service", "bracer-shop-drill.timer"}
-	for _, n := range append(old, "bracer-shopper-backup.timer", "bracer-blog.timer") {
-		os.WriteFile(filepath.Join(d.unitDir, n), []byte("old"), 0o644)
+	for _, n := range []string{"bracer-shopper.timer", "bracer-blog.timer"} {
+		os.WriteFile(filepath.Join(d.unitDir, n), []byte("other"), 0o644)
 	}
 	if err := installUnits(context.Background(), cfg, cfgPath, d); err != nil {
 		t.Fatalf("installUnits: %v\n%s", err, errb)
@@ -306,24 +308,25 @@ func TestInstallUnitsRetiresOldLayout(t *testing.T) {
 	if !strings.Contains(out.String(), "Installed 2 units") || !strings.Contains(out.String(), "drill is off for every instance of shop: backups are not test-restored.") {
 		t.Errorf("stdout:\n%s", out)
 	}
-	for _, n := range old {
-		if _, err := os.Stat(filepath.Join(d.unitDir, n)); err == nil {
-			t.Errorf("%s must be removed", n)
-		}
-	}
-	for _, n := range []string{"bracer-shopper-backup.timer", "bracer-blog.timer", "bracer-shop.service", "bracer-shop.timer"} {
+	for _, n := range []string{"bracer-shopper.timer", "bracer-blog.timer", "bracer-shop.service", "bracer-shop.timer"} {
 		if _, err := os.Stat(filepath.Join(d.unitDir, n)); err != nil {
 			t.Errorf("%s must exist: %v", n, err)
 		}
 	}
 	calls := strings.Join(sc.calls, "\n")
-	for _, want := range []string{"disable --now bracer-shop-backup.timer", "disable --now bracer-shop-drill.timer", "daemon-reload\nshow -p ActiveState bracer-shop-backup.service\nshow -p ActiveState bracer-shop-drill.service\nreset-failed bracer-shop-backup.service bracer-shop-drill.service\nenable --now bracer-shop.timer\n"} {
-		if !strings.Contains(calls+"\n", want) {
-			t.Errorf("calls missing %q:\n%s", want, calls)
-		}
+	if want := "daemon-reload\nshow -p ActiveState bracer-shop.service\nreset-failed bracer-shop.service\nenable --now bracer-shop.timer\n"; !strings.Contains(calls+"\n", want) {
+		t.Errorf("calls missing %q:\n%s", want, calls)
 	}
 	if strings.Contains(calls, "shopper") || strings.Contains(calls, "blog") {
 		t.Errorf("another app's unit was touched:\n%s", calls)
+	}
+	// Installed again: no reset-failed, the pair is overwritten.
+	sc.calls = nil
+	if err := installUnits(context.Background(), cfg, cfgPath, d); err != nil {
+		t.Fatalf("install again: %v", err)
+	}
+	if calls := strings.Join(sc.calls, "\n"); strings.Contains(calls, "reset-failed") || !strings.Contains(calls, "enable --now bracer-shop.timer") {
+		t.Errorf("second install calls:\n%s", calls)
 	}
 }
 
@@ -343,24 +346,12 @@ func TestInstallUnitsRefusals(t *testing.T) {
 		}
 		return err.Error()
 	}
-	none := func(*scheduleDeps) {}
 	if err := run(func(d *scheduleDeps) {
 		d.lookupUser = func(string) (account, error) { return account{}, errors.New("unknown user deploy") }
 	}); !strings.Contains(err, `runtime.user "deploy": unknown user deploy`) || !strings.Contains(err, "Fix: bracer remove shop, then bracer init shop") {
 		t.Errorf("unknown user: %s", err)
 	}
 	cfg := loadAppYAML(t, cfgPath)
-	cfg.Runtime.User = "root"
-	if err := config.Save(cfgPath, cfg); err != nil {
-		t.Fatal(err)
-	}
-	if err := run(none); !strings.Contains(err, "the jobs would run as root, whose home has no app shop\nFix: bracer init shop") {
-		t.Errorf("app in another home: %s", err)
-	}
-	cfg.Runtime.User = "deploy"
-	if err := config.Save(cfgPath, cfg); err != nil {
-		t.Fatal(err)
-	}
 	// systemctl enable failing is an error of the install.
 	d, _, _ := testDeps(t, &fakeSystemctl{fail: "enable"}, "")
 	if err := installUnits(context.Background(), cfg, cfgPath, d); err == nil || !strings.Contains(err.Error(), "Failed to enable unit") {
@@ -380,17 +371,15 @@ func TestInstallUnitsRefusals(t *testing.T) {
 // (ADR-0023).
 func TestUninstallUnits(t *testing.T) {
 	sc := &fakeSystemctl{show: map[string]map[string]string{
-		"bracer-shop-backup.service": {"ActiveState": "failed"},
-		"bracer-shop-drill.service":  {"ActiveState": "failed"},
-		"bracer-shop.service":        {"ActiveState": "failed"},
+		"bracer-shop.service": {"ActiveState": "failed"},
 	}}
 	d, out, errb := testDeps(t, sc, "")
 	cfgPath := writeAppYAML(t, "shop")
 	if err := uninstallUnits(context.Background(), "shop", d); err != nil || !strings.Contains(out.String(), "No schedule installed for app shop.") || len(sc.calls) != 0 {
 		t.Errorf("nothing to remove: %v %s %v", err, out, sc.calls)
 	}
-	// The pair, the pairs of the earlier layout, and files that are no unit of shop.
-	for _, n := range []string{"bracer-shop.service", "bracer-shop.timer", "bracer-shop-backup.service", "bracer-shop-backup.timer", "bracer-shop-drill.service", "bracer-shop-drill.timer", "bracer-shop.timer.bak", "bracer-blog.timer", "bracer-shopper.timer", "bracer-shop-x.conf"} {
+	// The pair, and files that are no unit of shop.
+	for _, n := range []string{"bracer-shop.service", "bracer-shop.timer", "bracer-shop.timer.bak", "bracer-blog.timer", "bracer-shopper.timer", "bracer-shop-x.conf"} {
 		os.WriteFile(filepath.Join(d.unitDir, n), []byte("x"), 0o644)
 	}
 	os.WriteFile(cfgPath, []byte("not: [yaml"), 0o644)
@@ -406,17 +395,17 @@ func TestUninstallUnits(t *testing.T) {
 	if strings.Join(left, " ") != "bracer-blog.timer bracer-shop-x.conf bracer-shop.timer.bak bracer-shopper.timer" {
 		t.Errorf("left: %v", left)
 	}
-	for _, n := range []string{"bracer-shop.timer", "bracer-shop-drill.timer", "bracer-shop-backup.service"} {
+	for _, n := range []string{"bracer-shop.service", "bracer-shop.timer"} {
 		if !strings.Contains(out.String(), "Removed "+filepath.Join(d.unitDir, n)+"\n") {
 			t.Errorf("stdout missing Removed %s:\n%s", n, out)
 		}
 	}
 	// Timers off first, then the services stopped, then (files gone) reload
 	// and a clean slate for the services systemd remembers as failed.
-	want := "disable --now bracer-shop-backup.timer\ndisable --now bracer-shop-drill.timer\ndisable --now bracer-shop.timer\n" +
-		"stop bracer-shop-backup.service\nstop bracer-shop-drill.service\nstop bracer-shop.service\n" +
-		"daemon-reload\nshow -p ActiveState bracer-shop-backup.service\nshow -p ActiveState bracer-shop-drill.service\nshow -p ActiveState bracer-shop.service\n" +
-		"reset-failed bracer-shop-backup.service bracer-shop-drill.service bracer-shop.service"
+	want := "disable --now bracer-shop.timer\n" +
+		"stop bracer-shop.service\n" +
+		"daemon-reload\nshow -p ActiveState bracer-shop.service\n" +
+		"reset-failed bracer-shop.service"
 	if calls := strings.Join(sc.calls, "\n"); calls != want {
 		t.Errorf("calls:\n%s\nwant:\n%s", calls, want)
 	}

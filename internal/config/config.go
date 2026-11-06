@@ -8,6 +8,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -30,7 +32,8 @@ type App struct {
 	AgeRecipient    string     `yaml:"age_recipient,omitempty"`
 	AgeIdentityFile string     `yaml:"age_identity_file,omitempty"`
 	// HeartbeatURLEnv names the secret holding a Healthchecks-style URL: one
-	// signal per backup run, no details (ADR-0025, ADR-0026).
+	// signal per backup run, its exit code; a run that passed with warnings
+	// sends the warning lines as the body (ADR-0025, ADR-0026, ADR-0029).
 	HeartbeatURLEnv string  `yaml:"heartbeat_url_env,omitempty"`
 	Hosted          *Hosted `yaml:"hosted,omitempty"`
 	Drill           *Drill  `yaml:"drill,omitempty"`
@@ -49,7 +52,21 @@ type Schedule struct {
 	At    []string `yaml:"at" json:"at"`               // HH:MM, machine time
 	Days  []string `yaml:"days" json:"days,omitempty"` // weekly: mon…sun; monthly: 1–28 or last; daily: empty
 	Keep  int      `yaml:"keep" json:"keep"`           // every backup of the last Keep periods that have one
+	// Since is when this schedule came into force, UTC (SinceLayout): init
+	// writes it, never asks it. A schedule changes only by remove and init
+	// (ADR-0030), so hosted grades each run by the schedule whose since it
+	// follows.
+	Since string `yaml:"since" json:"since"`
 }
+
+// SinceLayout is how Schedule.Since is written.
+const SinceLayout = "2006-01-02T15:04:05Z"
+
+// firstSince is the earliest Since init can have written.
+var firstSince = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// SinceOf is t as Schedule.Since.
+func SinceOf(t time.Time) string { return t.UTC().Format(SinceLayout) }
 
 // The rhythms of Schedule.Every.
 const (
@@ -66,6 +83,15 @@ const LastDay = "last"
 
 // reClock is a time of day, HH:MM.
 var reClock = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
+
+// MaxAt is how many times of day a schedule may have: a backup every 15
+// minutes. The hosted server grades no denser schedule.
+const MaxAt = 96
+
+// TooManyAt says why a schedule with n times of day is refused.
+func TooManyAt(n int) string {
+	return fmt.Sprintf("%d times of day; at most %d (one every 15 minutes)", n, MaxAt)
+}
 
 // ValidClock: s is HH:MM.
 func ValidClock(s string) bool { return reClock.MatchString(s) }
@@ -112,6 +138,9 @@ func (s Schedule) problems() []string {
 		}
 		seen[a] = true
 	}
+	if len(seen) > MaxAt {
+		errs = append(errs, "at: "+TooManyAt(len(seen)))
+	}
 	switch s.Every {
 	case EveryDaily:
 		if len(s.Days) > 0 {
@@ -145,6 +174,13 @@ func (s Schedule) problems() []string {
 	}
 	if s.Keep < 1 {
 		errs = append(errs, "keep: must be ≥ 1")
+	}
+	// Not checked against this machine's clock: a clock put right after
+	// init must not fail every backup.
+	if s.Since == "" {
+		errs = append(errs, "since: required")
+	} else if t, err := time.Parse(SinceLayout, s.Since); err != nil || SinceOf(t) != s.Since || t.Before(firstSince) {
+		errs = append(errs, fmt.Sprintf("since: %q is not the UTC time init writes (like 2026-11-05T03:04:05Z)", s.Since))
 	}
 	return errs
 }
@@ -480,13 +516,14 @@ func rejectPlaintextSecrets(data []byte) error {
 // Validate checks the whole file and reports every error at once.
 func (a *App) Validate() error {
 	var errs []string
+	fix := "" // the Fix line, when one error has its own
 	add := func(format string, args ...interface{}) {
 		errs = append(errs, fmt.Sprintf(format, args...))
 	}
 	if a.App == "" {
 		add("app: required")
-	} else if !reName.MatchString(a.App) {
-		add("app: lowercase letters, digits, `-`, `_` only")
+	} else if p := AppNameProblem(a.App); p != "" {
+		add("app: %s", p)
 	}
 	if a.SecretsFile == "" {
 		add("secrets_file: required")
@@ -626,6 +663,9 @@ func (a *App) Validate() error {
 	if h := a.Hosted; h != nil {
 		if h.Server == "" {
 			add("hosted.server: required")
+		} else if err := CheckServer(h.Server); err != nil {
+			add("hosted.server: %v", err)
+			fix = "bracer remove " + a.App + ", then bracer init " + a.App + " --web"
 		}
 		if h.TokenEnv == "" {
 			add("hosted.token_env: required")
@@ -652,14 +692,15 @@ func (a *App) Validate() error {
 		}
 	}
 	if len(errs) > 0 {
-		return &ValidationError{Errs: errs}
+		return &ValidationError{Errs: errs, Fix: fix}
 	}
 	return nil
 }
 
 // Load reads and validates app.yaml from disk. app.yaml is written only by
 // init, so a file that does not read is made again: the error ends
-// with `Fix: bracer remove <app>, then bracer init <app>` (ADR-0022, ADR-0023).
+// with `Fix: bracer remove <app>, then bracer init <app>` (ADR-0022, ADR-0023),
+// with --web when the file has hosted:, so following it keeps the app paired.
 func Load(path string) (*App, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -667,11 +708,37 @@ func Load(path string) (*App, error) {
 	}
 	a, err := Parse(data)
 	var ve *ValidationError
-	if errors.As(err, &ve) {
+	if errors.As(err, &ve) && ve.Fix == "" {
 		app := AppOf(path)
 		ve.Fix = "bracer remove " + app + ", then bracer init " + app
+		if loose, lerr := LoadLoose(path); lerr == nil && loose.Hosted != nil {
+			ve.Fix += " --web"
+		}
 	}
 	return a, err
+}
+
+// LoadLoose reads only what a failure report needs from an app.yaml that
+// Load refused: app, secrets_file, hosted and schedule, without validating
+// the rest. Nothing else may use it: app.yaml is read strictly (ADR-0022).
+func LoadLoose(path string) (*App, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var part struct {
+		App         string    `yaml:"app"`
+		SecretsFile string    `yaml:"secrets_file"`
+		Hosted      *Hosted   `yaml:"hosted"`
+		Schedule    *Schedule `yaml:"schedule"`
+	}
+	if err := yaml.Unmarshal(data, &part); err != nil {
+		return nil, err
+	}
+	if part.App == "" {
+		part.App = AppOf(path)
+	}
+	return &App{App: part.App, SecretsFile: part.SecretsFile, Hosted: part.Hosted, Schedule: part.Schedule}, nil
 }
 
 // Marshal writes App as YAML.
@@ -694,7 +761,7 @@ func Save(path string, a *App) error {
 
 // writeAtomic writes through a temp file, then renames. If the file already exists,
 // its mode is kept and, when running as root (sudo), so is its owner, so another
-// user's cron can still read it (spec rotate-key § Edge cases).
+// user's timer can still read it (spec rotate-key § Edge cases).
 func writeAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	old, oldErr := os.Stat(path)
@@ -749,6 +816,29 @@ func EnvVarName(parts ...string) string {
 		}
 	}
 	return b.String()
+}
+
+// CheckServer is the rule of a hosted server URL (init --server,
+// hosted.server): the pair secret, the app token and every report go there,
+// so https://<host>, or http:// only to this machine (localhost, a loopback
+// address) for a server run locally.
+func CheckServer(s string) error {
+	u, err := url.Parse(s)
+	// Paths are joined onto it (…/report): no query or fragment, not even empty.
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || strings.ContainsAny(s, "?#") {
+		return fmt.Errorf("%q: expected https://<host>", s)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		h := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		if ip := net.ParseIP(h); h == "localhost" || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+		return fmt.Errorf("%q: http:// would send the token in cleartext; use https:// (http:// only to localhost)", s)
+	}
+	return fmt.Errorf("%q: expected https://<host>", s)
 }
 
 // ExpandHome replaces a leading `~/` in the path with the home directory.

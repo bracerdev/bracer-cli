@@ -7,12 +7,13 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"syscall"
 )
 
 // Version is set by main from ldflags.
 var Version = "dev"
 
-const usage = `bracer — backups proven, crons watched, nothing held.
+const usage = `bracer — backups proven, nothing held.
 
 Usage:
   bracer <command> <app> [flags]
@@ -48,7 +49,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, usage)
 		return exitUsage
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signalContext()
 	defer stop()
 	switch cmd := args[0]; cmd {
 	case "version", "--version", "-v":
@@ -73,4 +74,18 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "bracer: unknown command %q\n\n%s", cmd, usage)
 		return exitUsage
 	}
+}
+
+// signalContext is cancelled by Ctrl-C and by what stops a process from
+// outside: systemctl stop (bracer remove during a run), a shutdown or reboot
+// (SIGTERM), a closed SSH session (SIGHUP). Each runs the same cancel paths,
+// so a drill container, a lock or an upload is cleaned up and the failure
+// is reported. A SIGHUP ignored when bracer starts (nohup) stays ignored:
+// subscribing to it would undo nohup and stop the run with the session.
+func signalContext() (context.Context, context.CancelFunc) {
+	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !signal.Ignored(syscall.SIGHUP) {
+		sigs = append(sigs, syscall.SIGHUP)
+	}
+	return signal.NotifyContext(context.Background(), sigs...)
 }

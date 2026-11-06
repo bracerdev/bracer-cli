@@ -6,11 +6,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // tail is the part of app.yaml every test file shares: storage, encryption,
 // runtime, as init writes them.
-const schedBlock = "schedule:\n  every: daily\n  at: [\"03:00\"]\n  days: []\n  keep: 7\n"
+const schedBlock = "schedule:\n  every: daily\n  at: [\"03:00\"]\n  days: []\n  keep: 7\n  since: \"2026-10-01T00:00:00Z\"\n"
 
 const tail = `secrets_file: /home/khanh/.config/bracer/shop/secrets.env
 storage:
@@ -27,6 +28,7 @@ schedule:
   at: ["03:00"]
   days: []
   keep: 7
+  since: "2026-10-01T00:00:00Z"
 runtime:
   user: khanh
   path: /usr/bin:/bin
@@ -270,10 +272,12 @@ func TestScheduleInAppYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Schedule == nil || !reflect.DeepEqual(*a.Schedule, DefaultSchedule) {
+	want := DefaultSchedule
+	want.Since = "2026-10-01T00:00:00Z"
+	if a.Schedule == nil || !reflect.DeepEqual(*a.Schedule, want) {
 		t.Fatalf("schedule = %+v", a.Schedule)
 	}
-	monthly := Schedule{Every: "monthly", At: []string{"02:30", "14:00"}, Days: []string{"1", "15", "last"}, Keep: 3}
+	monthly := Schedule{Every: "monthly", At: []string{"02:30", "14:00"}, Days: []string{"1", "15", "last"}, Keep: 3, Since: "2026-10-01T00:00:00Z"}
 	a.Schedule = &monthly
 	path := filepath.Join(t.TempDir(), "app.yaml")
 	if err := Save(path, a); err != nil {
@@ -291,8 +295,8 @@ func TestScheduleInAppYAML(t *testing.T) {
 		t.Error("Period")
 	}
 	for _, s := range []Schedule{
-		{Every: "weekly", At: []string{"03:00"}, Days: []string{"mon", "sun"}, Keep: 1},
-		{Every: "monthly", At: []string{"00:00", "23:59"}, Days: []string{"28", "last"}, Keep: 1},
+		{Every: "weekly", At: []string{"03:00"}, Days: []string{"mon", "sun"}, Keep: 1, Since: "2026-10-01T00:00:00Z"},
+		{Every: "monthly", At: []string{"00:00", "23:59"}, Days: []string{"28", "last"}, Keep: 1, Since: "2026-10-01T00:00:00Z"},
 	} {
 		if err := s.Validate(); err != nil {
 			t.Errorf("%+v: %v", s, err)
@@ -300,5 +304,74 @@ func TestScheduleInAppYAML(t *testing.T) {
 	}
 	if err := (Schedule{Every: "hourly", At: []string{"03:00"}, Days: []string{"mon"}, Keep: 0}).Validate(); err == nil || !strings.Contains(err.Error(), "every: must be daily, weekly or monthly; keep: must be ≥ 1") {
 		t.Errorf("validate: %v", err)
+	}
+}
+
+// BR-023: schedule.since is required, the UTC time init writes, not before
+// 2026; a time ahead of this machine's clock is not refused. It survives a
+// save and load as a string.
+func TestBR023ScheduleSince(t *testing.T) {
+	ok := Schedule{Every: "daily", At: []string{"03:00"}, Days: []string{}, Keep: 7, Since: "2026-11-05T03:04:05Z"}
+	for _, since := range []string{"2026-11-05T03:04:05Z", "2026-01-01T00:00:00Z", "2099-12-31T23:59:59Z"} {
+		s := ok
+		s.Since = since
+		if err := s.Validate(); err != nil {
+			t.Errorf("%s: %v", since, err)
+		}
+	}
+	for _, since := range []string{"", "2026-11-05", "2026-11-05T03:04:05+07:00", "2026-11-05T03:04:05.5Z", "2026-02-30T00:00:00Z", "2025-12-31T23:59:59Z", "0001-01-01T00:00:00Z", "yesterday"} {
+		s := ok
+		s.Since = since
+		if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "since:") {
+			t.Errorf("%q: %v", since, err)
+		}
+	}
+	// app.yaml without since does not load: no compatibility path.
+	if _, err := Parse([]byte(strings.Replace(sample, "  since: \"2026-10-01T00:00:00Z\"\n", "", 1))); err == nil || !strings.Contains(err.Error(), "schedule.since") {
+		t.Errorf("app.yaml without since: %v", err)
+	}
+	if got := SinceOf(time.Date(2026, 11, 5, 10, 4, 5, 999, time.FixedZone("", 7*3600))); got != "2026-11-05T03:04:05Z" {
+		t.Errorf("SinceOf = %q", got)
+	}
+	a, err := Parse([]byte(sample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Schedule = &ok
+	path := filepath.Join(t.TempDir(), "app.yaml")
+	if err := Save(path, a); err != nil {
+		t.Fatal(err)
+	}
+	b, err := Load(path)
+	if err != nil || b.Schedule.Since != ok.Since {
+		t.Errorf("round trip: %+v %v", b.Schedule, err)
+	}
+}
+
+// BR-023 review: a missing since reads like every missing field, a
+// malformed one names the value; the Fix of an app.yaml that does not read
+// keeps --web when the file has hosted:, or following it drops the pairing.
+func TestBR023SinceMessagesAndFix(t *testing.T) {
+	noSince := strings.Replace(sample, "  since: \"2026-10-01T00:00:00Z\"\n", "", 1)
+	bad := strings.Replace(sample, "\"2026-10-01T00:00:00Z\"", "\"2026-10-01 00:00\"", 1)
+	hosted := "hosted:\n  server: https://app.bracer.dev\n  token_env: BRACER_SHOP_TOKEN\n"
+	for _, tc := range []struct {
+		name, yaml, want, fix string
+	}{
+		{"missing", noSince, "schedule.since: required", "bracer init shop\n"},
+		{"malformed", bad, `schedule.since: "2026-10-01 00:00" is not the UTC time init writes`, "bracer init shop\n"},
+		{"missing, hosted", noSince + hosted, "schedule.since: required", "bracer init shop --web\n"},
+		{"malformed, hosted", bad + hosted, `schedule.since: "2026-10-01 00:00" is not the UTC time init writes`, "bracer init shop --web\n"},
+	} {
+		dir := filepath.Join(t.TempDir(), "shop")
+		os.MkdirAll(dir, 0o700)
+		path := filepath.Join(dir, "app.yaml")
+		if err := os.WriteFile(path, []byte(tc.yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.HasSuffix(err.Error()+"\n", "Fix: bracer remove shop, then "+tc.fix) {
+			t.Errorf("%s: %v", tc.name, err)
+		}
 	}
 }

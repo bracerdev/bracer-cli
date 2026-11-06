@@ -51,9 +51,22 @@ func runRestore(ctx context.Context, args []string, d backupDeps) int {
 		}
 		return exitUsage
 	}
-	r := &restoreRun{ctx: ctx, d: d, p: newPrompter(d.stdin, d.stdout), w: d.stdout, log: logger}
+	return restoreSession(ctx, d, logger)
+}
+
+// restoreSession is restore once the terminal and Docker are there: the
+// questions, then the load.
+func restoreSession(ctx context.Context, d backupDeps, logger *slog.Logger) int {
+	fail := func(code int, format string, a ...interface{}) int {
+		fmt.Fprintf(d.stderr, "bracer restore: "+format+"\n", a...)
+		return code
+	}
+	r := &restoreRun{ctx: ctx, d: d, p: newPrompter(ctx, d.stdin, d.stdout), w: d.stdout, log: logger}
 	code, err := r.run()
 	if err != nil {
+		if ctx.Err() != nil {
+			return fail(exitError, "interrupted; nothing was loaded")
+		}
 		if errors.Is(err, ErrNoInput) || errors.Is(err, errQuit) {
 			return fail(exitUsage, "nothing was loaded")
 		}
@@ -571,9 +584,21 @@ func (r *restoreRun) printOutcome(out *restore.Outcome) {
 	if _, err := os.Stat(r.s.SQLDir()); err == nil {
 		r.printf("SQL files are in %s (env-up holds password hashes: delete the directory when done)\n", r.s.SQLDir())
 	}
-	if app := r.s.Newest().App; !containsStr(config.KnownApps(userHome()), app) {
-		r.printf("to back up this server: bracer init %s\n", app)
+	r.printf("%s", initHint(r.s.Newest().App))
+}
+
+// initHint is the last line of a restore: how to back this server up, ""
+// when the app is already on it (in the home every command uses, appHome).
+func initHint(app string) string {
+	home, _ := appHome()
+	if containsStr(config.KnownApps(home), app) {
+		return ""
 	}
+	if processEUID() == 0 {
+		// The app may be another user's, made without sudo (fixNoApp).
+		return "to back up this server: bracer init " + app + ", without sudo, as the user the nightly job should run as (" + rootOnly + ")\n"
+	}
+	return "to back up this server: bracer init " + app + "\n"
 }
 
 // printChecks lists the comparison: one line per check, the fix under a ✗.

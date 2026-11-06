@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,7 +22,7 @@ func checkHeartbeatURL(ctx context.Context, u string) error {
 // signal per backup run, its test-restore included (ADR-0025, ADR-0026).
 func (r *initRun) askHeartbeat() error {
 	prompt := "Heartbeat URL, Healthchecks-style (e.g. https://hc-ping.com/<uuid>; Enter to skip)"
-	r.p.printf("\nA heartbeat URL gets one signal each time backup runs (its test-restore included): ok or not, no details. The service behind it (Healthchecks or compatible) tells you when the signal fails or does not come.\n")
+	r.p.printf("\nA heartbeat URL gets one signal each time backup runs (its test-restore included): its exit code, and when it passes with warnings, the warning lines, which can name instances, databases and row counts. The service behind it (Healthchecks or compatible) tells you when the signal fails or does not come.\n")
 	for {
 		v, err := r.p.askSecret(prompt)
 		if err != nil {
@@ -66,49 +64,8 @@ func (r *initRun) printHeartbeat() {
 	if u == "" || r.cfg.Schedule == nil {
 		return
 	}
-	sched := "schedule: " + describeSchedule(*r.cfg.Schedule)
-	if cron, ok := scheduleCron(*r.cfg.Schedule); ok {
-		sched = "schedule (cron): " + cron
-	}
+	sched := "schedule: " + scheduleWhen(*r.cfg.Schedule)
 	r.p.printf("\nHeartbeat: set the check at %s to\n  %s\n  time zone: %s\n  grace time: at least 1 hour (more if the backup and its test-restore take longer)\nbracer only sends the signal; %s is what notices a missing one.\n", hostOf(u), sched, machineZone(), hostOf(u))
-}
-
-// scheduleCron is the schedule as one cron expression, for a check that
-// takes one: every time of day must share the minute, and `last` has no
-// cron form; false when no single expression says it.
-func scheduleCron(sc config.Schedule) (string, bool) {
-	minute, hours := "", []string{}
-	for _, a := range sc.At {
-		h, m, _ := strings.Cut(a, ":")
-		if minute != "" && m != minute {
-			return "", false
-		}
-		minute = m
-		hours = append(hours, cronField(h))
-	}
-	dom, dow := "*", "*"
-	switch sc.Every {
-	case config.EveryWeekly:
-		var days []string
-		for _, d := range sc.Days {
-			days = append(days, strconv.Itoa((slices.Index(config.Weekdays, d)+1)%7))
-		}
-		dow = strings.Join(days, ",")
-	case config.EveryMonthly:
-		if slices.Contains(sc.Days, config.LastDay) {
-			return "", false
-		}
-		dom = strings.Join(sc.Days, ",")
-	}
-	return fmt.Sprintf("%s %s %s * %s", cronField(minute), strings.Join(hours, ","), dom, dow), true
-}
-
-// cronField is a two-digit clock field without its leading zero.
-func cronField(s string) string {
-	if t := strings.TrimLeft(s, "0"); t != "" {
-		return t
-	}
-	return "0"
 }
 
 func hostOf(u string) string {

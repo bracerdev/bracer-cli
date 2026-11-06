@@ -134,6 +134,35 @@ func (ir *InstanceResult) Failures() []string {
 	return out
 }
 
+// Redact replaces, in place, every secret in the text of the instance's
+// drill with redact: its error, notes, the details of failed checks, the
+// disk check and each database's error and warnings. The backup calls it
+// before anything of the run is written or printed (BR-014).
+func (ir *InstanceResult) Redact(redact func(string) string) {
+	if ir == nil {
+		return
+	}
+	r := func(s *string) { *s = redact(*s) }
+	all := func(ss []string) {
+		for i := range ss {
+			r(&ss[i])
+		}
+	}
+	r(&ir.Error)
+	all(ir.Notes)
+	for i := range ir.Checks {
+		r(&ir.Checks[i].Detail)
+		r(&ir.Checks[i].Manual)
+	}
+	if ir.Disk != nil {
+		r(&ir.Disk.Error)
+	}
+	for _, dr := range ir.Databases {
+		r(&dr.Error)
+		all(dr.Warnings)
+	}
+}
+
 // Step is the drill step of a backup (backup.Deps.Drill): it drills the run
 // just written and records the outcome of each instance in run.json and in
 // the backup's result. keep, when set, receives the drill's own result.

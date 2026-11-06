@@ -21,10 +21,15 @@ import (
 // ADR-0008 option B): the new key is appended to age.key, app.yaml points at
 // the new key, old backups stay as they are. Offline, does not touch the
 // bucket. Attended only: the new key must be copied off the machine.
-func runRotateKey(_ context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runRotateKey(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("rotate-key", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfgPath, code, err := selectApp(fs, args, userHome(), "rotate-key")
+	home, err := appHome()
+	if err != nil {
+		fmt.Fprintf(stderr, "bracer rotate-key: %v\n", err)
+		return exitUsage
+	}
+	cfgPath, code, err := selectApp(fs, args, home, "rotate-key")
 	if code != exitOK {
 		if err != nil {
 			fmt.Fprintf(stderr, "bracer rotate-key: %v\n", err)
@@ -65,8 +70,11 @@ func runRotateKey(_ context.Context, args []string, stdin io.Reader, stdout, std
 		return fail(exitError, "%s does not hold the key for %s: backups made with it cannot be opened\n%s", keyPath, cfg.AgeRecipient, copyBack)
 	}
 
-	p := newPrompter(stdin, stdout)
+	p := newPrompter(ctx, stdin, stdout)
 	ok, err := p.yesNo(fmt.Sprintf("Rotate the age key for app %s? New backups will use a new key; the current key (%s) stays in %s so old backups still open.", cfg.App, cfg.AgeRecipient, keyPath), false)
+	if ctx.Err() != nil {
+		return fail(exitError, "interrupted; not rotated")
+	}
 	if err != nil || !ok {
 		return fail(exitError, "not rotated")
 	}
@@ -98,6 +106,9 @@ func runRotateKey(_ context.Context, args []string, stdin io.Reader, stdout, std
 	// The private key is never printed: age.key is the rescue card (ADR-0022).
 	for {
 		ans, err := p.ask(fmt.Sprintf("Copy %s somewhere off this machine again: it now holds the new key as well as the old ones. Without the new copy the backups made from now on cannot be opened if this machine is lost. Type copied when done", keyPath), "")
+		if ctx.Err() != nil {
+			return fail(exitError, "interrupted; the new key is in use: copy %s off this machine", keyPath)
+		}
 		if err != nil {
 			return fail(exitUsage, "%v; the new key is in use: copy %s off this machine", err, keyPath)
 		}

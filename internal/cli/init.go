@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -40,9 +42,13 @@ type initDeps struct {
 	// ADR-0027); the root work goes through sudo.
 	installTimer func(ctx context.Context, cfg *config.App, cfgPath string) error
 	// newPair opens the pairing API of a hosted server (init --web).
-	newPair  func(server string, verbose io.Writer) pairAPI
-	hostname func() (string, error)
-	euid     int
+	newPair func(server string, verbose io.Writer) pairAPI
+	// reportHTTP sends the proof run to /report (init --web); nil sends nothing.
+	reportHTTP *http.Client
+	hostname   func() (string, error)
+	// now is the clock schedule.since is stamped from (BR-023).
+	now  func() time.Time
+	euid int
 	// tty: stdin and stdout are a terminal.
 	tty    bool
 	stdin  io.Reader
@@ -65,6 +71,13 @@ type initRun struct {
 	secrets map[string]string // variable name → collected value, not written anywhere yet
 	pick    chooser           // who decides instances, databases, failed checks
 	web     *webSession       // init --web: the pairing session, else nil
+	// What init has left on this machine so far (unchanged): secrets.env,
+	// then app.yaml (the renamed draft), then the timer.
+	secretsWritten, written, timer bool
+	// named are the instances set up so far in this run, for a new
+	// instance's name and variables to be unique (init --web sets up
+	// several before they reach cfg).
+	named []config.Instance
 }
 
 func defaultInitDeps(stdin io.Reader, stdout, stderr io.Writer) initDeps {
@@ -73,20 +86,22 @@ func defaultInitDeps(stdin io.Reader, stdout, stderr io.Writer) initDeps {
 		probe:          pg.ProbeSSLRequest,
 		newStore:       func(c storage.S3Config) (storage.Store, error) { return storage.NewS3(c) },
 		env:            defaultEnvDeps(pg.ExecShell{}),
-		home:           os.UserHomeDir,
+		home:           appHome,
 		runSelf:        execSelf,
 		runTTY:         execTTY,
 		checkHeartbeat: checkHeartbeatURL,
 		installTimer: func(ctx context.Context, cfg *config.App, cfgPath string) error {
 			return installUnits(ctx, cfg, cfgPath, defaultScheduleDeps(stdin, stdout, stderr))
 		},
-		newPair:  newHTTPPair,
-		hostname: os.Hostname,
-		euid:     os.Geteuid(),
-		tty:      isTerminal(stdin) && isTerminal(stdout),
-		stdin:    stdin,
-		stdout:   stdout,
-		stderr:   stderr,
+		newPair:    newHTTPPair,
+		reportHTTP: defaultBackupDeps(stdin, stdout, stderr).http,
+		hostname:   os.Hostname,
+		now:        time.Now,
+		euid:       os.Geteuid(),
+		tty:        isTerminal(stdin) && isTerminal(stdout),
+		stdin:      stdin,
+		stdout:     stdout,
+		stderr:     stderr,
 	}
 }
 
@@ -118,8 +133,8 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	switch {
 	case name == "":
 		return fail("%v", noName(config.KnownApps(home), cmd))
-	case !config.ValidAppName(name):
-		return fail("%q is not an app name: lowercase letters, digits, `-`, `_` only", name)
+	case config.AppNameProblem(name) != "":
+		return fail("%q is not an app name: %s", name, config.AppNameProblem(name))
 	}
 	path := config.AppPath(home, name)
 	if _, err := os.Stat(path); err == nil {
@@ -129,12 +144,19 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 		// The confirmation and every secret are typed here (spec init-web).
 		return fail("--web needs a terminal: the confirmation and the secrets are typed there")
 	}
+	srv := strings.TrimRight(*server, "/")
+	if *web {
+		// The pair secret, then the app token, go to this URL.
+		if err := config.CheckServer(srv); err != nil {
+			return fail("--server %v", err)
+		}
+	}
 	if sh, ok := d.shell.(pg.ExecShell); ok {
 		sh.Verbose = *verbose
 		d.shell = sh
 	}
 	d.env.shell = d.shell
-	r := &initRun{initDeps: d, ctx: ctx, p: newPrompter(d.stdin, d.stdout), appName: name, path: path,
+	r := &initRun{initDeps: d, ctx: ctx, p: newPrompter(ctx, d.stdin, d.stdout), appName: name, path: path,
 		again: commandLine(cmd, args), docker: pg.Docker{Shell: d.shell}, secrets: map[string]string{}}
 	r.tools = pg.NewTools(d.shell)
 	r.pick = termChooser{r}
@@ -143,7 +165,6 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 		if *verbose {
 			vw = d.stderr
 		}
-		srv := strings.TrimRight(*server, "/")
 		r.web = newWebSession(r, d.newPair(srv, vw), srv)
 		r.pick = r.web
 	}
@@ -162,7 +183,9 @@ func runInit(ctx context.Context, args []string, d initDeps) int {
 	case errors.Is(err, ErrNoInput), errors.As(err, new(*usageError)):
 		fmt.Fprintf(d.stderr, "bracer %s: %v\n", cmd, err)
 		return exitUsage
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled), ctx.Err() != nil:
+		// A check cut short by the interrupt fails with its own words
+		// ("signal: killed"); it is still an interrupt.
 		fmt.Fprintf(d.stderr, "\nbracer %s: interrupted. %s\n", cmd, r.unchanged())
 		return exitError
 	default:
@@ -188,8 +211,20 @@ var (
 	errSelfCheck = errors.New("self-check failed")
 )
 
-// unchanged says what init leaves behind when it stops early.
-func (r *initRun) unchanged() string { return "No app.yaml written." }
+// unchanged says what init leaves behind when it stops early. Before the
+// rename that is nothing but an age key, which the next init reuses
+// (ADR-0030); after it, the app is there.
+func (r *initRun) unchanged() string {
+	switch {
+	case r.timer && r.cfg.Encryption == "age":
+		return fmt.Sprintf("%s written and its timer installed, but %s was not confirmed copied off this machine.", r.path, r.cfg.AgeIdentityFile)
+	case r.timer:
+		return fmt.Sprintf("%s written and its timer installed.", r.path)
+	case r.written:
+		return fmt.Sprintf("%s written; no timer installed.\nFix: %s", r.path, backup.FixReinit(r.appName))
+	}
+	return "No app.yaml written."
+}
 
 func (r *initRun) warn(format string, args ...interface{}) {
 	fmt.Fprintf(r.stderr, "warning: "+format+"\n", args...)
@@ -265,7 +300,14 @@ func (r *initRun) runInit() error {
 
 // finish is steps 11 and 14–19: the secrets, the proof (preflight, a real
 // backup with its drill), the timer, the rescue card.
-func (r *initRun) finish() error {
+// A stop before the rename takes back what this run wrote: no live
+// credential stays behind without an app.yaml that names it.
+func (r *initRun) finish() (err error) {
+	defer func() {
+		if err != nil && !r.written {
+			r.dropSecrets()
+		}
+	}()
 	if err := r.storeSecrets(); err != nil {
 		return err
 	}
@@ -328,6 +370,9 @@ func (r *initRun) setupStorage() error {
 			r.secrets[akEnv] = ak
 			r.secrets[skEnv] = sk
 			return nil
+		}
+		if r.ctx.Err() != nil {
+			return r.ctx.Err()
 		}
 		r.p.printf("  ✗ %v\n", err)
 		// No skip: without a bucket backup has nowhere to go.
@@ -491,7 +536,8 @@ func (r *initRun) askSchedule() error {
 			s.Days = []string{"1"}
 		}
 	}
-	askList := func(prompt string, dst *[]string, check func(string) (string, string)) error {
+	// max > 0 bounds how many entries the answer may have.
+	askList := func(prompt string, max int, dst *[]string, check func(string) (string, string)) error {
 		for {
 			v, err := r.p.ask(prompt, strings.Join(*dst, ", "))
 			if err != nil {
@@ -515,8 +561,12 @@ func (r *initRun) askSchedule() error {
 				seen[norm] = true
 				out = append(out, norm)
 			}
-			if problem == "" && len(out) == 0 {
+			switch {
+			case problem != "":
+			case len(out) == 0:
 				problem = "at least one"
+			case max > 0 && len(out) > max:
+				problem = config.TooManyAt(len(out))
 			}
 			if problem != "" {
 				r.p.printf("  %s\n", problem)
@@ -526,7 +576,7 @@ func (r *initRun) askSchedule() error {
 			return nil
 		}
 	}
-	if err := askList("Time of day (HH:MM, several separated by commas)", &s.At, func(v string) (string, string) {
+	if err := askList("Time of day (HH:MM, several separated by commas)", config.MaxAt, &s.At, func(v string) (string, string) {
 		if !config.ValidClock(v) {
 			return v, v + " is not HH:MM"
 		}
@@ -536,7 +586,7 @@ func (r *initRun) askSchedule() error {
 	}
 	switch s.Every {
 	case config.EveryWeekly:
-		if err := askList("Days of the week (mon…sun, several separated by commas)", &s.Days, func(v string) (string, string) {
+		if err := askList("Days of the week (mon…sun, several separated by commas)", 0, &s.Days, func(v string) (string, string) {
 			if !slices.Contains(config.Weekdays, v) {
 				return v, v + " is not a day of the week (mon…sun)"
 			}
@@ -545,7 +595,7 @@ func (r *initRun) askSchedule() error {
 			return err
 		}
 	case config.EveryMonthly:
-		if err := askList("Days of the month (1–28 or last, several separated by commas)", &s.Days, func(v string) (string, string) {
+		if err := askList("Days of the month (1–28 or last, several separated by commas)", 0, &s.Days, func(v string) (string, string) {
 			if v == config.LastDay {
 				return v, ""
 			}
@@ -578,13 +628,17 @@ func (r *initRun) askSchedule() error {
 // describeSchedule is a schedule in one line: "daily at 03:00, 15:00, keep
 // every backup of the last 7 days".
 func describeSchedule(sc config.Schedule) string {
-	var b strings.Builder
-	b.WriteString(sc.Every)
+	return fmt.Sprintf("%s, keep every backup of the last %d %ss", scheduleWhen(sc), sc.Keep, sc.Period())
+}
+
+// scheduleWhen is when the timer fires, in words: "daily at 03:00",
+// "weekly on mon, thu at 03:00".
+func scheduleWhen(sc config.Schedule) string {
+	when := sc.Every
 	if len(sc.Days) > 0 {
-		b.WriteString(" on " + strings.Join(sc.Days, ", "))
+		when += " on " + strings.Join(sc.Days, ", ")
 	}
-	fmt.Fprintf(&b, " at %s, keep every backup of the last %d %ss", strings.Join(sc.At, ", "), sc.Keep, sc.Period())
-	return b.String()
+	return when + " at " + strings.Join(sc.At, ", ")
 }
 
 // storeSecrets is step 11: no question, secrets.env in the app directory is
@@ -600,9 +654,22 @@ func (r *initRun) storeSecrets() error {
 	if err := config.WriteEnvFile(path, r.secrets); err != nil {
 		return err
 	}
+	r.secretsWritten = true
 	names := slices.Sorted(maps.Keys(r.secrets))
 	r.p.printf("Secrets saved to %s (mode 600): %s. They are never written to %s.\n", path, strings.Join(names, ", "), r.path)
 	return nil
+}
+
+// dropSecrets removes the secrets.env of an init that stopped before the
+// rename, and the app directory when nothing else is in it (an age.key
+// stays: the next init reuses it, ADR-0030).
+func (r *initRun) dropSecrets() {
+	path, _ := r.configPath(config.SecretsFile)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		r.warn("could not remove %s: %v; remove it yourself, it holds the secrets of this init", path, err)
+		return
+	}
+	_ = os.Remove(filepath.Dir(r.path)) // only when empty
 }
 
 // configPath is <home>/.config/bracer/<app>/<name>, absolute: the timers run
@@ -618,14 +685,32 @@ func execSelf(ctx context.Context, args, env []string, stdout, stderr io.Writer)
 		fmt.Fprintln(stderr, "bracer init: cannot find this binary:", err)
 		return exitError
 	}
+	return runChild(ctx, exe, args, env, stdout, stderr)
+}
+
+// childGrace is how long a proof run has to clean up after init is
+// interrupted (drill container and volume removed, upload aborted) before
+// it is killed. A variable so tests can shorten it.
+var childGrace = 30 * time.Second
+
+// runChild runs exe with exactly env. When ctx ends the child gets SIGINT,
+// as from Ctrl-C, and childGrace to exit; only then is it killed.
+func runChild(ctx context.Context, exe string, args, env []string, stdout, stderr io.Writer) int {
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Env, cmd.Stdout, cmd.Stderr = env, stdout, stderr
+	cmd.Cancel = func() error {
+		fmt.Fprintf(stderr, "\nStopping the running backup; it cleans up first (up to %s).\n", childGrace)
+		return cmd.Process.Signal(os.Interrupt)
+	}
+	cmd.WaitDelay = childGrace
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return ee.ExitCode()
 		}
-		fmt.Fprintln(stderr, "bracer init:", err)
+		if ctx.Err() == nil {
+			fmt.Fprintln(stderr, "bracer init:", err)
+		}
 		return exitError
 	}
 	return exitOK

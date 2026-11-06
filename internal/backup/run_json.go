@@ -243,28 +243,6 @@ func (r *Run) instance(name string) *RunInstance {
 // Whole: the instance has everything the run meant to back up of it.
 func (ri *RunInstance) Whole() bool { return ri != nil && len(ri.Missing) == 0 }
 
-// DrillPassed: the instance was test-restored in this run and passed.
-func (ri *RunInstance) DrillPassed() bool {
-	return ri != nil && ri.Drill != nil && ri.Drill.Result == DrillPassed
-}
-
-// AllDrillsPassed: every instance of the run that was test-restored passed,
-// and at least one was. The run retention keeps as "latest that passed a
-// drill" (ADR-0019, ADR-0026).
-func (r *Run) AllDrillsPassed() bool {
-	drilled := false
-	for _, ri := range r.Instances {
-		if ri.Drill == nil || ri.Drill.Result == DrillOff {
-			continue
-		}
-		if ri.Drill.Result != DrillPassed {
-			return false
-		}
-		drilled = true
-	}
-	return drilled
-}
-
 // Encrypted: some object of the run is encrypted, so restore needs the age key.
 func (r *Run) Encrypted() bool {
 	for _, ri := range r.Instances {

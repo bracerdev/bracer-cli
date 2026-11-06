@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -182,7 +183,7 @@ func TestRunnersBuildDockerArgsWithoutSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := strings.Join(sh.calls[0].Args, " ")
-	if !strings.HasPrefix(args, "exec -i -e PGUSER -e PGPASSWORD -e PGDATABASE -e PGCONNECT_TIMEOUT shop-db psql -c select 1") {
+	if !strings.HasPrefix(args, "exec -i -e PGUSER -e PGPASSWORD -e PGDATABASE -e PGCONNECT_TIMEOUT -e PGAPPNAME shop-db psql -c select 1") {
 		t.Errorf("args exec: %s", args)
 	}
 	if strings.Contains(args, "pw") {
@@ -214,9 +215,9 @@ func TestRunnersBuildDockerArgsWithoutSecrets(t *testing.T) {
 
 func TestClientQueries(t *testing.T) {
 	sh := &fakeShell{out: map[string]string{
-		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c show server_version_num": "170011\n",
-		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c select datname":          "postgres\nshop\n",
-		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c select current_user":     "bracer_backup\x1ff\x1ft\x1ff\n",
+		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT -e PGAPPNAME c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c show server_version_num": "170011\n",
+		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT -e PGAPPNAME c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c select datname":          "postgres\nshop\n",
+		"docker exec -i -e PGUSER -e PGCONNECT_TIMEOUT -e PGAPPNAME c psql -X -A -t -q -v ON_ERROR_STOP=1 -F \x1f -0 -c select current_user":     "bracer_backup\x1ff\x1ft\x1ff\n",
 	}}
 	cl := &Client{Runner: ExecRunner{Shell: sh, Container: "c"}, Conn: Conn{User: "bracer_backup"}}
 	ctx := context.Background()
@@ -258,6 +259,19 @@ func TestFixRoleSQLByMajor(t *testing.T) {
 	}
 	for _, m := range []int{0, 14, 18} {
 		if got := FixRoleSQL("b", m); !strings.Contains(got, "GRANT pg_read_all_data TO b") || !strings.Contains(got, "GRANT pg_read_all_settings TO b") || strings.Contains(got, "SUPERUSER") {
+			t.Errorf("PG%d: %q", m, got)
+		}
+	}
+}
+
+// BR-016 item 6: the sample SQL holds no password literal (psql's \password
+// asks for it), so it stays out of shell history and the hosted server,
+// which refuses PASSWORD '…', accepts it as an init --web hint.
+func TestBR016FixRoleSQLHasNoPassword(t *testing.T) {
+	re := regexp.MustCompile(`(?i)PASSWORD\s+'`)
+	for _, m := range []int{0, 13, 17} {
+		got := FixRoleSQL("bracer_backup", m)
+		if re.MatchString(got) || !strings.HasSuffix(got, "\n\\password bracer_backup") {
 			t.Errorf("PG%d: %q", m, got)
 		}
 	}

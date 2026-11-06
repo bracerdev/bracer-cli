@@ -30,15 +30,21 @@ import (
 // fakeRunner fakes psql/pg_dump/pg_dumpall by tool and SQL statement.
 type fakeRunner struct {
 	dbs        []string
-	extraDBs   []string          // on the server but not in app.yaml
-	payload    map[string]string // db → pg_dump contents
-	failDump   string            // db whose pg_dump fails
-	notSuper   bool              // the connected user is not a superuser (default: it is)
-	cfuncs     string            // rows of the C functions query (probin, function)
-	colls      string            // rows of the collations query
-	readAll    bool              // pg_read_all_data
-	sysid      string            // system_identifier; empty: pg_control_system() fails (managed)
-	noSettings bool              // shared_preload_libraries unreadable (no pg_read_all_settings)
+	extraDBs   []string            // on the server but not in app.yaml
+	payload    map[string]string   // db → pg_dump contents
+	failDump   string              // db whose pg_dump fails
+	dumpStderr string              // what that pg_dump says; empty: an RLS error
+	notSuper   bool                // the connected user is not a superuser (default: it is)
+	cfuncs     string              // rows of the C functions query (probin, function)
+	colls      string              // rows of the collations query
+	readAll    bool                // pg_read_all_data
+	sysid      string              // system_identifier; empty: pg_control_system() fails (managed)
+	noSettings bool                // shared_preload_libraries unreadable (no pg_read_all_settings)
+	envErr     string              // stderr of the environment's first query, which then fails
+	globalsErr string              // stderr of pg_dumpall, which then fails
+	commitErr  string              // error of the snapshot session's commit
+	globalsEnv []string            // the libpq environment pg_dumpall ran with
+	otherEnvs  map[string][]string // tool + args → the libpq environment of every other call
 	calls      []string
 }
 
@@ -46,6 +52,12 @@ func (f *fakeRunner) Describe() string { return "fake runner" }
 
 func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []string, stdin io.Reader, stdout io.Writer) error {
 	f.calls = append(f.calls, tool+" "+strings.Join(args, " ")+" db="+conn.Database)
+	if tool != "pg_dumpall" {
+		if f.otherEnvs == nil {
+			f.otherEnvs = map[string][]string{}
+		}
+		f.otherEnvs[tool+" "+strings.Join(args, " ")] = conn.Env()
+	}
 	if tool == "psql" && hasArg(args, "-0") {
 		stdout = psqlRows{stdout}
 	}
@@ -64,6 +76,9 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 			io.WriteString(stdout, "17.11\n")
 		// Environment record (ADR-0015).
 		case strings.HasPrefix(sql, "select (select rolname from pg_roles where oid = 10)"):
+			if f.envErr != "" {
+				return &pg.ExitError{Cmd: "psql", Code: 1, Stderr: []byte(f.envErr)}
+			}
 			su := "f"
 			if !f.notSuper {
 				su = "t"
@@ -137,10 +152,17 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 			return fmt.Errorf("fake: pg_dump without --snapshot: %v", args)
 		}
 		if conn.Database == f.failDump {
+			if f.dumpStderr != "" {
+				return &pg.ExitError{Cmd: "pg_dump", Code: 1, Stderr: []byte(f.dumpStderr)}
+			}
 			return &pg.ExitError{Cmd: "pg_dump", Code: 1, Stderr: []byte("pg_dump: error: query would be affected by row-level security policy")}
 		}
 		io.WriteString(stdout, f.payload[conn.Database])
 	case "pg_dumpall":
+		f.globalsEnv = conn.Env()
+		if f.globalsErr != "" {
+			return &pg.ExitError{Cmd: "pg_dumpall", Code: 1, Stderr: []byte(f.globalsErr)}
+		}
 		io.WriteString(stdout, "CREATE ROLE app;\n")
 	default:
 		return fmt.Errorf("fake: unexpected tool %s", tool)
@@ -171,6 +193,8 @@ func (f *fakeRunner) session(conn pg.Conn, stdin io.Reader, stdout io.Writer) er
 		switch {
 		case sql == "select 1":
 			io.WriteString(stdout, "1\n")
+		case sql == "commit" && f.commitErr != "":
+			lastErr = f.commitErr
 		case strings.HasPrefix(sql, "begin"), sql == "commit", strings.HasPrefix(sql, "set "):
 		case sql == "select pg_export_snapshot()":
 			io.WriteString(stdout, fakeSnapshotID+"\n")
@@ -201,6 +225,8 @@ type memStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	failPut string   // Put fails for keys containing this string
+	failDel string   // Delete fails for keys containing this string
+	failMsg string   // the error of a failed Put or Delete; empty: 403 Forbidden
 	puts    []string // keys written, in order
 	deleted []string // keys deleted, in order
 }
@@ -215,7 +241,7 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64) erro
 		return err
 	}
 	if m.failPut != "" && strings.Contains(key, m.failPut) {
-		return errors.New("403 Forbidden")
+		return m.failure()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -241,7 +267,16 @@ func (m *memStore) List(_ context.Context, prefix string) ([]storage.Object, err
 	}
 	return out, nil
 }
+func (m *memStore) failure() error {
+	if m.failMsg != "" {
+		return errors.New(m.failMsg)
+	}
+	return errors.New("403 Forbidden")
+}
 func (m *memStore) Delete(_ context.Context, key string) error {
+	if m.failDel != "" && strings.Contains(key, m.failDel) {
+		return m.failure()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.objects, key)
@@ -325,7 +360,7 @@ func baseCfg(dbs ...string) *config.App {
 		Instances:  []config.Instance{{Name: "main", Connection: config.Connection{Container: "shop-db", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone}, Databases: config.Databases(list)}},
 		Storage:    &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Folder: "shop-abc123", AccessKeyEnv: "A", SecretKeyEnv: "S"},
 		Encryption: "none",
-		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 2},
+		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 2, Since: "2026-10-01T00:00:00Z"},
 	}
 }
 
@@ -807,25 +842,6 @@ func TestNewOutcome(t *testing.T) {
 	}
 }
 
-func TestLock(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "app.yaml")
-	l, err := Acquire(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Acquire(cfgPath); !errors.Is(err, ErrLocked) {
-		t.Errorf("second acquire: %v", err)
-	}
-	l.Release()
-	os.WriteFile(filepath.Join(dir, ".app.yaml.lock"), []byte("999999999\n"), 0o644)
-	l2, err := Acquire(cfgPath)
-	if err != nil {
-		t.Errorf("stale lock must be taken over: %v", err)
-	}
-	l2.Release()
-}
-
 // The ts of a run always sorts after the newest folder (clock behind → +1 s,
 // warning); a folder without run.json is a run that did not end and goes;
 // keys outside a <ts>/ folder are never touched (ADR-0026).
@@ -1040,6 +1056,140 @@ func hasArg(args []string, a string) bool {
 	return false
 }
 
+// br014Drill is another package's drill result kept in a Result: it holds
+// text that Backup must redact through its Redact method.
+type br014Drill struct{ Error string }
+
+func (x *br014Drill) Redact(redact func(string) string) { x.Error = redact(x.Error) }
+
+// BR-014: a secret quoted by pg_dump's stderr or by the drill (a secrets_file
+// value, a URL password, a SQL verifier) is redacted before run.json is
+// written and before the journal line: run.json, the log and the Result
+// carry the same redacted text; names stay.
+func TestBR014RunJSONAndLogRedacted(t *testing.T) {
+	const value, urlPW, verifier = "fakepw-br014-value", "url-pw-br014", "SCRAM-SHA-256$4096:verifier-br014"
+	stderr := "pg_dump: error: connection to postgres://app:" + urlPW + "@db:5432/shop failed: password " + value + "\nLINE 1: ALTER ROLE app PASSWORD '" + verifier + "'"
+	st := newMemStore()
+	r := &fakeRunner{dbs: []string{"shop"}, failDump: "shop", dumpStderr: stderr}
+	d := deps(st, r)
+	var logged bytes.Buffer
+	d.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	// "shop" is a secret value too: free text loses it, names keep it.
+	d.Secrets = config.NewSecrets(map[string]string{"PW": value, "NAME": "shop"}, "test")
+	x := &br014Drill{Error: "env-up failed: PASSWORD '" + verifier + "'"}
+	d.Drill = func(_ context.Context, run *Run, res *Result) {
+		res.Warnings = append(res.Warnings, "could not remove leftover drill resources: PGPASSWORD="+value)
+		ri, ir := run.Instances["main"], res.Instance("main")
+		ri.Drill = &DrillOutcome{Result: DrillFailed, Reasons: []string{x.Error}}
+		ir.DrillFailed, ir.Drill = ri.Drill.Reasons, x
+	}
+	res, err := Backup(context.Background(), baseCfg(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := st.objects[RunKey(root, res.TS)]
+	for what, text := range map[string]string{"result": string(data), "run.json": string(raw), "log": logged.String()} {
+		for _, secret := range []string{value, urlPW, verifier} {
+			if strings.Contains(text, secret) {
+				t.Errorf("%s holds %q:\n%s", what, secret, text)
+			}
+		}
+	}
+	run := st.newest(t)
+	reasons := strings.Join(run.Backup.Reasons, "\n")
+	if !strings.Contains(reasons, "postgres://***@db:5432/***") || !strings.Contains(reasons, "PASSWORD ***") || !strings.Contains(logged.String(), "PASSWORD ***") {
+		t.Errorf("reasons:\n%s\nlog:\n%s", reasons, logged.String())
+	}
+	if dr := run.Instances["main"].Drill; dr == nil || dr.Reasons[0] != "env-up failed: PASSWORD ***" || x.Error != dr.Reasons[0] {
+		t.Errorf("drill: %+v, result %q", dr, x.Error)
+	}
+	if w := strings.Join(run.Backup.Warnings, "\n"); !strings.Contains(w, "PGPASSWORD=***") || w != strings.Join(res.Warnings, "\n") {
+		t.Errorf("warnings: run.json %q, result %q", w, res.Warnings)
+	}
+	if ir := res.Instance("main"); ir.Name != "main" || ir.Databases[0].Name != "shop" || run.Instances["main"].Databases == nil {
+		t.Errorf("names changed: %+v", ir)
+	}
+}
+
+// BR-014: every other text of a run that can quote a secret is redacted:
+// the environment's and the globals' errors, the warning of a retention
+// delete that failed, the error of run.json not written and the log line
+// of a snapshot session that did not close.
+func TestBR014RedactedEverywhereElse(t *testing.T) {
+	const value = "fakepw-br014-other"
+	leak := "password=" + value + " AKIAIOSFODNN7EXAMPLE"
+	secretDeps := func(st *memStore, r *fakeRunner) (Deps, *bytes.Buffer) {
+		d := deps(st, r)
+		var logged bytes.Buffer
+		d.Log = slog.New(slog.NewTextHandler(&logged, nil))
+		d.Secrets = config.NewSecrets(map[string]string{"PW": value}, "test")
+		return d, &logged
+	}
+	clean := func(what, text string) {
+		t.Helper()
+		if strings.Contains(text, value) || strings.Contains(text, "AKIA") || !strings.Contains(text, "***") {
+			t.Errorf("%s: %q", what, text)
+		}
+	}
+	payload := map[string]string{"shop": "PGDMP-shop"}
+
+	// Environment and globals.
+	st := newMemStore()
+	d, _ := secretDeps(st, &fakeRunner{dbs: []string{"shop"}, payload: payload, envErr: "ERROR:  " + leak, globalsErr: "pg_dumpall: error: " + leak})
+	res, err := Backup(context.Background(), baseCfg(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ir := res.Instance("main")
+	if ir.Env == nil || ir.Globals == nil {
+		t.Fatalf("no environment or globals: %+v", ir)
+	}
+	clean("Env.Error", ir.Env.Error)
+	clean("Globals.Error", ir.Globals.Error)
+	clean("run.json reasons", strings.Join(st.newest(t).Backup.Reasons, "\n"))
+
+	// The snapshot session's commit.
+	d, logged := secretDeps(newMemStore(), &fakeRunner{dbs: []string{"shop"}, payload: payload, commitErr: "ERROR:  " + leak})
+	if _, err := Backup(context.Background(), baseCfg(), d); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logged.String(), "close snapshot session") {
+		t.Fatalf("no close snapshot log:\n%s", logged)
+	}
+	clean("close snapshot log", logged.String())
+
+	// A retention delete.
+	st = newMemStore()
+	oldRun(t, st, "2026-10-14T030000Z", 10)
+	oldRun(t, st, "2026-10-15T030000Z", 10)
+	st.failDel, st.failMsg = "2026-10-14T030000Z", "delete: "+leak
+	d, _ = secretDeps(st, &fakeRunner{dbs: []string{"shop"}, payload: payload})
+	if res, err = Backup(context.Background(), baseCfg(), d); err != nil {
+		t.Fatal(err)
+	}
+	w := strings.Join(res.Warnings, "\n")
+	if !strings.Contains(w, "retention: could not delete") {
+		t.Fatalf("warnings: %q", w)
+	}
+	clean("retention warning", w)
+
+	// run.json not written.
+	st = newMemStore()
+	st.failPut, st.failMsg = RunFile, "put: "+leak
+	d, _ = secretDeps(st, &fakeRunner{dbs: []string{"shop"}, payload: payload})
+	if res, err = Backup(context.Background(), baseCfg(), d); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Error, "run.json could not be written") {
+		t.Fatalf("error: %q", res.Error)
+	}
+	clean("SaveRun error", res.Error)
+}
+
 // spec backup § needs: run.json records the library a C function loads and
 // the collations columns use.
 func TestBackupRecordsNeeds(t *testing.T) {
@@ -1081,7 +1231,7 @@ func TestDrillFailsRunAndDeletesNothing(t *testing.T) {
 	oldRun(t, st, "2026-10-15T030000Z", 10, func(r *Run) {
 		r.Instances["main"].Drill = &DrillOutcome{Result: DrillFailed, Reasons: []string{"orders: 10 rows, dump says 11"}}
 	})
-	if !passed.AllDrillsPassed() {
+	if passed.Instances["main"].Drill.Result != DrillPassed {
 		t.Fatal("seeded run must count as drill-passed")
 	}
 	cfg := baseCfg()
@@ -1100,7 +1250,7 @@ func TestDrillFailsRunAndDeletesNothing(t *testing.T) {
 	if strings.Contains(strings.Join(res.Warnings, "\n"), "keeping run") {
 		t.Errorf("warnings: %v", res.Warnings)
 	}
-	if run := st.newest(t); run.AllDrillsPassed() || run.Instances["main"].Drill.Result != DrillOff {
+	if run := st.newest(t); run.Instances["main"].Drill.Result != DrillOff {
 		t.Errorf("drill off: %+v", run.Instances["main"].Drill)
 	}
 
@@ -1112,7 +1262,7 @@ func TestDrillFailsRunAndDeletesNothing(t *testing.T) {
 		t.Fatal(err, res)
 	}
 	run := st.newest(t)
-	if dr := run.Instances["main"].Drill; !run.AllDrillsPassed() || run.Verdict() != ResultOK || dr.TookSeconds != 12.5 || dr.At.IsZero() {
+	if dr := run.Instances["main"].Drill; dr.Result != DrillPassed || run.Verdict() != ResultOK || dr.TookSeconds != 12.5 || dr.At.IsZero() {
 		t.Errorf("drill outcome: %+v", dr)
 	}
 	if len(st.deleted) != 0 {

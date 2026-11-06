@@ -156,7 +156,7 @@ func TestPlanMatchingTarget(t *testing.T) {
 	tgt.Names[restoredShop] = true
 	tgt.DBs[restoredShop] = &TargetDB{Name: restoredShop, Exists: true, Objects: 5, Owner: "app", Locale: src.DBs[0].Dump.Locale,
 		Settings: map[string]string{}, SettingName: map[string]string{},
-		ACL: map[string]bool{"PUBLIC CONNECT": true, "PUBLIC TEMPORARY": true, "app CONNECT": true, "app CREATE": true, "app TEMPORARY": true, "Report Reader CONNECT": true}}
+		ACL: map[string]bool{"public CONNECT": true, "public TEMPORARY": true, "app CONNECT": true, "app CREATE": true, "app TEMPORARY": true, "Report Reader CONNECT": true}}
 	p = MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull, Loaded: map[string]string{"shop": restoredShop}})
 	if !p.OK() || p.DBs[0].Target != restoredShop || len(p.DBs[0].Create) != 0 {
 		t.Errorf("after the load: %v %+v", failed(p), p.DBs[0])
@@ -268,7 +268,7 @@ func TestPlanDataModeSetsSettingsOnCreate(t *testing.T) {
 
 // Grantee names may hold spaces.
 func TestACLDiffQuotesGrantees(t *testing.T) {
-	got := aclDiff("shop", map[string]bool{"PUBLIC TEMPORARY": true}, map[string]bool{"Report Reader CONNECT": true})
+	got := aclDiff("shop", map[string]bool{"public TEMPORARY": true}, map[string]bool{"Report Reader CONNECT": true})
 	want := []string{`REVOKE TEMPORARY ON DATABASE "shop" FROM PUBLIC;`, `GRANT CONNECT ON DATABASE "shop" TO "Report Reader";`}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("got %q", got)
@@ -489,5 +489,73 @@ func TestPlanConfigExtension(t *testing.T) {
 	if c.OK || c.Fix != FixManual || c.Detail != "the target installs timescaledb 2.31.0 by default; the dump holds its configuration tables as of 2.29.2" ||
 		!strings.HasPrefix(c.Manual, "use image timescale/timescaledb:2.29.2-pg17 (the source's) for container db") {
 		t.Errorf("newer default: %+v", c)
+	}
+}
+
+// BR-015 #1: a list setting is written one literal per element, as pg_dump
+// does; bare it may not parse, as one literal it is a single element.
+func TestBR015ValueSQLList(t *testing.T) {
+	cases := []struct{ name, v, want string }{
+		{"search_path", `""`, "''"},
+		{"search_path", "", "''"},
+		{"search_path", `"$user", public`, "'$user', 'public'"},
+		{"search_path", "$user, public", "'$user', 'public'"},
+		{"search_path", "App, public", "'app', 'public'"},
+		{"search_path", `"App", public`, "'App', 'public'"},
+		{"search_path", `"a""b",x`, `'a"b', 'x'`},
+		{"search_path", `"it's"`, `'it''s'`},
+		{"temp_tablespaces", `fast, "Slow"`, "'fast', 'Slow'"},
+		{"shared_preload_libraries", "pg_stat_statements,pg_cron", "'pg_stat_statements', 'pg_cron'"},
+		{"session_preload_libraries", "$libdir/My Lib", "'$libdir/My Lib'"},
+		{"DateStyle", "ISO, DMY", "'ISO, DMY'"},
+	}
+	for _, c := range cases {
+		if got := valueSQL(c.name, c.v); got != c.want {
+			t.Errorf("valueSQL(%s, %q) = %s, want %s", c.name, c.v, got, c.want)
+		}
+	}
+}
+
+// BR-015 #1 through the compare: env-up sets search_path so that it applies,
+// env-down puts the old value back the same way, and a value the server reads
+// the same (written by hand in postgresql.conf, or as SET stored it) is no
+// difference.
+func TestBR015PlanSearchPath(t *testing.T) {
+	plan := func(src, tgt string, auto map[string]string) *Plan {
+		s := planSource(t)
+		s.Env.Settings = append(s.Env.Settings, pg.Setting{Name: "search_path", Value: src, Vartype: "string"})
+		tg := roleTarget(t)
+		tg.Roles = &TargetRoles{Roles: s.Globals.Roles, ParamGrants: map[string]ParamGrant{}, HasGrantOptions: true}
+		tg.Env.Settings = append(tg.Env.Settings, pg.Setting{Name: "search_path", Value: tgt, Vartype: "string", Source: "configuration file", Context: "user"})
+		tg.AutoConf = auto
+		return MakePlan(PlanInput{Src: s, Tgt: tg, Mode: ModeFull})
+	}
+	p := plan(`""`, `"$user", public`, map[string]string{"search_path": `"$user", public`})
+	if !has(p.Up, "ALTER SYSTEM SET search_path = '';") || !has(p.Down, "ALTER SYSTEM SET search_path = '$user', 'public';") {
+		t.Errorf("up:\n%s\ndown:\n%s", strings.Join(p.Up, "\n"), strings.Join(p.Down, "\n"))
+	}
+	// After env-up the target holds what SET stored; nothing is left.
+	for _, c := range [][2]string{{"$user, public", `"$user", public`}, {`""`, `""`}, {"", `""`}, {"App, public", "app, public"}, {`"App", public`, `"App", public`}} {
+		if p := plan(c[0], c[1], nil); len(p.Up) != 0 {
+			t.Errorf("backup %s, target %s: still a difference\n%s", c[0], c[1], strings.Join(p.Up, "\n"))
+		}
+	}
+	// A quoted mixed-case schema is another schema than the folded name.
+	p = plan(`"App", public`, "app, public", nil)
+	if _, ok := failed(p)["setting search_path"]; !ok || !has(p.Up, "ALTER SYSTEM SET search_path = 'App', 'public';") {
+		t.Errorf("App:\n%s", strings.Join(p.Up, "\n"))
+	}
+}
+
+// BR-015 #1: adding a preload library sets the list one literal per library;
+// one literal 'a,b' would be a single library named "a,b" and the server
+// would not start.
+func TestBR015PreloadList(t *testing.T) {
+	src, tgt := planSource(t), freshTarget(t)
+	have := "pg_cron"
+	tgt.Env.PreloadLibraries = &have
+	p := MakePlan(PlanInput{Src: src, Tgt: tgt, Mode: ModeFull})
+	if !has(p.Up, "ALTER SYSTEM SET shared_preload_libraries = 'pg_cron', 'pg_stat_statements';") {
+		t.Errorf("env-up:\n%s", strings.Join(p.Up, "\n"))
 	}
 }

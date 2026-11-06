@@ -20,15 +20,6 @@ func indexKeyword(toks []token, k string) int {
 	return -1
 }
 
-func hasKeyword(toks []token, k string) bool {
-	for _, t := range toks {
-		if t.isKeyword(k) {
-			return true
-		}
-	}
-	return false
-}
-
 // statement is one SQL statement (; stripped) or one psql meta-command line.
 type statement struct {
 	text string
@@ -190,13 +181,7 @@ func (t token) ident() string {
 }
 
 // tokenize splits one statement into words, quoted identifiers, literals, numbers, punctuation.
-func tokenize(s string) ([]token, error) { return tokenizeMode(s, false) }
-
-// tokenizeLoose is tokenize where any other character (operators, casts in a
-// policy expression) becomes a punctuation token instead of an error.
-func tokenizeLoose(s string) ([]token, error) { return tokenizeMode(s, true) }
-
-func tokenizeMode(s string, loose bool) ([]token, error) {
+func tokenize(s string) ([]token, error) {
 	var out []token
 	i := 0
 	for i < len(s) {
@@ -250,9 +235,6 @@ func tokenizeMode(s string, loose bool) ([]token, error) {
 			out = append(out, token{kind: tokWord, val: s[i:j]})
 			i = j
 		case c == ',' || c == '=' || c == '(' || c == ')' || c == '.':
-			out = append(out, token{kind: tokPunct, val: string(c)})
-			i++
-		case loose:
 			out = append(out, token{kind: tokPunct, val: string(c)})
 			i++
 		default:

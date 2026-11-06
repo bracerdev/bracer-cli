@@ -54,8 +54,8 @@ func resolveApp(home, name, cmd string) (string, error) {
 	if name == "" {
 		return "", noName(apps, cmd)
 	}
-	if !config.ValidAppName(name) {
-		return "", fmt.Errorf("%q is not an app name: lowercase letters, digits, `-`, `_` only", name)
+	if p := config.AppNameProblem(name); p != "" {
+		return "", fmt.Errorf("%q is not an app name: %s", name, p)
 	}
 	p := config.AppPath(home, name)
 	if _, err := os.Stat(p); err != nil {
@@ -63,7 +63,7 @@ func resolveApp(home, name, cmd string) (string, error) {
 		if len(apps) > 0 {
 			here = " (apps here: " + strings.Join(apps, ", ") + ")"
 		}
-		return "", fmt.Errorf("%w %s on this machine%s\nFix: bracer init %s", errNoApp, name, here, name)
+		return "", fmt.Errorf("%w %s on this machine%s\n%s", errNoApp, name, here, fixNoApp(cmd, name))
 	}
 	return p, nil
 }
@@ -71,15 +71,9 @@ func resolveApp(home, name, cmd string) (string, error) {
 // noName is the error of a command run without an app name (ADR-0021).
 func noName(apps []string, cmd string) error {
 	if len(apps) == 0 {
-		return fmt.Errorf("name the app: bracer %s <app> (no app on this machine yet)\nFix: bracer init <name>", cmd)
+		return fmt.Errorf("name the app: bracer %s <app> (no app on this machine yet)\n%s", cmd, fixNoApp(cmd, ""))
 	}
 	return fmt.Errorf("name the app: bracer %s <app> (apps here: %s)", cmd, strings.Join(apps, ", "))
-}
-
-// userHome is $HOME, or "" when it cannot be told (resolveApp then finds no app).
-func userHome() string {
-	h, _ := os.UserHomeDir()
-	return h
 }
 
 // selectApp parses args and returns the app.yaml of the app named. A flag

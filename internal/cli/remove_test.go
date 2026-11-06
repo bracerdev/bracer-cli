@@ -31,7 +31,7 @@ func TestRemove(t *testing.T) {
 		d, _, _ := testDeps(t, sc, in)
 		var out, errb strings.Builder
 		d.stdout, d.stderr = &out, &errb
-		d.euid, d.tty = 1000, true
+		d.tty = true
 		ran = nil
 		d.root = recordingRoot(&ran)
 		return d, &out, &errb
@@ -100,6 +100,7 @@ func TestRemove(t *testing.T) {
 	}
 	want := "systemctl disable --now bracer-shop.timer\nsystemctl stop bracer-shop.service\n" +
 		"rm -f " + filepath.Join(d.unitDir, "bracer-shop.service") + "\nrm -f " + filepath.Join(d.unitDir, "bracer-shop.timer") + "\n" +
+		"rm -f " + filepath.Join(d.stampDir, "stamp-bracer-shop.timer") + "\n" +
 		"systemctl daemon-reload\nsystemctl reset-failed bracer-shop.service"
 	if strings.Join(got, "\n") != want {
 		t.Errorf("ran:\n%s\nwant:\n%s", strings.Join(got, "\n"), want)

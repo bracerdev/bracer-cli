@@ -21,15 +21,16 @@ const defaultServer = "https://app.bracer.dev"
 
 // pairAPI is what init --web needs from the server; tests fake it.
 type pairAPI interface {
-	// Open starts a session: POST /pair.
-	Open(ctx context.Context, cliVersion, hostname string) (*pairOpened, error)
+	// Open starts a session for app: POST /pair.
+	Open(ctx context.Context, cliVersion, hostname, app string) (*pairOpened, error)
 	// Next waits up to wait seconds for the web's next move: GET /pair/next.
 	// nil, nil when nothing came.
 	Next(ctx context.Context, secret string, wait int) (json.RawMessage, error)
 	// State tells the web where the CLI is: POST /pair/state.
 	State(ctx context.Context, secret string, body any) error
-	// Finish ends the session; the token comes only with confirmed.
-	Finish(ctx context.Context, secret string, confirmed bool, app string) (*pairFinished, error)
+	// Finish ends the session; with confirmed (only after the proof run
+	// passed) it creates or continues the app and issues its token.
+	Finish(ctx context.Context, secret string, confirmed bool) (*pairFinished, error)
 }
 
 type pairOpened struct {
@@ -42,6 +43,9 @@ type pairOpened struct {
 type pairFinished struct {
 	AppID string `json:"app_id"`
 	Token string `json:"token"`
+	// Continued: an app of that name was in the account and goes on with
+	// this token; its earlier token no longer works (ADR-0033).
+	Continued bool `json:"continued"`
 }
 
 var (
@@ -49,8 +53,11 @@ var (
 	errPairClosed = errors.New("pairing session closed")
 	// errPairingOff: 503, the server has pairing switched off.
 	errPairingOff = errors.New("pairing is switched off on the server")
-	// errAppExists: 409 at finish, the account already has an app of that name.
-	errAppExists = errors.New("app exists")
+	// errAppChanged: 409 APP_CHANGED at finish, the app is no longer what
+	// the web confirmed (created, continued or deleted by another setup).
+	errAppChanged = errors.New("app changed")
+	// errAppLimit: 403 APP_LIMIT at finish, the plan's app limit is reached.
+	errAppLimit = errors.New("app limit")
 )
 
 // pairError is any other answer the server gave.
@@ -77,9 +84,9 @@ func newHTTPPair(server string, verbose io.Writer) pairAPI {
 	return &httpPair{server: server, client: &http.Client{Timeout: 45 * time.Second}, verbose: verbose}
 }
 
-func (h *httpPair) Open(ctx context.Context, cliVersion, hostname string) (*pairOpened, error) {
+func (h *httpPair) Open(ctx context.Context, cliVersion, hostname, app string) (*pairOpened, error) {
 	var out pairOpened
-	if err := h.call(ctx, http.MethodPost, "/pair", "", map[string]string{"cli_version": cliVersion, "hostname": hostname}, &out); err != nil {
+	if err := h.call(ctx, http.MethodPost, "/pair", "", map[string]string{"cli_version": cliVersion, "hostname": hostname, "app": app}, &out); err != nil {
 		return nil, err
 	}
 	if out.Secret == "" || out.UserCode == "" || out.VerifyURL == "" {
@@ -101,9 +108,9 @@ func (h *httpPair) State(ctx context.Context, secret string, body any) error {
 	return h.call(ctx, http.MethodPost, "/pair/state", secret, body, nil)
 }
 
-func (h *httpPair) Finish(ctx context.Context, secret string, confirmed bool, app string) (*pairFinished, error) {
+func (h *httpPair) Finish(ctx context.Context, secret string, confirmed bool) (*pairFinished, error) {
 	var out pairFinished
-	body := map[string]any{"confirmed": confirmed, "app": app}
+	body := map[string]any{"confirmed": confirmed}
 	if err := h.call(ctx, http.MethodPost, "/pair/finish", secret, body, &out); err != nil {
 		return nil, err
 	}
@@ -159,8 +166,11 @@ func (h *httpPair) call(ctx context.Context, method, path, secret string, body, 
 			Error string `json:"error"`
 		}
 		json.Unmarshal(data, &e)
-		if resp.StatusCode == http.StatusConflict && e.Error == "APP_EXISTS" {
-			return errAppExists
+		switch {
+		case resp.StatusCode == http.StatusConflict && e.Error == "APP_CHANGED":
+			return errAppChanged
+		case resp.StatusCode == http.StatusForbidden && e.Error == "APP_LIMIT":
+			return errAppLimit
 		}
 		return &pairError{Status: resp.StatusCode, Code: e.Error}
 	}

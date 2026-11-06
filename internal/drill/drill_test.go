@@ -20,6 +20,25 @@ import (
 	"bracer.dev/bracer/internal/storage"
 )
 
+// BR-014: Redact reaches every text of an instance's drill that backup
+// prints, sends with --json and reports, and leaves its names alone.
+func TestBR014InstanceResultRedact(t *testing.T) {
+	const secret = "fakepw-br014-drill"
+	x := &InstanceResult{Name: "main", Image: "postgres:17", Error: "env-up: " + secret, Notes: []string{"note " + secret},
+		Checks:    []restore.Check{{Area: "setting", Name: "TimeZone", Detail: "detail " + secret, Manual: "manual " + secret}},
+		Disk:      &restore.DiskCheck{Error: "df: " + secret},
+		Databases: []*DatabaseResult{{DB: "shop", RestoredAs: "shop_restored_1", Error: "pg_restore: " + secret, Warnings: []string{"warning " + secret}}}}
+	x.Redact(config.NewSecrets(map[string]string{"PW": secret}, "test").Redact)
+	data, _ := json.Marshal(x)
+	if strings.Contains(string(data), secret) || strings.Count(string(data), "***") != 7 {
+		t.Fatalf("redacted: %s", data)
+	}
+	if x.Name != "main" || x.Image != "postgres:17" || x.Databases[0].DB != "shop" || x.Checks[0].Name != "TimeZone" {
+		t.Fatalf("names changed: %s", data)
+	}
+	(*InstanceResult)(nil).Redact(strings.ToUpper) // a nil result has nothing to redact
+}
+
 // fakeTable is a table in the fake Postgres: the real row count.
 type fakeTable struct {
 	schema, name string
@@ -486,7 +505,7 @@ func baseCfg() *config.App {
 		Instances:   []config.Instance{{Name: "main", Connection: config.Connection{Container: "shop-db", User: "postgres", PgMajor: 17, SystemID: config.SystemIDNone}, Databases: config.Databases([]config.Database{{Name: "shop"}})}},
 		Storage:     &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Folder: testFolder, AccessKeyEnv: "A", SecretKeyEnv: "S"},
 		Encryption:  "none",
-		Schedule:    &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		Schedule:    &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7, Since: "2026-10-01T00:00:00Z"},
 		Runtime:     &config.Runtime{User: "deploy", Path: "/usr/bin:/bin", Docker: "/usr/bin/docker"},
 	}
 }

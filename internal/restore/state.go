@@ -63,7 +63,7 @@ type TargetDB struct {
 	Owner       string
 	Settings    map[string]string // role "\x00" lowercase name → value as stored; role "" for the database
 	SettingName map[string]string // same key → name as stored
-	ACL         map[string]bool   // "grantee privilege" with grantee PUBLIC or a role
+	ACL         map[string]bool   // "grantee privilege" with grantee publicGrantee or a role
 	ACLNull     bool              // datacl is NULL: the default privileges
 	Comment     *string
 	Effective   []pg.Setting // data mode: settings in effect in this database for the connected user
@@ -204,7 +204,7 @@ func readTargetDB(ctx context.Context, admin *pg.Client, name string, exists boo
 		k := r[0] + "\x00" + strings.ToLower(n)
 		td.Settings[k], td.SettingName[k] = v, n
 	}
-	rows, err = admin.Query(ctx, "select case when a.grantee = 0 then 'PUBLIC' else pg_get_userbyid(a.grantee) end, a.privilege_type from pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a where d.datname = "+lit)
+	rows, err = admin.Query(ctx, "select case when a.grantee = 0 then '"+publicGrantee+"' else pg_get_userbyid(a.grantee) end, a.privilege_type from pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a where d.datname = "+lit)
 	if err != nil {
 		return nil, fmt.Errorf("read privileges of %s: %w", name, err)
 	}

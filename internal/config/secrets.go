@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Secrets holds the variables of secrets_file, the one source of secrets of
@@ -49,6 +51,64 @@ func (s *Secrets) With(name, value, source string) *Secrets {
 func (s *Secrets) Lookup(name string) (string, bool) {
 	v, ok := s.values[name]
 	return v, ok
+}
+
+// Redact is the one redaction of bracer: it replaces by *** every value of
+// secrets_file in text, longest first (values shorter than 4 characters
+// are left: they would hit ordinary words), then every pattern of
+// redactions (row values Postgres quotes, credentials). It is for free
+// text only (errors, warnings, notes), at the place the text is made,
+// never for names: a password equal to a database name must not hide the
+// name. A nil Secrets (secrets_file unreadable) applies the patterns alone.
+func (s *Secrets) Redact(text string) string {
+	if s != nil {
+		vals := make([]string, 0, len(s.values))
+		for _, v := range s.values {
+			if utf8.RuneCountInString(v) >= 4 {
+				vals = append(vals, v)
+			}
+		}
+		sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
+		for _, v := range vals {
+			text = strings.ReplaceAll(text, v, "***")
+		}
+	}
+	for _, p := range redactions {
+		text = p.re.ReplaceAllString(text, p.with)
+	}
+	return text
+}
+
+// redactions are what an error text can quote whatever secrets_file holds:
+// row values (no dump content leaves the machine) and credentials. Each is
+// replaced by ***, keeping what tells the reader where it was. The hosted
+// server refuses a /report body with a string that matches its patterns
+// (spec monitor/backup-report): what these leave never matches them.
+var redactions = []struct {
+	re   *regexp.Regexp
+	with string
+}{
+	// Row values in Postgres messages: DETAIL: Key (email)=(a@b.c) already
+	// exists / is not present in table / conflicts with existing key (…)=(…).
+	{regexp.MustCompile(`(?im)(\bkey \([^\n]*?\)=\()[^\n]*?(\)(?: [a-z]|[.,]|$))`), "${1}***${2}"},
+	// DETAIL: Failing row contains (…). (not-null, check violations)
+	{regexp.MustCompile(`(Failing row contains \()[^\n]*(\))`), "${1}***${2}"},
+	// CONTEXT: COPY users, line 5: "…" and COPY users, line 5, column email: "…"
+	{regexp.MustCompile(`(COPY [^\n]*?, line [0-9]+(?:, column [^\n:]*)?: )"[^\n]*"?`), "${1}***"},
+	// URL userinfo: scheme://user:password@, up to the last @ before the
+	// next / blank or quote. Userinfo never holds a raw / (libpq and
+	// RFC 3986 stop there), so https://minio:9000/b/a@b.dump is no userinfo.
+	{regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^\s/'"@:]*:[^\s/'"]*@`), "${1}***@"},
+	// A password key of a URL query (?password=), a libpq key/value string
+	// (host=h password = x) or an environment (PGPASSWORD=, POSTGRES_PASSWORD=,
+	// MYSQL_PWD=): the value is a quoted string or runs to the next blank,
+	// so a password holding & # ; or a quote leaves nothing behind.
+	{regexp.MustCompile(`(?i)((?:^|[^A-Za-z0-9_])(?:[A-Za-z0-9_]*(?:password|passwd)|(?:[A-Za-z0-9]+_)?pwd)[ \t]*=[ \t]*)(?:'(?:[^'\\\n]|''|\\.)*'?|"(?:[^"\\\n]|\\.)*"?|\S+)`), "${1}***"},
+	// SQL: PASSWORD 'verifier', E'…', 'it''s', $$…$$ or $tag$…$tag$, also
+	// cut short as psql's LINE 1: echo can leave it.
+	{regexp.MustCompile(`(?im)(PASSWORD\s+)(?:E?'(?:[^'\\\n]|''|\\.)*'?|\$[A-Za-z0-9_]*\$.*?(?:\$[A-Za-z0-9_]*\$|$))`), "${1}***"},
+	{regexp.MustCompile(`(?:AKIA|ASIA)[0-9A-Z]{16}`), "***"},
+	{regexp.MustCompile(`AGE-SECRET-KEY-\S*`), "***"},
 }
 
 // Require is like Lookup but returns an error naming the variable and the file.

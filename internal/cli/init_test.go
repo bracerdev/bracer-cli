@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -41,7 +43,8 @@ func longestPrefix(m map[string]string, key string) (string, bool) {
 func (f *fakeShell) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 	var args []string
 	for i := 0; i < len(c.Args); i++ {
-		if c.Args[i] == "-e" && i+1 < len(c.Args) {
+		// -e names, and the per-command client container flags (random name).
+		if (c.Args[i] == "-e" || c.Args[i] == "--name" || c.Args[i] == "--log-driver") && i+1 < len(c.Args) {
 			i++
 			continue
 		}
@@ -121,6 +124,9 @@ type world struct {
 	root      bool // euid 0
 	noTTY     bool
 	selfRun   func(args []string) int // nil: every self-check passes
+	// selfRunCtx replaces selfRun when the fake child must see init's
+	// context end (SIGINT on Ctrl-C or a web cancel).
+	selfRunCtx func(ctx context.Context, args []string) int
 	// preflight is the JSON `backup --dry-run --json` prints; nil: ok, or
 	// one failed line when selfRun fails it.
 	preflight  func(n int) *preflightResult
@@ -136,6 +142,17 @@ type world struct {
 	// pair is the hosted server of init --web; server is the URL init used.
 	pair   pairAPI
 	server string
+	// reportHTTP sends init --web's proof report; nil sends none.
+	reportHTTP *http.Client
+	// ctx replaces context.Background(); in replaces the answers as stdin;
+	// onInstall runs when the timer is installed, onStore when the bucket
+	// is opened.
+	ctx       context.Context
+	in        io.Reader
+	onInstall func()
+	onStore   func()
+	// now is init's clock; nil: time.Now.
+	now func() time.Time
 }
 
 func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, string, string) {
@@ -143,7 +160,10 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 	w.dir = dir
 	pg.KubernetesDirs = []string{filepath.Join(dir, "no-k3s")}
 	var out, errb bytes.Buffer
-	in := strings.NewReader(strings.Join(answers, "\n") + "\n")
+	var in io.Reader = strings.NewReader(strings.Join(answers, "\n") + "\n")
+	if w.in != nil {
+		in = w.in
+	}
 	euid := 1000
 	if w.root {
 		euid = 0
@@ -152,6 +172,9 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 		shell: w.sh,
 		probe: func(context.Context, string, int) (bool, error) { return true, nil },
 		newStore: func(storage.S3Config) (storage.Store, error) {
+			if w.onStore != nil {
+				w.onStore()
+			}
 			err := w.store
 			w.store = nil
 			switch {
@@ -169,10 +192,13 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 			hasSystemd: func() bool { return !w.noSystemd },
 		},
 		home: func() (string, error) { return dir, nil },
-		runSelf: func(_ context.Context, args, env []string, stdout, _ io.Writer) int {
+		runSelf: func(ctx context.Context, args, env []string, stdout, _ io.Writer) int {
 			w.selfLog = append(w.selfLog, args, env)
 			code := 0
-			if w.selfRun != nil {
+			switch {
+			case w.selfRunCtx != nil:
+				code = w.selfRunCtx(ctx, args)
+			case w.selfRun != nil:
 				code = w.selfRun(args)
 			}
 			if hasArg(args, "--json") {
@@ -199,6 +225,9 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 		},
 		installTimer: func(_ context.Context, cfg *config.App, cfgPath string) error {
 			w.units = append(w.units, cfgPath)
+			if w.onInstall != nil {
+				w.onInstall()
+			}
 			if w.installErr != nil {
 				return w.installErr
 			}
@@ -215,16 +244,25 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 			w.server = server
 			return w.pair
 		},
-		hostname: func() (string, error) { return "vps-1", nil },
-		euid:     euid,
-		tty:      !w.noTTY,
-		stdin:    in, stdout: &out, stderr: &errb,
+		reportHTTP: w.reportHTTP,
+		hostname:   func() (string, error) { return "vps-1", nil },
+		now:        time.Now,
+		euid:       euid,
+		tty:        !w.noTTY,
+		stdin:      in, stdout: &out, stderr: &errb,
+	}
+	if w.now != nil {
+		d.now = w.now
 	}
 	args := []string{"shop"}
 	if w.args != nil {
 		args = w.args
 	}
-	code := runInit(context.Background(), args, d)
+	ctx := context.Background()
+	if w.ctx != nil {
+		ctx = w.ctx
+	}
+	code := runInit(ctx, args, d)
 	return code, out.String(), errb.String()
 }
 
@@ -309,7 +347,7 @@ func TestInitContainerFullFlow(t *testing.T) {
 	if rt == nil || rt.User != "khanh" || rt.Docker != "/usr/bin/docker" || rt.DockerHost != "unix:///var/run/docker.sock" || rt.Path != "/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin" {
 		t.Errorf("runtime: %+v", rt)
 	}
-	if cfg.Schedule == nil || !reflect.DeepEqual(*cfg.Schedule, config.DefaultSchedule) {
+	if cfg.Schedule == nil || !reflect.DeepEqual(noSince(cfg.Schedule), config.DefaultSchedule) {
 		t.Errorf("schedule: %+v", cfg.Schedule)
 	}
 	raw, _ := os.ReadFile(appYAML(dir))
@@ -830,7 +868,7 @@ func TestInitNoDrill(t *testing.T) {
 	if strings.Contains(out, "Limit the drill's memory") || strings.Contains(out, "When should drill run?") || strings.Contains(out, "free, about") {
 		t.Errorf("nothing about drill may be asked:\n%s", out)
 	}
-	if cfg.Schedule == nil || !reflect.DeepEqual(*cfg.Schedule, config.DefaultSchedule) {
+	if cfg.Schedule == nil || !reflect.DeepEqual(noSince(cfg.Schedule), config.DefaultSchedule) {
 		t.Errorf("schedule: %+v", cfg.Schedule)
 	}
 	if len(w.selfLog) != 4 || strings.Join(w.selfLog[0], " ") != "backup shop --init-draft --dry-run --json" || strings.Join(w.selfLog[2], " ") != "backup shop --init-draft" {
@@ -852,7 +890,7 @@ func TestInitDrillMemoryAndSchedule(t *testing.T) {
 		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
 	}
 	cfg, _ := config.Load(appYAML(dir))
-	if cfg.DrillMemory() != "2g" || cfg.Schedule == nil || !reflect.DeepEqual(*cfg.Schedule, config.Schedule{Every: "weekly", At: []string{"04:00", "22:00"}, Days: []string{"mon", "fri"}, Keep: 6}) {
+	if cfg.DrillMemory() != "2g" || cfg.Schedule == nil || !reflect.DeepEqual(noSince(cfg.Schedule), config.Schedule{Every: "weekly", At: []string{"04:00", "22:00"}, Days: []string{"mon", "fri"}, Keep: 6}) {
 		t.Errorf("memory %q schedule %+v\n%s", cfg.DrillMemory(), cfg.Schedule, out)
 	}
 	for _, want := range []string{`"lots" is not a docker --memory value`, "[d] daily  [w] weekly  [m] monthly  [Enter] daily", "Time of day (HH:MM, several separated by commas) [03:00]", "4:00 is not HH:MM",
@@ -1206,7 +1244,7 @@ func TestInitHeartbeat(t *testing.T) {
 		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
 	}
 	for _, want := range []string{"the heartbeat URL must be an http(s) URL with a host", "✗ hc-ping.com: unknown heartbeat URL (404)", "✓ the heartbeat URL at hc-ping.com answers",
-		"Heartbeat: set the check at hc-ping.com to\n  schedule (cron): 30 4 * * *\n  time zone: ", "bracer only sends the signal; hc-ping.com is what notices a missing one."} {
+		"Heartbeat: set the check at hc-ping.com to\n  schedule: daily at 04:30\n  time zone: ", "bracer only sends the signal; hc-ping.com is what notices a missing one."} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
@@ -1216,23 +1254,19 @@ func TestInitHeartbeat(t *testing.T) {
 	}
 }
 
-// ADR-0029: the heartbeat hint gives one cron expression when one says the
-// schedule (same minute everywhere, no `last`), else the schedule in words.
-func TestScheduleCron(t *testing.T) {
+// The heartbeat hint says the schedule in words, the summary adds what is kept.
+func TestScheduleInWords(t *testing.T) {
 	for _, tc := range []struct {
 		sc   config.Schedule
 		want string
-		ok   bool
 	}{
-		{config.Schedule{Every: "daily", At: []string{"03:00"}}, "0 3 * * *", true},
-		{config.Schedule{Every: "daily", At: []string{"03:30", "15:30"}}, "30 3,15 * * *", true},
-		{config.Schedule{Every: "weekly", At: []string{"04:05"}, Days: []string{"mon", "sun"}}, "5 4 * * 1,0", true},
-		{config.Schedule{Every: "monthly", At: []string{"00:00"}, Days: []string{"1", "15"}}, "0 0 1,15 * *", true},
-		{config.Schedule{Every: "monthly", At: []string{"03:00"}, Days: []string{"last"}}, "", false},
-		{config.Schedule{Every: "daily", At: []string{"03:00", "15:30"}}, "", false},
+		{config.Schedule{Every: "daily", At: []string{"03:00"}}, "daily at 03:00"},
+		{config.Schedule{Every: "daily", At: []string{"03:00", "15:30"}}, "daily at 03:00, 15:30"},
+		{config.Schedule{Every: "weekly", At: []string{"04:05"}, Days: []string{"mon", "sun"}}, "weekly on mon, sun at 04:05"},
+		{config.Schedule{Every: "monthly", At: []string{"03:00"}, Days: []string{"1", "last"}}, "monthly on 1, last at 03:00"},
 	} {
-		if got, ok := scheduleCron(tc.sc); got != tc.want || ok != tc.ok {
-			t.Errorf("scheduleCron(%+v) = %q, %v; want %q, %v", tc.sc, got, ok, tc.want, tc.ok)
+		if got := scheduleWhen(tc.sc); got != tc.want {
+			t.Errorf("scheduleWhen(%+v) = %q; want %q", tc.sc, got, tc.want)
 		}
 	}
 	if got := describeSchedule(config.Schedule{Every: "monthly", At: []string{"03:00"}, Days: []string{"1", "last"}, Keep: 3}); got != "monthly on 1, last at 03:00, keep every backup of the last 3 months" {

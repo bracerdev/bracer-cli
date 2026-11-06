@@ -261,9 +261,12 @@ func MajorOf(version string) int {
 	return n
 }
 
+// rlsTablesSQL skips temporary tables, which pg_dump does not dump.
+const rlsTablesSQL = "select n.nspname || '.' || c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relrowsecurity and c.relkind in ('r','p') and c.relpersistence <> 't' order by 1"
+
 // RLSTables lists the tables with row-level security enabled in the current database.
 func (c *Client) RLSTables(ctx context.Context) ([]string, error) {
-	rows, err := c.Query(ctx, "select n.nspname || '.' || c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relrowsecurity and c.relkind in ('r','p') order by 1")
+	rows, err := c.Query(ctx, rlsTablesSQL)
 	if err != nil {
 		return nil, err
 	}
@@ -293,12 +296,14 @@ func (c *Client) DetectPooler(ctx context.Context) (bool, string) {
 
 // FixRoleSQL is the sample SQL that creates the backup user when privileges are missing. → ADR-0006
 // major is the server's major; before PG14 there is no pg_read_all_data, so only
-// a superuser can dump every database.
+// a superuser can dump every database. It holds no password literal: psql's
+// \password asks for it, so it stays out of shell history, and the hint can
+// go to the web, which refuses anything that looks like a credential.
 func FixRoleSQL(role string, major int) string {
 	if major > 0 && major < 14 {
-		return fmt.Sprintf("-- PostgreSQL %d has no pg_read_all_data (added in 14): the backup user must be a superuser\nCREATE ROLE %s LOGIN PASSWORD '<password>' SUPERUSER;", major, role)
+		return fmt.Sprintf("-- PostgreSQL %d has no pg_read_all_data (added in 14): the backup user must be a superuser\nCREATE ROLE %s LOGIN SUPERUSER;\n\\password %s", major, role, role)
 	}
-	return fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '<password>' BYPASSRLS;\nGRANT pg_read_all_data TO %s;\nGRANT pg_read_all_settings TO %s;", role, role, role)
+	return fmt.Sprintf("CREATE ROLE %s LOGIN BYPASSRLS;\nGRANT pg_read_all_data TO %s;\nGRANT pg_read_all_settings TO %s;\n\\password %s", role, role, role, role)
 }
 
 // PreloadLibraries reads shared_preload_libraries ("pg_stat_statements,timescaledb"
@@ -373,7 +378,9 @@ func QuoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-const tablesSQL = "select n.nspname, c.relname, c.reltuples::bigint, c.relkind, coalesce(e.extname, '') from pg_class c join pg_namespace n on n.oid = c.relnamespace left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid and d.deptype = 'e' left join pg_extension e on e.oid = d.refobjid where c.relkind in ('r','p') and n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%' order by 1, 2"
+// tablesSQL skips temporary tables: those of other sessions (pg_temp_N) cannot
+// be read (count(*) fails) and pg_dump never dumps them.
+const tablesSQL = "select n.nspname, c.relname, c.reltuples::bigint, c.relkind, coalesce(e.extname, '') from pg_class c join pg_namespace n on n.oid = c.relnamespace left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid and d.deptype = 'e' left join pg_extension e on e.oid = d.refobjid where c.relkind in ('r','p') and c.relpersistence <> 't' and n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%' order by 1, 2"
 
 // parseTables parses the tablesSQL result (3–5 columns: older tests return only 3).
 func parseTables(rows [][]string) []Table {

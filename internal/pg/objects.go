@@ -16,9 +16,10 @@ func notExtensionMember(cls, oid string) string {
 // functions, types and schemas that do not belong to an extension. The public
 // schema and extension members do not count. A schema that a script created
 // next to an extension (postgis image: topology, tiger) counts: the dump
-// creates it again, which would fail.
+// creates it again, which would fail. Temporary relations of other sessions
+// do not count: no dump holds them.
 var userObjectsSQL = "select " +
-	"(select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m','S','f','c') and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast' and " + notExtensionMember("pg_class", "c.oid") +
+	"(select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m','S','f','c') and c.relpersistence <> 't' and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast' and " + notExtensionMember("pg_class", "c.oid") +
 	// a composite type's membership is recorded on its pg_type row
 	" and (c.relkind <> 'c' or " + notExtensionMember("pg_type", "c.reltype") + "))" +
 	" + (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname not in ('pg_catalog','information_schema') and " + notExtensionMember("pg_proc", "p.oid") + ")" +

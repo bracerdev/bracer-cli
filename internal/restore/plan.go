@@ -2,6 +2,7 @@ package restore
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -429,7 +430,7 @@ func (pl *planner) preload() {
 		return
 	}
 	all := append(append([]string{}, cur...), missing...)
-	pl.up[gSystem] = append(pl.up[gSystem], "ALTER SYSTEM SET shared_preload_libraries = "+pg.QuoteLiteral(strings.Join(all, ","))+";")
+	pl.up[gSystem] = append(pl.up[gSystem], "ALTER SYSTEM SET shared_preload_libraries = "+valueSQL("shared_preload_libraries", strings.Join(all, ","))+";")
 	pl.down[gSystem] = append(pl.down[gSystem], pl.systemRevert("shared_preload_libraries"))
 	pl.p.Restart = true
 	pl.add(Check{Area: "preload", Name: strings.Join(missing, ","), Detail: "not loaded; the library is installed", Fix: FixSQL,
@@ -633,7 +634,7 @@ func (pl *planner) serverSettings() {
 		}
 		t := pl.tgt.Env.Setting(s.Name)
 		switch {
-		case t != nil && pg.SameValue(s.Name, s.Vartype, s.Value, t.Value):
+		case t != nil && sameValue(s.Name, s.Vartype, s.Value, t.Value):
 			continue
 		case s.Custom && t == nil && !pl.tgt.Env.HasFileSettings:
 			pl.manual("setting", s.Name, "custom setting; the target's configuration files are not readable", "connect as a superuser")
@@ -677,7 +678,7 @@ func (pl *planner) serverSettings() {
 func (pl *planner) moduleSettings() {
 	for _, s := range pl.src.Env.Modules {
 		t := pl.tgt.Env.Module(s.Name)
-		if t == nil || pg.SameValue(s.Name, s.Vartype, s.Value, t.Value) {
+		if t == nil || sameValue(s.Name, s.Vartype, s.Value, t.Value) {
 			continue
 		}
 		detail := fmt.Sprintf("target %s, backup %s", t.Value, s.Value)
@@ -720,15 +721,203 @@ func isPlainIdent(s string) bool {
 	return true
 }
 
-// listSettings take their value as a list of names: written bare, not as one literal.
-var listSettings = map[string]bool{"search_path": true, "temp_tablespaces": true, "session_preload_libraries": true, "local_preload_libraries": true}
+// listSettings are PostgreSQL's GUC_LIST_QUOTE settings (the list pg_dump
+// keeps in variable_is_guc_list_quote). SET quotes each literal it is given as
+// one identifier, so a stored list is written back one literal per element:
+// written bare it may not parse ($user, ""), and as one literal it would
+// become a single element ("a,b").
+var listSettings = map[string]bool{"local_preload_libraries": true, "search_path": true, "session_preload_libraries": true,
+	"shared_preload_libraries": true, "temp_tablespaces": true, "unix_socket_directories": true}
+
+// nameListSettings hold names: PostgreSQL folds an unquoted element to lower
+// case. The other list settings hold file names, taken as written.
+var nameListSettings = map[string]bool{"search_path": true, "temp_tablespaces": true}
+
+// usedElems is a list as the server uses it. In search_path an element ""
+// names no schema (none can be named "") and is skipped; in temp_tablespaces
+// "" is the database's default tablespace, which a list of nothing else (or
+// an empty list) also means.
+func usedElems(name string, elems []string) []string {
+	switch strings.ToLower(name) {
+	case "search_path":
+		return slices.DeleteFunc(elems, func(e string) bool { return e == "" })
+	case "temp_tablespaces":
+		if !slices.ContainsFunc(elems, func(e string) bool { return e != "" }) {
+			return nil
+		}
+	}
+	return elems
+}
 
 // valueSQL writes a stored value back as SQL for SET/ALTER SYSTEM SET.
 func valueSQL(name, v string) string {
-	if listSettings[strings.ToLower(name)] && v != "" {
-		return v
+	if !listSettings[strings.ToLower(name)] {
+		return pg.QuoteLiteral(v)
 	}
-	return pg.QuoteLiteral(v)
+	elems, ok := splitList(name, v)
+	if !ok {
+		return pg.QuoteLiteral(v)
+	}
+	if len(elems) == 0 {
+		return "''"
+	}
+	out := make([]string, len(elems))
+	for i, e := range elems {
+		out[i] = pg.QuoteLiteral(e)
+	}
+	return strings.Join(out, ", ")
+}
+
+// splitList reads a list setting as PostgreSQL stores it ("$user", public)
+// into the elements the server uses, as SplitIdentifierString and
+// SplitDirectoriesString do: a "…" element keeps its case, "" inside it is a
+// quote; an unquoted one runs to the next comma (a name list stops at a space
+// too and folds it to lower case). ok is false when the value does not parse.
+func splitList(name, v string) (elems []string, ok bool) {
+	names := nameListSettings[strings.ToLower(name)]
+	i := 0
+	skip := func() {
+		for i < len(v) && isSpaceByte(v[i]) {
+			i++
+		}
+	}
+	skip()
+	if i == len(v) {
+		return nil, true
+	}
+	for {
+		var e string
+		if v[i] == '"' {
+			var b strings.Builder
+			for {
+				j := strings.IndexByte(v[i+1:], '"')
+				if j < 0 {
+					return nil, false
+				}
+				b.WriteString(v[i+1 : i+1+j])
+				i += j + 2
+				if i < len(v) && v[i] == '"' {
+					b.WriteByte('"')
+					continue
+				}
+				break
+			}
+			e = b.String()
+		} else {
+			start := i
+			for i < len(v) && v[i] != ',' && !(names && isSpaceByte(v[i])) {
+				i++
+			}
+			e = strings.TrimRight(v[start:i], " \t\r\n\f\v")
+			if e == "" {
+				return nil, false
+			}
+			if names {
+				e = asciiLower(e)
+			}
+		}
+		elems = append(elems, e)
+		skip()
+		if i == len(v) {
+			return usedElems(name, elems), true
+		}
+		if v[i] != ',' {
+			return nil, false
+		}
+		i++
+		skip()
+		if i == len(v) {
+			return nil, false
+		}
+	}
+}
+
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
+}
+
+// asciiLower folds A-Z only, as PostgreSQL folds identifiers in a multibyte encoding.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// sameValue is pg.SameValue, except that a list setting compares as the
+// elements the server uses: "$user", public set by SET and $user, public
+// written in postgresql.conf are the same search_path.
+func sameValue(name, vartype, a, b string) bool {
+	if listSettings[strings.ToLower(name)] {
+		x, okA := splitList(name, a)
+		y, okB := splitList(name, b)
+		if okA && okB {
+			return slices.Equal(x, y)
+		}
+	}
+	return pg.SameValue(name, vartype, a, b)
+}
+
+// sameDumped compares a role or database setting as pg_db_role_setting stores
+// it with what pg_dump wrote for it (value, and sql: the part after TO, such as
+// '$user', 'public'). A list setting is compared element by element with case
+// and quoting kept, so "MySchema" is not myschema; any other as before.
+func sameDumped(name, stored, value, sql string) bool {
+	if same, ok := sameDumpedList(name, stored, sql); ok {
+		return same
+	}
+	return normSetting(stored) == normSetting(value)
+}
+
+// sameDumpedList is sameDumped for a list setting; ok is false for any other
+// setting or a value that does not parse.
+func sameDumpedList(name, stored, sql string) (same, ok bool) {
+	if !listSettings[strings.ToLower(name)] {
+		return false, false
+	}
+	x, okA := splitList(name, stored)
+	y, okB := dumpedList(name, sql)
+	if !okA || !okB {
+		return false, false
+	}
+	return slices.Equal(x, y), true
+}
+
+// dumpedList reads the elements of a list setting from the value pg_dump
+// writes: one literal per element; an identifier is folded as PostgreSQL does.
+func dumpedList(name, sql string) ([]string, bool) {
+	toks, err := tokenize(sql)
+	if err != nil {
+		return nil, false
+	}
+	var out []string
+	for i, t := range toks {
+		if i%2 == 1 {
+			if t.kind != tokPunct || t.val != "," {
+				return nil, false
+			}
+			continue
+		}
+		var e string
+		switch t.kind {
+		case tokLiteral:
+			e = unquoteLiteral(t.val)
+		case tokQuoted:
+			e = t.val
+		case tokWord:
+			e = asciiLower(t.val)
+		default:
+			return nil, false
+		}
+		out = append(out, e)
+	}
+	if len(toks) > 0 && len(toks)%2 == 0 {
+		return nil, false
+	}
+	return usedElems(name, out), true
 }
 
 // dataSettings (URL source): the settings in effect for the connecting user
@@ -768,15 +957,22 @@ func (pl *planner) dataSettings() {
 				continue
 			}
 			// A database setting of the archive is set on the new database too.
-			value := t.Value
+			value, dumped := t.Value, ""
 			if a != nil && !loaded {
 				for _, as := range a.Settings {
 					if as.Role == "" && strings.EqualFold(as.Name, s.Name) {
-						value = pg.NormalizeValue(as.Value, s.Unit, s.Vartype)
+						value, dumped = pg.NormalizeValue(as.Value, s.Unit, s.Vartype), as.SQL
 					}
 				}
 			}
-			if pg.SameValue(s.Name, s.Vartype, s.Value, value) {
+			same := sameValue(s.Name, s.Vartype, s.Value, value)
+			if dumped != "" {
+				// The archive's value is pg_dump's SQL, not a stored one.
+				if eq, ok := sameDumpedList(s.Name, s.Value, dumped); ok {
+					same = eq
+				}
+			}
+			if same {
 				continue
 			}
 			differ = append(differ, s.Name)
@@ -948,7 +1144,7 @@ func (pl *planner) roles() {
 		}
 		for _, k := range sortedKeys(spec.Settings) {
 			s := spec.Settings[k]
-			if got, ok := t.Settings[k]; ok && normSetting(got.Value) == normSetting(s.Value) {
+			if got, ok := t.Settings[k]; ok && sameDumped(s.Name, got.Value, s.Value, s.SQL) {
 				continue
 			}
 			pl.up[gRoleSet] = append(pl.up[gRoleSet], fmt.Sprintf("ALTER ROLE %s SET %s TO %s;", q, settingName(s.Name), s.SQL))
@@ -973,16 +1169,25 @@ func (pl *planner) roles() {
 		if strings.HasPrefix(pgr.Grantee, "pg_") && tr.Roles[pgr.Grantee] == nil {
 			continue
 		}
-		if have, ok := tr.ParamGrants[pgr.key()]; ok && (have.GrantOption || !pgr.GrantOption) {
+		have, ok := tr.ParamGrants[pgr.key()]
+		if ok && (have.GrantOption || !pgr.GrantOption) {
 			continue
 		}
-		stmt := fmt.Sprintf("GRANT %s ON PARAMETER %s TO %s", pgr.Privilege, settingName(pgr.Param), pg.QuoteIdent(pgr.Grantee))
+		on := pgr.Privilege + " ON PARAMETER " + settingName(pgr.Param)
+		stmt := "GRANT " + on + " TO " + granteeSQL(pgr.Grantee)
 		if pgr.GrantOption {
 			stmt += " WITH GRANT OPTION"
 		}
 		pl.up[gParam] = append(pl.up[gParam], stmt+";")
-		pl.down[gParam] = append(pl.down[gParam], fmt.Sprintf("REVOKE %s ON PARAMETER %s FROM %s;", pgr.Privilege, settingName(pgr.Param), pg.QuoteIdent(pgr.Grantee)))
-		pl.sql("role", pgr.Grantee, fmt.Sprintf("missing %s on parameter %s", pgr.Privilege, pgr.Param))
+		detail := fmt.Sprintf("missing %s on parameter %s", pgr.Privilege, pgr.Param)
+		if ok {
+			// The target had the privilege: env-down takes back only the grant option.
+			pl.down[gParam] = append(pl.down[gParam], "REVOKE GRANT OPTION FOR "+on+" FROM "+granteeSQL(pgr.Grantee)+";")
+			detail = fmt.Sprintf("missing the grant option of %s on parameter %s", pgr.Privilege, pgr.Param)
+		} else {
+			pl.down[gParam] = append(pl.down[gParam], "REVOKE "+on+" FROM "+granteeSQL(pgr.Grantee)+";")
+		}
+		pl.sql("role", granteeName(pgr.Grantee), detail)
 	}
 	if len(existing) > 0 {
 		pl.p.Notes = append(pl.p.Notes, fmt.Sprintf("users %s already exist on the target with their own password (restore never changes it; a hash cannot tell whether it is the same password): only the app check proves the app's password works", strings.Join(existing, ", ")))
@@ -996,6 +1201,15 @@ func (pl *planner) roles() {
 	if len(extra) > 0 {
 		pl.p.Notes = append(pl.p.Notes, "users on the target that the backup does not have (left as they are): "+listFirst(extra, 8))
 	}
+}
+
+// granteeSQL is a grantee in GRANT … TO / REVOKE … FROM: the keyword PUBLIC
+// for the pseudo-role, or a quoted role name (a role named "PUBLIC" too).
+func granteeSQL(g string) string {
+	if g == publicGrantee {
+		return "PUBLIC"
+	}
+	return pg.QuoteIdent(g)
 }
 
 func roleCommentSQL(q string, c *string) string {
@@ -1186,7 +1400,7 @@ func (pl *planner) dbAttributes() {
 		for _, s := range a.Settings {
 			k := s.Role + "\x00" + strings.ToLower(s.Name)
 			want[k] = true
-			if got, ok := td.Settings[k]; !ok || normSetting(got) != normSetting(s.Value) {
+			if got, ok := td.Settings[k]; !ok || !sameDumped(s.Name, got, s.Value, s.SQL) {
 				diffs = append(diffs, "setting "+s.Name)
 			}
 		}
@@ -1221,12 +1435,7 @@ func splitACL(k string) (grantee, privilege string) {
 func aclDiff(db string, have, want map[string]bool) []string {
 	q := pg.QuoteIdent(db)
 	var out []string
-	who := func(g string) string {
-		if g == "PUBLIC" {
-			return "PUBLIC"
-		}
-		return pg.QuoteIdent(g)
-	}
+	who := granteeSQL
 	for _, k := range sortedKeys(have) {
 		if !want[k] {
 			g, p := splitACL(k)

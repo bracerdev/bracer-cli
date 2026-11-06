@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,23 +19,35 @@ var ErrNoInput = errors.New("no more input: bracer init needs an interactive ter
 // prompter asks and answers on the terminal. secret reads without echoing when
 // stdin is a terminal; otherwise (tests, pipes) it reads a plain line.
 type prompter struct {
-	in     *bufio.Reader
-	out    io.Writer
+	in  *bufio.Reader
+	out io.Writer
+	// ctx ends a question waiting for its answer: Ctrl-C, SIGTERM or SIGHUP
+	// at a prompt stops the command at once instead of after the next Enter.
+	ctx    context.Context
 	secret func(prompt string) (string, error)
 	// before runs before every question; init --web tells the web the
 	// customer is now answering in the terminal (spec init-web § Flow 5).
 	before func()
 }
 
-func newPrompter(in io.Reader, out io.Writer) *prompter {
-	p := &prompter{in: bufio.NewReader(in), out: out}
+// newPrompter asks on in and out until ctx ends.
+func newPrompter(ctx context.Context, in io.Reader, out io.Writer) *prompter {
+	p := &prompter{ctx: ctx, in: bufio.NewReader(in), out: out}
 	if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
 		fd := int(f.Fd())
 		p.secret = func(prompt string) (string, error) {
 			fmt.Fprint(out, prompt)
-			b, err := term.ReadPassword(fd)
+			// An interrupt leaves ReadPassword waiting with echo off:
+			// put the terminal back as it was.
+			if st, err := term.GetState(fd); err == nil {
+				defer term.Restore(fd, st)
+			}
+			s, err := p.wait(func() (string, error) {
+				b, err := term.ReadPassword(fd)
+				return string(b), err
+			})
 			fmt.Fprintln(out)
-			return string(b), err
+			return s, err
 		}
 	} else {
 		p.secret = func(prompt string) (string, error) {
@@ -48,17 +61,43 @@ func newPrompter(in io.Reader, out io.Writer) *prompter {
 // hook runs before a question is printed, so what the web shows ("finish
 // in your terminal") is up before the prompt waits for an answer.
 func (p *prompter) hook() {
-	if p.before != nil {
+	if p.before != nil && p.ctx.Err() == nil {
 		p.before()
 	}
 }
 
 func (p *prompter) line() (string, error) {
-	s, err := p.in.ReadString('\n')
-	if err != nil && (err != io.EOF || s == "") {
-		return "", ErrNoInput
+	return p.wait(func() (string, error) {
+		s, err := p.in.ReadString('\n')
+		if err != nil && (err != io.EOF || s == "") {
+			return "", ErrNoInput
+		}
+		return strings.TrimRight(s, "\r\n"), nil
+	})
+}
+
+// wait runs read, or returns ctx's error as soon as ctx ends. A read left
+// waiting is never followed by another: once ctx has ended every question
+// returns its error before reading.
+func (p *prompter) wait(read func() (string, error)) (string, error) {
+	if err := p.ctx.Err(); err != nil {
+		return "", err
 	}
-	return strings.TrimRight(s, "\r\n"), nil
+	type answer struct {
+		s   string
+		err error
+	}
+	ch := make(chan answer, 1)
+	go func() {
+		s, err := read()
+		ch <- answer{s, err}
+	}()
+	select {
+	case a := <-ch:
+		return a.s, a.err
+	case <-p.ctx.Done():
+		return "", p.ctx.Err()
+	}
 }
 
 func (p *prompter) printf(format string, args ...interface{}) {

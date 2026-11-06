@@ -5,65 +5,47 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 )
 
 // ErrLocked: another bracer process is running with the same app.yaml.
 var ErrLocked = errors.New("another bracer process is running for this app.yaml")
 
-// Lock is the one lock file next to app.yaml, holding the PID: backup holds
-// it for the whole run (drill included), init's real run being one
-// (ADR-0026). A stale lock of a dead process is taken over.
-type Lock struct{ path string }
+// Lock is the one lock next to app.yaml: backup holds it for the whole run
+// (drill included), init's real run being one (ADR-0026). It is an flock(2)
+// on `.<app.yaml>.lock`, which the kernel releases when the process dies, so
+// a run killed without cleanup leaves nothing to take over. The file stays
+// empty: it is opened read-only, since flock needs no write permission, so a
+// file left by a run as another user (root) still locks.
+type Lock struct{ f *os.File }
 
-// Acquire creates `.<app.yaml>.lock`.
+// Acquire takes the lock, or returns an error wrapping ErrLocked when another
+// process holds it.
 func Acquire(configPath string) (*Lock, error) {
 	abs, err := filepath.Abs(configPath)
 	if err != nil {
 		return nil, err
 	}
-	l := &Lock{path: filepath.Join(filepath.Dir(abs), "."+filepath.Base(abs)+".lock")}
-	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(l.path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if err == nil {
-			fmt.Fprintf(f, "%d\n", os.Getpid())
-			f.Close()
-			return l, nil
-		}
-		if !os.IsExist(err) {
-			return nil, err
-		}
-		data, rerr := os.ReadFile(l.path)
-		if rerr != nil {
-			return nil, ErrLocked
-		}
-		pid, perr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if perr == nil && processAlive(pid) {
-			return nil, fmt.Errorf("a backup is running for this app.yaml (pid %d, %s): %w", pid, l.path, ErrLocked)
-		}
-		// Orphan lock: remove it and retry once.
-		_ = os.Remove(l.path)
+	path := filepath.Join(filepath.Dir(abs), "."+filepath.Base(abs)+".lock")
+	// os.OpenFile sets O_CLOEXEC: docker and the other children never hold the lock.
+	f, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, err
 	}
-	return nil, ErrLocked
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("lock %s: %w", path, err)
+		}
+		return nil, fmt.Errorf("a backup is running for this app.yaml (%s): %w", path, ErrLocked)
+	}
+	return &Lock{f: f}, nil
 }
 
-// Release removes the lock file.
+// Release closes the file, which releases the lock. The file stays: removing
+// it would let a starter that opened it before lock a file nobody else sees.
 func (l *Lock) Release() {
 	if l != nil {
-		_ = os.Remove(l.path)
+		l.f.Close()
 	}
-}
-
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = p.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, syscall.EPERM)
 }

@@ -1,9 +1,11 @@
 package pg
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +20,10 @@ type Conn struct {
 	Password string
 	Database string
 	Params   map[string]string // sslmode… keyed by libpq parameter name
+	// PinTime pins how the session writes dates and times: PGDATESTYLE=ISO
+	// and PGTZ=UTC, so pg_dumpall --globals-only writes a role's VALID UNTIL
+	// the same way whatever the server's or the role's settings.
+	PinTime bool
 }
 
 // WithDatabase returns a copy connecting to another database.
@@ -72,6 +78,10 @@ func (c Conn) Env() []string {
 	if !hasTimeout {
 		add("PGCONNECT_TIMEOUT", "10")
 	}
+	if c.PinTime {
+		add("PGDATESTYLE", "ISO")
+		add("PGTZ", "UTC")
+	}
 	return env
 }
 
@@ -81,11 +91,13 @@ func (c Conn) EnvNames() []string {
 }
 
 // ParseURL parses postgres://user:pass@host:port/db?sslmode=… into a Conn.
-// Unknown parameters are an error so a misspelled sslmode is not silently ignored.
+// Unknown parameters are an error so a misspelled sslmode is not silently
+// ignored. No error quotes any part of the URL: it is printed, written to
+// run.json and reported.
 func ParseURL(raw string) (Conn, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return Conn{}, fmt.Errorf("invalid URL: %w", err)
+		return Conn{}, urlError(err)
 	}
 	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
 		return Conn{}, fmt.Errorf("URL must start with postgres:// or postgresql://")
@@ -134,10 +146,41 @@ func ParseURL(raw string) (Conn, error) {
 			c.Database = vs[0]
 		default:
 			if _, ok := paramEnv[k]; !ok {
-				return Conn{}, fmt.Errorf("unsupported URL parameter: %s", k)
+				// Not the key: in a hand-broken URL it can be password material.
+				return Conn{}, fmt.Errorf("unsupported URL parameter (accepted: host, port, user, password, dbname, %s)", strings.Join(paramNames(), ", "))
 			}
 			c.Params[k] = vs[0]
 		}
 	}
 	return c, nil
+}
+
+// paramNames are the libpq parameters a URL may carry besides the
+// connection fields, sorted.
+func paramNames() []string {
+	out := make([]string, 0, len(paramEnv))
+	for k := range paramEnv {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// quoted is a quoted fragment of url.Parse's reason: a port, an escape or a
+// character that may be part of the password (BR-008).
+var quoted = regexp.MustCompile(`\s*"(?:[^"\\]|\\.)*"`)
+
+// urlError is why url.Parse refused a URL, without the URL: *url.Error
+// quotes it whole, password included, so only its reason is kept, minus
+// any quoted fragment of the URL.
+func urlError(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return errors.New("invalid URL")
+	}
+	why := strings.TrimSpace(quoted.ReplaceAllString(ue.Err.Error(), ""))
+	if why == "" {
+		return errors.New("invalid URL")
+	}
+	return fmt.Errorf("invalid URL: %s", why)
 }

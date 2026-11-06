@@ -320,7 +320,13 @@ func fingerprint(st *restore.TargetState) map[string]string {
 	}
 	if st.Roles != nil {
 		for n, r := range st.Roles.Roles {
-			put("role "+n, r)
+			// ALTER ROLE cannot set VALID UNTIL back to none: env-down
+			// writes infinity, which means the same.
+			rc := *r
+			if restore.NoExpiry(rc.ValidUntil) {
+				rc.ValidUntil = ""
+			}
+			put("role "+n, rc)
 		}
 		put("parameter grants", st.Roles.ParamGrants)
 	}

@@ -77,6 +77,27 @@ func TestFingerprintDiff(t *testing.T) {
 	}
 }
 
+// BR-011 B6: ALTER ROLE cannot set VALID UNTIL back to none, so env-down
+// writes infinity: both mean no expiry and fingerprint the same. A role that
+// had infinity before env-up has it after env-down.
+func TestBR011FingerprintValidUntil(t *testing.T) {
+	st := func(vu string) *restore.TargetState {
+		r := &restore.RoleSpec{Name: "app", Flags: map[string]bool{"LOGIN": true}, ConnLimit: -1, ValidUntil: vu}
+		return &restore.TargetState{Env: &pg.Env{}, Names: map[string]bool{"postgres": true},
+			Roles: &restore.TargetRoles{Roles: map[string]*restore.RoleSpec{"app": r}, ParamGrants: map[string]restore.ParamGrant{}}}
+	}
+	for _, c := range [][2]string{{"infinity", "infinity"}, {"", "infinity"}, {"infinity", ""}, {"2030-01-01 03:00:00+00", "2030-01-01 03:00:00+00"}} {
+		if d := diffPrints(fingerprint(st(c[0])), fingerprint(st(c[1]))); len(d) != 0 {
+			t.Errorf("%q then %q: %v", c[0], c[1], d)
+		}
+	}
+	for _, c := range [][2]string{{"", "2030-01-01 03:00:00+00"}, {"infinity", "-infinity"}} {
+		if d := strings.Join(diffPrints(fingerprint(st(c[0])), fingerprint(st(c[1]))), "; "); d != "role app changed" {
+			t.Errorf("%q then %q: %s", c[0], c[1], d)
+		}
+	}
+}
+
 // pg_hba and ssl are the real target's business: notes in a drill, not failures.
 func TestDrillFailedSkipsTargetOnly(t *testing.T) {
 	p := &restore.Plan{Checks: []restore.Check{

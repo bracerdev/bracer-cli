@@ -65,7 +65,6 @@ func installTimer(t *testing.T, d scheduleDeps, app string) {
 func statusDeps(t *testing.T, sc *fakeSystemctl, st storage.Store) (scheduleDeps, *strings.Builder) {
 	t.Helper()
 	d, _, _ := testDeps(t, sc, "")
-	d.euid = 1000
 	d.newStore = func(storage.S3Config) (storage.Store, error) { return st, nil }
 	var out strings.Builder
 	d.stdout = &out

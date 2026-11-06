@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
@@ -12,9 +13,9 @@ import (
 // Spec backup § Flow 8: the /report body is the run's JSON plus the schedule
 // (hosted computes the next run from it) and the hostname.
 func TestReportBody(t *testing.T) {
-	cfg := &config.App{App: "shop", Schedule: &config.Schedule{Every: "weekly", At: []string{"03:00"}, Days: []string{"sun"}, Keep: 4}}
+	cfg := &config.App{App: "shop", Schedule: &config.Schedule{Every: "weekly", At: []string{"03:00"}, Days: []string{"sun"}, Keep: 4, Since: "2026-10-01T00:00:00Z"}}
 	res := &backup.Result{Kind: "backup", App: "shop", TS: "2026-10-23T030000Z", Status: backup.ResultOK, OK: true, Warnings: []string{"x"}}
-	for _, body := range []any{res, failureReport("backup", "shop", errors.New("lock"))} {
+	for _, body := range []any{res, failureReport("backup", "shop", time.Now(), time.Now(), errors.New("lock"), nil)} {
 		data, err := reportBody(cfg, body)
 		if err != nil {
 			t.Fatal(err)

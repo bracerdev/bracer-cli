@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -9,7 +10,7 @@ import (
 // line (a number meant for the web, an Enter) must not pass silently.
 func TestYesNoRepeatsWithHint(t *testing.T) {
 	var out strings.Builder
-	p := newPrompter(strings.NewReader("1\nmaybe\ny\n"), &out)
+	p := newPrompter(context.Background(), strings.NewReader("1\nmaybe\ny\n"), &out)
 	ok, err := p.yesNo("Go on?", false)
 	if err != nil || !ok {
 		t.Fatalf("yesNo = %v, %v", ok, err)
@@ -23,7 +24,7 @@ func TestYesNoRepeatsWithHint(t *testing.T) {
 // "finish in your terminal" while the prompt waits, not after.
 func TestPromptHookBeforeQuestion(t *testing.T) {
 	var out strings.Builder
-	p := newPrompter(strings.NewReader("\n"), &out)
+	p := newPrompter(context.Background(), strings.NewReader("\n"), &out)
 	p.before = func() { out.WriteString("<hook>") }
 	if _, err := p.ask("Instance name", "db"); err != nil {
 		t.Fatal(err)

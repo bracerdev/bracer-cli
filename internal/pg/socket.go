@@ -45,7 +45,8 @@ func SocketOwner(l Local) (uid, gid int, err error) {
 
 // SocketRunner: `docker run --rm --network none` of postgres:<major> with the
 // socket directory mounted at the same path, as the socket's owner, so the
-// tools connect over the socket with peer authentication (ADR-0015).
+// tools connect over the socket with peer authentication (ADR-0015). Named
+// and without a log driver, like every client container (clientRunArgs).
 type SocketRunner struct {
 	Shell    Shell
 	Image    string
@@ -66,15 +67,18 @@ func (r SocketRunner) Run(ctx context.Context, conn Conn, tool string, args []st
 func (r SocketRunner) RunStderr(ctx context.Context, conn Conn, tool string, args []string, stdin io.Reader, stdout io.Writer) ([]byte, error) {
 	conn.Host, conn.Port = r.Local.Dir, r.Local.Port
 	env := conn.Env()
-	dargs := []string{"run", "--rm", "-i", "--network", "none",
+	name := uniqueName("bracer-pg-")
+	dargs := append(clientRunArgs(name), "--network", "none",
 		"--user", fmt.Sprintf("%d:%d", r.UID, r.GID),
-		"-v", r.Local.Dir + ":" + r.Local.Dir}
+		"-v", r.Local.Dir+":"+r.Local.Dir)
 	for _, n := range envNames(env) {
 		dargs = append(dargs, "-e", n)
 	}
 	dargs = append(dargs, r.Image, tool)
 	dargs = append(dargs, args...)
-	res, err := r.Shell.Run(ctx, Cmd{Name: "docker", Args: dargs, Env: env, Stdin: stdin, Stdout: stdout})
+	res, err := runStoppable(ctx, r.Shell,
+		Cmd{Name: "docker", Args: dargs, Env: env, Stdin: stdin, Stdout: stdout},
+		Cmd{Name: "docker", Args: []string{"rm", "-f", name}})
 	return res.Stderr, err
 }
 

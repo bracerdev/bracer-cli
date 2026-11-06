@@ -193,7 +193,7 @@ func baseCfg() *config.App {
 			Databases: config.Databases([]config.Database{{Name: "shop"}})}},
 		Storage:    &config.Storage{Endpoint: "https://s3.example.com", Bucket: "b", Folder: "shop-7f3k2q", AccessKeyEnv: "A", SecretKeyEnv: "S"},
 		Encryption: "none",
-		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7},
+		Schedule:   &config.Schedule{Every: config.EveryDaily, At: []string{"03:00"}, Days: []string{}, Keep: 7, Since: "2026-10-01T00:00:00Z"},
 		Runtime:    &config.Runtime{User: "u", Path: "/usr/bin:/bin", Docker: "/usr/bin/docker"},
 	}
 }

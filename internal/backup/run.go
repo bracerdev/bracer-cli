@@ -76,8 +76,9 @@ type InstanceResult struct {
 	Runner    string `json:"runner,omitempty"`
 	PgVersion string `json:"pg_version,omitempty"`
 	SystemID  string `json:"system_id,omitempty"`
-	// IdentityChanged: the server is another cluster than the one init recorded;
-	// dumps are taken but retention deletes nothing (spec backup § Flow 3a2).
+	// IdentityChanged: the server is another cluster than the one init
+	// recorded; dumps are taken, a warning says so and retention runs as
+	// usual (spec backup § Flow 3a2, ADR-0029).
 	IdentityChanged bool              `json:"identity_changed,omitempty"`
 	ToolVersion     string            `json:"tool_version,omitempty"` // the pg_dump --version used
 	OK              bool              `json:"ok"`
@@ -135,6 +136,47 @@ func (r *Result) Instance(name string) *InstanceResult {
 		}
 	}
 	return nil
+}
+
+// redacter is a result of another package kept in a Result (the drill's):
+// it redacts its own text in place.
+type redacter interface {
+	Redact(redact func(string) string)
+}
+
+// redactRun replaces, in place, every secret in the text of the run (spec
+// backup, BR-014): errors, warnings, the drill's reasons and the drill's
+// own result. The reasons of run.json's drill are the DrillFailed slice
+// itself (drill.Step), and its backup outcome is built from res afterwards.
+// Names (instances, databases, runner, system_id) are never touched. It
+// runs once, when the run's text is final and before anything reads it, so
+// run.json, the journal, the printed result, --json, the heartbeat and the
+// report all carry the same redacted text.
+func redactRun(res *Result, secrets *config.Secrets) {
+	r := func(s *string) { *s = secrets.Redact(*s) }
+	all := func(ss []string) {
+		for i := range ss {
+			r(&ss[i])
+		}
+	}
+	r(&res.Error)
+	all(res.Warnings)
+	for _, ir := range res.Instances {
+		r(&ir.Error)
+		for _, dr := range ir.Databases {
+			r(&dr.Error)
+		}
+		if ir.Globals != nil {
+			r(&ir.Globals.Error)
+		}
+		if ir.Env != nil {
+			r(&ir.Env.Error)
+		}
+		all(ir.DrillFailed)
+		if x, ok := ir.Drill.(redacter); ok {
+			x.Redact(secrets.Redact)
+		}
+	}
 }
 
 // finish sets OK and Status from the errors of the run.
@@ -271,12 +313,17 @@ func Backup(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 			ri.Drill = &DrillOutcome{Result: DrillOff}
 		}
 	}
+	if !d.SchemaOnly {
+		checkRowDrops(cfg.Instances, run, newRunCache(ctx, d.Store, run, prev, refs), res)
+	}
+	// Every text of the run is written by now: redacted here, before
+	// run.json, the CLI's output, the heartbeat and the report read it.
+	redactRun(res, d.Secrets)
 	if d.SchemaOnly {
 		res.FinishedAt = d.Now().UTC()
 		res.finish()
 		return res, nil
 	}
-	checkRowDrops(cfg.Instances, run, newRunCache(ctx, d.Store, run, prev, refs), res)
 	// The outcome is known before run.json is written, so it goes with it;
 	// run.json is the last object of the run (ADR-0026).
 	res.FinishedAt = d.Now().UTC()
@@ -286,7 +333,7 @@ func Backup(ctx context.Context, cfg *config.App, d Deps) (*Result, error) {
 		if res.Error != "" {
 			res.Error += "\n"
 		}
-		res.Error += fmt.Sprintf("run.json could not be written: %v; this run's objects are in the bucket but no restore can find them, and the next backup deletes them", err)
+		res.Error += d.Secrets.Redact(fmt.Sprintf("run.json could not be written: %v; this run's objects are in the bucket but no restore can find them, and the next backup deletes them", err))
 		res.finish()
 		return res, nil
 	}
@@ -456,7 +503,7 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, run, 
 		fail := func(format string, args ...interface{}) {
 			dr.Error = fmt.Sprintf(format, args...)
 			ir.OK = false
-			d.Log.Error("dump failed", "instance", in.Name, "db", db, "err", dr.Error)
+			d.Log.Error("dump failed", "instance", in.Name, "db", db, "err", d.Secrets.Redact(dr.Error))
 		}
 		// Encoding/locale so restore can recreate the database identically (spec backup § Flow 3c);
 		// if it cannot be read, the dump cannot be recreated identically → this database fails.
@@ -563,7 +610,11 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, run, 
 	args = append(args, lockWaitArg())
 	key := globalsKey(run.root, run.TS, in.Name, recipient != "")
 	gctx, cancel := context.WithTimeout(ctx, config.BackupTimeout)
-	n, sha, err := streamToStore(gctx, runner, conn, "pg_dumpall", args, d.Store, key, recipient)
+	// VALID UNTIL is written in the session's date style and time zone;
+	// restore reads the target's roles the same way (ReadTargetRoles).
+	gconn := conn
+	gconn.PinTime = true
+	n, sha, err := streamToStore(gctx, runner, gconn, "pg_dumpall", args, d.Store, key, recipient)
 	cancel()
 	if err != nil {
 		gr.Error = err.Error()
@@ -638,7 +689,7 @@ func applyRetention(ctx context.Context, sc config.Schedule, run *Run, refs []Ru
 		removed := true
 		for _, key := range keys {
 			if err := d.Store.Delete(ctx, key); err != nil {
-				res.warn("retention: could not delete %s: %v; the next run tries again", key, err)
+				res.warn("retention: could not delete %s: %s; the next run tries again", key, d.Secrets.Redact(err.Error()))
 				removed = false
 				break
 			}
@@ -727,7 +778,7 @@ func dumpDatabase(ctx context.Context, in config.Instance, runner pg.Runner, con
 	args := append([]string{"-Fc", lockWaitArg()}, snap.Args()...)
 	n, sha, err = streamToStore(ctx, runner, conn, "pg_dump", args, d.Store, key, recipient)
 	if endErr := snap.End(); err == nil && endErr != nil {
-		d.Log.Warn("close snapshot session", "instance", in.Name, "db", db, "err", endErr)
+		d.Log.Warn("close snapshot session", "instance", in.Name, "db", db, "err", d.Secrets.Redact(endErr.Error()))
 	}
 	if err != nil {
 		return 0, "", nil, err
