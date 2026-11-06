@@ -44,6 +44,27 @@ func (r ExecRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
 	return ParseDF(out.Bytes())
 }
 
+// DatabasesSize is the sum of pg_database_size of the databases names on
+// the connected server: about what a restore of them writes.
+func (c *Client) DatabasesSize(ctx context.Context, names []string) (int64, error) {
+	quoted := make([]string, 0, len(names))
+	for _, n := range names {
+		quoted = append(quoted, QuoteLiteral(n))
+	}
+	rows, err := c.Query(ctx, "select coalesce(sum(pg_database_size(datname)), 0) from pg_database where datname in ("+strings.Join(quoted, ",")+")")
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		return 0, fmt.Errorf("unexpected answer to pg_database_size: %q", rows)
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rows[0][0]), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unexpected answer to pg_database_size: %v", err)
+	}
+	return n, nil
+}
+
 // DiskFree: `df` on this machine, where the local cluster's data directory is.
 func (r SocketRunner) DiskFree(ctx context.Context, dir string) (int64, error) {
 	res, err := r.Shell.Run(ctx, Cmd{Name: "df", Args: dfArgs(dir)})

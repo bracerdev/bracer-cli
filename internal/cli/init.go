@@ -83,7 +83,7 @@ type initRun struct {
 func defaultInitDeps(stdin io.Reader, stdout, stderr io.Writer) initDeps {
 	return initDeps{
 		shell:          pg.ExecShell{},
-		probe:          pg.ProbeSSLRequest,
+		probe:          pg.ProbeGSSENCRequest,
 		newStore:       func(c storage.S3Config) (storage.Store, error) { return storage.NewS3(c) },
 		env:            defaultEnvDeps(pg.ExecShell{}),
 		home:           appHome,

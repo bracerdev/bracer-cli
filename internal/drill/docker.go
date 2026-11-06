@@ -92,11 +92,11 @@ func (r *dockerRuntime) imageVolumes(ctx context.Context, image string) ([]strin
 	inspect := func() ([]string, error) {
 		out, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{json .Config.Volumes}}", image}})
 		if err != nil {
-			return nil, err
+			return nil, pullError(image, fmt.Errorf("inspect %s: %v", image, err))
 		}
 		var vols map[string]struct{}
 		if err := json.Unmarshal(bytes.TrimSpace(out.Stdout), &vols); err != nil {
-			return nil, fmt.Errorf("parse image volumes: %w", err)
+			return nil, fmt.Errorf("inspect %s: parse image volumes: %w", image, err)
 		}
 		paths := make([]string, 0, len(vols))
 		for p := range vols {
@@ -110,7 +110,7 @@ func (r *dockerRuntime) imageVolumes(ctx context.Context, image string) ([]strin
 		return paths, nil
 	}
 	if _, perr := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"pull", "-q", image}}); perr != nil {
-		return nil, fmt.Errorf("pull %s: %w", image, perr)
+		return nil, pullError(image, fmt.Errorf("inspect %s: pull %s: %v", image, image, perr))
 	}
 	return inspect()
 }
@@ -123,7 +123,7 @@ func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.In
 	// leaves no copy of the data behind.
 	paths, err := r.imageVolumes(ctx, image)
 	if err != nil {
-		return nil, fmt.Errorf("inspect %s: %v", image, err)
+		return nil, err
 	}
 	name := containerPrefix + cfg.App + "-" + d.Rand(3)
 	t := &tempPG{run: pg.ExecRunner{Shell: r.sh, Container: name}, image: image, name: name, user: user}
@@ -161,6 +161,11 @@ func (r *dockerRuntime) start(ctx context.Context, cfg *config.App, in config.In
 		}
 	}
 	runArgs = append(runArgs, image)
+	// pg_restore --single-transaction creates each table and loads it in
+	// one transaction: with wal_level=minimal that data skips WAL, which
+	// would otherwise grow about as large as the data (spec backup § Drill).
+	// minimal needs no WAL senders and no WAL archiving.
+	runArgs = append(runArgs, "-c", "wal_level=minimal", "-c", "max_wal_senders=0", "-c", "archive_mode=off")
 	if len(preload) > 0 {
 		// The image entrypoint passes arguments starting with - to postgres.
 		runArgs = append(runArgs, "-c", "shared_preload_libraries="+strings.Join(preload, ","))

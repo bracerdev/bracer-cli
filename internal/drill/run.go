@@ -41,6 +41,9 @@ type Deps struct {
 	// SkipInstances are left out: the preflight of init keeps an
 	// instance that was already broken without making the new app.yaml wait on it.
 	SkipInstances []string
+	// Audience is who reads the Fix lines (fixText); the zero value is a
+	// run of an app that exists.
+	Audience Audience
 }
 
 // Result is the outcome of the drill step of one run: the detail of each
@@ -73,6 +76,12 @@ type InstanceResult struct {
 	Notes       []string           `json:"notes,omitempty"`
 	Disk        *restore.DiskCheck `json:"disk,omitempty"`
 	Databases   []*DatabaseResult  `json:"databases"`
+	// Fix is the one Fix line of a failure (fixText), "" when it has none.
+	Fix string `json:"fix,omitempty"`
+
+	errs  []string    // the instance's errors in order; Error joins them
+	why   *drillError // the error of the highest cause
+	cause cause       // the cause settle chose
 }
 
 // DatabaseResult is the outcome of restoring + comparing one database.
@@ -88,6 +97,8 @@ type DatabaseResult struct {
 	RowMismatches  []RowMismatch `json:"row_mismatches,omitempty"`
 	Warnings       []string      `json:"warnings,omitempty"` // extension version differs…
 	Error          string        `json:"error,omitempty"`
+
+	checked bool // loaded and compared with run.json
 }
 
 // RowMismatch is a table whose row count differs from run.json (shared with restore).
@@ -119,17 +130,20 @@ func (r *Result) Instance(name string) *InstanceResult {
 
 // Failures are the instance and database errors, as printed.
 func (ir *InstanceResult) Failures() []string {
-	var out []string
-	if ir.Error != "" {
+	out := append([]string(nil), ir.errs...)
+	if len(out) == 0 && ir.Error != "" {
 		out = append(out, ir.Error)
 	}
 	for _, dr := range ir.Databases {
 		switch {
 		case dr.Error != "":
 			out = append(out, dr.DB+": "+dr.Error)
-		case !dr.OK && ir.Error == "":
-			out = append(out, dr.DB+": does not match run.json")
+		case dr.checked && !dr.OK:
+			out = append(out, dr.DB+": the restored copy differs from what the backup recorded")
 		}
+	}
+	if ir.Fix != "" && len(out) > 0 {
+		out[len(out)-1] += "\nFix: " + ir.Fix
 	}
 	return out
 }
@@ -149,6 +163,8 @@ func (ir *InstanceResult) Redact(redact func(string) string) {
 		}
 	}
 	r(&ir.Error)
+	r(&ir.Fix)
+	all(ir.errs)
 	all(ir.Notes)
 	for i := range ir.Checks {
 		r(&ir.Checks[i].Detail)
@@ -183,7 +199,15 @@ func Step(cfg *config.App, d Deps, keep func(*Result)) backup.DrillFunc {
 			case in.DrillOff() || skipped(d.SkipInstances, in.Name):
 				ri.Drill = &backup.DrillOutcome{Result: backup.DrillOff}
 			case err != nil:
-				ri.Drill = &backup.DrillOutcome{Result: backup.DrillFailed, At: dr.StartedAt, Reasons: []string{err.Error()}}
+				// No instance started: the instance's result is the error,
+				// so run.json, status and the report say the same.
+				why := asDrillError(err)
+				nx := &InstanceResult{Name: in.Name, Result: backup.DrillFailed, Databases: []*DatabaseResult{}}
+				nx.fail(err)
+				nx.cause = why.cause
+				nx.Fix = fixText(why.cause, why, cfg.App, in.Name, nil, d.Audience)
+				ri.Drill = &backup.DrillOutcome{Result: backup.DrillFailed, At: dr.StartedAt, Reasons: nx.Failures()}
+				ir.Drill = nx
 			case x == nil:
 				continue
 			default:
@@ -235,15 +259,16 @@ func Run(ctx context.Context, cfg *config.App, run *backup.Run, d Deps) (*Result
 		res.Instances = append(res.Instances, ir)
 		start := d.Now()
 		if ri := run.Instances[in.Name]; ri == nil {
-			ir.Error = "the run has nothing of this instance"
+			ir.fail(failf(causeBackup, "the run has nothing of this instance"))
 		} else if len(ri.Missing) > 0 {
 			// Drilling an older run would report a pass for data that is no
 			// longer backed up (ADR-0019).
-			ir.Error = fmt.Sprintf("the run is missing %s; nothing to test-restore", strings.Join(ri.Missing, ", "))
+			ir.fail(failf(causeBackup, "the run is missing %s; nothing to test-restore", strings.Join(ri.Missing, ", ")))
 		} else {
 			runInstance(ctx, rt, cfg, in, run, ri, ir, res, d)
 		}
 		ir.TookSeconds = d.Now().Sub(start).Seconds()
+		ir.settle(cfg.App, d.Audience)
 		if ir.OK {
 			ir.Result = backup.DrillPassed
 		} else {

@@ -13,7 +13,7 @@ import (
 // runtime, as init writes them.
 const schedBlock = "schedule:\n  every: daily\n  at: [\"03:00\"]\n  days: []\n  keep: 7\n  since: \"2026-10-01T00:00:00Z\"\n"
 
-const tail = `secrets_file: /home/khanh/.config/bracer/shop/secrets.env
+const tail = `secrets_file: /home/deploy/.config/bracer/shop/secrets.env
 storage:
   endpoint: https://x.r2.cloudflarestorage.com
   bucket: backups
@@ -22,7 +22,7 @@ storage:
   secret_key_env: BRACER_SHOP_S3_SECRET_KEY
 encryption: age
 age_recipient: age1qxyabc
-age_identity_file: /home/khanh/.config/bracer/shop/age.key
+age_identity_file: /home/deploy/.config/bracer/shop/age.key
 schedule:
   every: daily
   at: ["03:00"]
@@ -30,7 +30,7 @@ schedule:
   keep: 7
   since: "2026-10-01T00:00:00Z"
 runtime:
-  user: khanh
+  user: deploy
   path: /usr/bin:/bin
   docker: /usr/bin/docker
   docker_host: unix:///var/run/docker.sock
@@ -145,21 +145,21 @@ func TestValidateErrors(t *testing.T) {
 		strings.Replace(one("", ""), `at: ["03:00"]`, `at: ["03:00", "03:00"]`, 1):                        "schedule.at: 03:00 twice",
 		strings.Replace(one("", ""), "days: []", "days: [mon]", 1):                                        "schedule.days: must be empty for a daily schedule",
 		strings.Replace(one("", ""), "every: daily", "every: weekly", 1):                                  "schedule.days: at least one day of the week (mon…sun)",
-		strings.Replace(one("", ""), "every: daily\n  at: [\"03:00\"]\n  days: []", "every: weekly\n  at: [\"03:00\"]\n  days: [mon, Fri]", 1):                         `schedule.days: "Fri" is not a day of the week`,
-		strings.Replace(one("", ""), "every: daily\n  at: [\"03:00\"]\n  days: []", "every: monthly\n  at: [\"03:00\"]\n  days: [1, 29]", 1):                           `schedule.days: "29" is not a day of the month (1–28 or last)`,
-		strings.Replace(one("", ""), "every: daily\n  at: [\"03:00\"]\n  days: []", "every: monthly\n  at: [\"03:00\"]\n  days: [last, last]", 1):                      "schedule.days: last twice",
-		strings.Replace(one("", ""), "  every: daily\n", "  every: daily\n  backup: \"03:00\"\n", 1):                                                                   "backup", // ADR-0029: no old form
-		strings.Replace(one("", ""), "  every: daily\n", "  every: daily\n  drill: \"04:00\"\n", 1):                                                                    "drill",  // ADR-0026: the drill runs inside backup
-		strings.Replace(one("", ""), "      system_id: \"1\"\n", "", 1):                                                                                                "system_id: required",
-		strings.Replace(one("", ""), "system_id: \"1\"", "system_id: abc", 1):                                                                                          "system_id: expected",
-		strings.Replace(one("", ""), "      pg_major: 17\n", "", 1):                                                                                                    "pg_major: required",
-		strings.Replace(one("", ""), "  folder: shop-7f3k2q\n", "", 1):                                                                                                 "storage.folder",
-		strings.Replace(one("", ""), "folder: shop-7f3k2q", "folder: shop", 1):                                                                                         "storage.folder",
-		strings.Replace(one("", ""), "encryption: age\nage_recipient: age1qxyabc\nage_identity_file: /home/khanh/.config/bracer/shop/age.key\n", "", 1):                "encryption: required",
-		strings.Replace(one("", ""), "age_identity_file: /home/khanh/.config/bracer/shop/age.key\n", "", 1):                                                            "age_identity_file: required",
-		strings.Replace(one("", ""), "secrets_file: /home/khanh/.config/bracer/shop/secrets.env", "secrets_file: ~/shop.env", 1):                                       "secrets_file: must be an absolute path",
-		strings.Replace(one("", ""), "runtime:\n  user: khanh\n  path: /usr/bin:/bin\n  docker: /usr/bin/docker\n  docker_host: unix:///var/run/docker.sock\n", "", 1): "runtime: required",
-		strings.Replace(one("", ""), "docker: /usr/bin/docker", "docker: docker", 1):                                                                                   "runtime.docker",
+		strings.Replace(one("", ""), "every: daily\n  at: [\"03:00\"]\n  days: []", "every: weekly\n  at: [\"03:00\"]\n  days: [mon, Fri]", 1):                          `schedule.days: "Fri" is not a day of the week`,
+		strings.Replace(one("", ""), "every: daily\n  at: [\"03:00\"]\n  days: []", "every: monthly\n  at: [\"03:00\"]\n  days: [1, 29]", 1):                            `schedule.days: "29" is not a day of the month (1–28 or last)`,
+		strings.Replace(one("", ""), "every: daily\n  at: [\"03:00\"]\n  days: []", "every: monthly\n  at: [\"03:00\"]\n  days: [last, last]", 1):                       "schedule.days: last twice",
+		strings.Replace(one("", ""), "  every: daily\n", "  every: daily\n  backup: \"03:00\"\n", 1):                                                                    "backup", // ADR-0029: no old form
+		strings.Replace(one("", ""), "  every: daily\n", "  every: daily\n  drill: \"04:00\"\n", 1):                                                                     "drill",  // ADR-0026: the drill runs inside backup
+		strings.Replace(one("", ""), "      system_id: \"1\"\n", "", 1):                                                                                                 "system_id: required",
+		strings.Replace(one("", ""), "system_id: \"1\"", "system_id: abc", 1):                                                                                           "system_id: expected",
+		strings.Replace(one("", ""), "      pg_major: 17\n", "", 1):                                                                                                     "pg_major: required",
+		strings.Replace(one("", ""), "  folder: shop-7f3k2q\n", "", 1):                                                                                                  "storage.folder",
+		strings.Replace(one("", ""), "folder: shop-7f3k2q", "folder: shop", 1):                                                                                          "storage.folder",
+		strings.Replace(one("", ""), "encryption: age\nage_recipient: age1qxyabc\nage_identity_file: /home/deploy/.config/bracer/shop/age.key\n", "", 1):                "encryption: required",
+		strings.Replace(one("", ""), "age_identity_file: /home/deploy/.config/bracer/shop/age.key\n", "", 1):                                                            "age_identity_file: required",
+		strings.Replace(one("", ""), "secrets_file: /home/deploy/.config/bracer/shop/secrets.env", "secrets_file: ~/shop.env", 1):                                       "secrets_file: must be an absolute path",
+		strings.Replace(one("", ""), "runtime:\n  user: deploy\n  path: /usr/bin:/bin\n  docker: /usr/bin/docker\n  docker_host: unix:///var/run/docker.sock\n", "", 1): "runtime: required",
+		strings.Replace(one("", ""), "docker: /usr/bin/docker", "docker: docker", 1):                                                                                    "runtime.docker",
 	}
 	for in, want := range cases {
 		_, err := Parse([]byte(in))

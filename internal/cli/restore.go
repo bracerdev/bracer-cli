@@ -322,7 +322,7 @@ func (r *restoreRun) pickTarget() error {
 	if err != nil {
 		r.printf("  ! %v\n", firstLine(err.Error()))
 	}
-	disc := pg.Discover(r.ctx, containers, pg.ScanHost(r.ctx, r.d.shell), pg.ProbeSSLRequest)
+	disc := pg.Discover(r.ctx, containers, pg.ScanHost(r.ctx, r.d.shell), pg.ProbeGSSENCRequest)
 	var cands []pg.Candidate
 	for _, c := range disc.Candidates {
 		if c.Local != nil || c.Container != nil && c.Container.Running {

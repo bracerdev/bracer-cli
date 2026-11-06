@@ -41,7 +41,7 @@ func (f *fakeShell) Run(_ context.Context, c Cmd) (Result, error) {
 }
 
 const psOut = `{"ID":"be65","Names":"bracer-test-pg","Image":"postgres:17-alpine","State":"running","Status":"Up 4 seconds"}
-{"ID":"2e20","Names":"k8s_dump_postgres-backup-1_ns_uid_0","Image":"b0f9560a2de0","State":"exited","Status":"Exited (1) 25 hours ago"}
+{"ID":"2e20","Names":"k8s_postgres_postgres-0_ns_uid_0","Image":"b0f9560a2de0","State":"exited","Status":"Exited (1) 25 hours ago"}
 {"ID":"aaaa","Names":"web","Image":"nginx:1.27","State":"running","Status":"Up"}
 `
 
@@ -49,8 +49,8 @@ const inspectOut = `[
  {"Id":"be65","Name":"/bracer-test-pg","State":{"Running":true,"Status":"running"},
   "Config":{"Image":"postgres:17-alpine","Env":["POSTGRES_PASSWORD=pw","POSTGRES_DB=shop","PG_MAJOR=17"]},
   "NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"15432"},{"HostIp":"::","HostPort":"15432"}]},"Networks":{"bridge":{"IPAddress":"172.17.0.32"}}}},
- {"Id":"2e20","Name":"/k8s_dump_postgres-backup-1_ns_uid_0","State":{"Running":false,"Status":"exited"},
-  "Config":{"Image":"b0f9560a2de0","Env":["PGHOST=db","POSTGRES_PASSWORD=x"]},
+ {"Id":"2e20","Name":"/k8s_postgres_postgres-0_ns_uid_0","State":{"Running":false,"Status":"exited"},
+  "Config":{"Image":"b0f9560a2de0","Env":["POSTGRES_PASSWORD=x"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["postgres"]},
   "NetworkSettings":{"Ports":{},"Networks":{}}},
  {"Id":"aaaa","Name":"/web","State":{"Running":true,"Status":"running"},
   "Config":{"Image":"nginx:1.27","Env":["NGINX_VERSION=1.27","POSTGRES_SERVICE_HOST=10.43.0.1"]},
@@ -279,8 +279,8 @@ func TestBR016FixRoleSQLHasNoPassword(t *testing.T) {
 
 // spec init § Flow 1b: Postgres from apt runs as user postgres, so `ss -ltnp`
 // run by another user shows no process. Such ports are kept only when
-// SSLRequest answers; the rest (sshd, DNS…) are dropped without a warning.
-func TestDiscoverUnseenProcessNeedsSSLRequest(t *testing.T) {
+// GSSENCRequest answers; the rest (sshd, DNS…) are dropped without a warning.
+func TestDiscoverUnseenProcessNeedsGSSENCRequest(t *testing.T) {
 	hs := HostScan{
 		Listeners: []Listener{
 			{Addr: "127.0.0.1", Port: 5433}, // apt Postgres, process not visible

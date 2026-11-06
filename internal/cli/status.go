@@ -210,7 +210,8 @@ func printRun(w io.Writer, run *backup.Run) int {
 		}
 		for _, name := range run.InstanceNames() {
 			if dr := run.Instances[name].Drill; dr != nil && dr.Result == backup.DrillFailed {
-				fmt.Fprintf(w, "  %s: test-restore failed: %s\n", name, strings.Join(dr.Reasons, "; "))
+				// A reason's own Fix line stays under it, indented.
+				fmt.Fprintf(w, "  %s: test-restore failed: %s\n", name, indentMore(strings.Join(dr.Reasons, "; ")))
 			}
 		}
 		if run.Backup.Fix != "" {

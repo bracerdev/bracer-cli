@@ -36,10 +36,10 @@ func chooseImage(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 		// build now (ADR-0022).
 		ce := env.Container
 		if ce == nil || ce.ImageID == "" {
-			return "", fmt.Errorf("the environment record has no image id of the source container of %s\nFix: %s", instance, backup.FixReinit(cfg.App))
+			return "", fmt.Errorf("the environment record has no image id of the source container of %s", instance)
 		}
 		if _, err := rt.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{.Id}}", ce.ImageID}}); err != nil {
-			return "", fmt.Errorf("the source image %s (%s) is not on this machine; drill will not use another build\nFix: %s", ce.Image, shortID(ce.ImageID), backup.FixReinit(cfg.App))
+			return "", fmt.Errorf("the source image %s (%s) is not on this machine; drill will not use another build", ce.Image, shortID(ce.ImageID))
 		}
 		return ce.ImageID, nil
 	case "local":
@@ -52,7 +52,7 @@ func chooseImage(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 		exts = append(exts, dp.Extensions...)
 	}
 	if n == 0 {
-		return "", fmt.Errorf("cannot pick a Postgres image for %s: the environment record has no server version\nFix: %s", instance, backup.FixReinit(cfg.App))
+		return "", fmt.Errorf("cannot pick a Postgres image for %s: the environment record has no server version", instance)
 	}
 	return pg.ImageForExtensions(n, exts)
 }
@@ -150,7 +150,8 @@ func (r *dockerRuntime) buildLocalImage(ctx context.Context, app string, env *pg
 	}
 	out, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"build", "--progress", "plain", "--label", Label + "=" + app, "-t", tag, "-"}, Stdin: strings.NewReader(df)})
 	if err != nil {
-		return "", fmt.Errorf("build %s for the local source failed:\n%s", tag, restore.Tail(append(out.Stdout, out.Stderr...), restore.StderrTail))
+		base, _, _ := strings.Cut(strings.TrimPrefix(df, "FROM "), "\n")
+		return "", pullError(base, fmt.Errorf("build %s for the local source failed:\n%s", tag, restore.Tail(append(out.Stdout, out.Stderr...), restore.StderrTail)))
 	}
 	return tag, nil
 }
@@ -160,7 +161,7 @@ func (r *dockerRuntime) buildLocalImage(ctx context.Context, app string, env *pg
 func (r *dockerRuntime) checkOfficial(ctx context.Context, image string) error {
 	if _, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{.Id}}", image}}); err != nil {
 		if _, perr := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"pull", "-q", image}}); perr != nil {
-			return fmt.Errorf("image %s is not on this machine and cannot be pulled: %v", image, firstLine(perr.Error()))
+			return pullError(image, fmt.Errorf("image %s is not on this machine and cannot be pulled: %v", image, firstLine(perr.Error())))
 		}
 	}
 	out, err := r.sh.Run(ctx, pg.Cmd{Name: "docker", Args: []string{"image", "inspect", "-f", "{{json .Config.Entrypoint}}\n{{json .Config.Cmd}}", image}})

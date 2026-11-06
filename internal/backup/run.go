@@ -554,6 +554,11 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, run, 
 			fail("count the objects of %s a restore locks: %v", db, err)
 			continue
 		}
+		size, err := c.DatabasesSize(ctx, []string{db})
+		if err != nil {
+			fail("read the size of %s: %v", db, err)
+			continue
+		}
 		// One deadline per database: count + dump + upload (spec backup § Edge cases).
 		key := dumpKey(run.root, run.TS, in.Name, db, recipient != "")
 		dbctx, cancel := context.WithTimeout(ctx, config.BackupTimeout)
@@ -569,7 +574,7 @@ func runInstance(ctx context.Context, cfg *config.App, in config.Instance, run, 
 		}
 		dr.Tables = len(tables)
 		dr.OK, dr.Bytes = true, n
-		ri.Databases[db] = &Dump{Key: key, TS: run.TS, ToolVersion: toolVer, Locale: loc, Extensions: exts, External: ext, RestoreNeeds: needs, LockObjects: locks, Bytes: n, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), Tables: tables}
+		ri.Databases[db] = &Dump{Key: key, TS: run.TS, ToolVersion: toolVer, Locale: loc, Extensions: exts, External: ext, RestoreNeeds: needs, LockObjects: locks, Bytes: n, SourceBytes: size, SHA256: sha, Encrypted: recipient != "", Recipient: recipientPtr(recipient), Tables: tables}
 		d.Log.Info("dumped", "instance", in.Name, "db", db, "bytes", n, "seconds", fmt.Sprintf("%.1f", dr.Seconds))
 	}
 

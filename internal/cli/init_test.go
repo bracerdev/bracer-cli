@@ -188,7 +188,7 @@ func runWorld(t *testing.T, dir string, w *world, answers ...string) (int, strin
 		env: envDeps{
 			lookPath:   func(name string) (string, error) { return "/usr/bin/" + name, nil },
 			getenv:     func(string) string { return "" },
-			userName:   func() string { return "khanh" },
+			userName:   func() string { return "deploy" },
 			hasSystemd: func() bool { return !w.noSystemd },
 		},
 		home: func() (string, error) { return dir, nil },
@@ -344,7 +344,7 @@ func TestInitContainerFullFlow(t *testing.T) {
 		t.Errorf("secrets_file = %q", cfg.SecretsFile)
 	}
 	rt := cfg.Runtime
-	if rt == nil || rt.User != "khanh" || rt.Docker != "/usr/bin/docker" || rt.DockerHost != "unix:///var/run/docker.sock" || rt.Path != "/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin" {
+	if rt == nil || rt.User != "deploy" || rt.Docker != "/usr/bin/docker" || rt.DockerHost != "unix:///var/run/docker.sock" || rt.Path != "/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin" {
 		t.Errorf("runtime: %+v", rt)
 	}
 	if cfg.Schedule == nil || !reflect.DeepEqual(noSince(cfg.Schedule), config.DefaultSchedule) {
@@ -373,7 +373,7 @@ func TestInitContainerFullFlow(t *testing.T) {
 		t.Errorf("mapped port must merge into the container:\n%s", out)
 	}
 	// Step 0 first, and sudo asked while nothing is written; the timers last.
-	if !strings.HasPrefix(out, "Checking this machine:\n  ✓ docker: docker info answers as khanh") || !strings.Contains(out, "✓ systemd") {
+	if !strings.HasPrefix(out, "Checking this machine:\n  ✓ docker: docker info answers as deploy") || !strings.Contains(out, "✓ systemd") {
 		t.Errorf("environment table first:\n%s", out)
 	}
 	if !w.installed() {
@@ -402,7 +402,7 @@ func TestInitContainerFullFlow(t *testing.T) {
 	for _, want := range []string{
 		"A real backup now proves the data too:",
 		"the databases hold 1.0 MB",
-		"drill restores them into a temporary Postgres in Docker: 10.0 GB free, about 5.0 MB needed",
+		"drill restores them into a temporary Postgres in Docker: 10.0 GB free, about 402.0 MB needed",
 		"Wrote " + appYAML(dir) + ".",
 		"Installing the nightly timer (sudo)",
 		"If this machine is lost, restore needs:\n  endpoint  https://s3.example.com\n  bucket    backups\n  folder    bracer/" + cfg.Storage.Folder + "\n  age key   " + key + "\n",
@@ -766,7 +766,7 @@ func TestInitEnvironmentBlocks(t *testing.T) {
 	}}
 	w := &world{sh: sh}
 	code, out, _ := runWorld(t, dir, w)
-	if code != exitError || !strings.Contains(out, "✗ docker: khanh may not use Docker") || !strings.Contains(out, "1. sudo usermod -aG docker khanh   # the docker group is equivalent to root") ||
+	if code != exitError || !strings.Contains(out, "✗ docker: deploy may not use Docker") || !strings.Contains(out, "1. sudo usermod -aG docker deploy   # the docker group is equivalent to root") ||
 		!strings.Contains(out, "2. log out and back in") || !strings.Contains(out, "3. bracer init shop\n") || !strings.Contains(out, "Nothing written.") || strings.Contains(out, "S3 endpoint") || w.tty != nil {
 		t.Errorf("exit %d:\n%s", code, out)
 	}
@@ -776,12 +776,12 @@ func TestInitEnvironmentBlocks(t *testing.T) {
 
 	// Rootless Docker without lingering: enable-linger, no logout needed.
 	sh = &fakeShell{out: map[string]string{
-		"docker info":                 "29.0\n",
-		"docker context inspect":      "unix:///run/user/1000/docker.sock\n",
-		"loginctl show-user khanh -p": "Linger=no\n",
+		"docker info":                  "29.0\n",
+		"docker context inspect":       "unix:///run/user/1000/docker.sock\n",
+		"loginctl show-user deploy -p": "Linger=no\n",
 	}}
 	code, out, _ = runWorld(t, dir, &world{sh: sh})
-	if code != exitError || !strings.Contains(out, "✗ rootless docker") || !strings.Contains(out, "1. sudo loginctl enable-linger khanh\n  2. bracer init shop") || !strings.Contains(out, "✓ systemd") {
+	if code != exitError || !strings.Contains(out, "✗ rootless docker") || !strings.Contains(out, "1. sudo loginctl enable-linger deploy\n  2. bracer init shop") || !strings.Contains(out, "✓ systemd") {
 		t.Errorf("rootless: exit %d:\n%s", code, out)
 	}
 
@@ -809,19 +809,19 @@ func TestInitEnvironmentBlocks(t *testing.T) {
 // Step 0 reads the machine only: the table, and runtime: when nothing blocks.
 func TestCheckEnv(t *testing.T) {
 	sh := &fakeShell{out: map[string]string{
-		"docker info":                 "29.0\n",
-		"docker context inspect":      "unix:///run/user/1000/docker.sock\n",
-		"loginctl show-user khanh -p": "Linger=yes\n",
+		"docker info":                  "29.0\n",
+		"docker context inspect":       "unix:///run/user/1000/docker.sock\n",
+		"loginctl show-user deploy -p": "Linger=yes\n",
 	}}
 	ed := envDeps{shell: sh, lookPath: func(n string) (string, error) { return "/opt/docker/bin/" + n, nil }, getenv: func(string) string { return "" },
-		userName: func() string { return "khanh" }, hasSystemd: func() bool { return true }}
+		userName: func() string { return "deploy" }, hasSystemd: func() bool { return true }}
 	rep := checkEnv(context.Background(), ed)
 	var buf bytes.Buffer
 	printEnv(&buf, rep, "bracer init shop")
-	if rep.Blocked() || buf.String() != "  ✓ docker: docker info answers as khanh (/opt/docker/bin/docker)\n  ✓ rootless docker: lingering is on for khanh\n  ✓ systemd: the nightly jobs run as systemd timers\n" {
+	if rep.Blocked() || buf.String() != "  ✓ docker: docker info answers as deploy (/opt/docker/bin/docker)\n  ✓ rootless docker: lingering is on for deploy\n  ✓ systemd: the nightly jobs run as systemd timers\n" {
 		t.Errorf("ok:\n%s", buf.String())
 	}
-	if rt := rep.Runtime; rt == nil || *rt != (config.Runtime{User: "khanh", Path: "/opt/docker/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", Docker: "/opt/docker/bin/docker", DockerHost: "unix:///run/user/1000/docker.sock"}) {
+	if rt := rep.Runtime; rt == nil || *rt != (config.Runtime{User: "deploy", Path: "/opt/docker/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", Docker: "/opt/docker/bin/docker", DockerHost: "unix:///run/user/1000/docker.sock"}) {
 		t.Errorf("runtime: %+v", rep.Runtime)
 	}
 	// DOCKER_HOST wins over the context.
@@ -935,7 +935,7 @@ func TestInitSelfCheckFails(t *testing.T) {
 	}
 }
 
-// Drill on needs DiskFactor × the databases free for Docker: too little, or
+// Drill on needs drill.NeedBytes of the databases free for Docker: too little, or
 // a size that cannot be read, stops before the real run.
 func TestInitDiskCheck(t *testing.T) {
 	dir := t.TempDir()
@@ -944,7 +944,7 @@ func TestInitDiskCheck(t *testing.T) {
 	sh.out["df -Pk /var/lib/docker"] = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 2048 1024 1024 50% /\n"
 	w := &world{sh: sh}
 	code, out, _ := runWorld(t, dir, w, answers(s3Answers, noEncryption, pickAll, drillOn, schedDefault)...)
-	if code != exitError || !strings.Contains(out, "✗ free up 4.0 MB for the drill (1.0 MB free, about 5.0 MB needed: 5 × the databases), or answer n to test-restore on this machine") || len(w.selfLog) != 2 {
+	if code != exitError || !strings.Contains(out, "✗ free up 401.0 MB for the drill (1.0 MB free, about 402.0 MB needed: 400.0 MB for the temporary Postgres + 2 × the databases), or answer n to test-restore on this machine") || len(w.selfLog) != 2 {
 		t.Errorf("exit %d %q:\n%s", code, w.selfLog, out)
 	}
 	if _, err := os.Stat(appYAML(dir)); !os.IsNotExist(err) {
@@ -963,8 +963,8 @@ func TestInitDiskCheck(t *testing.T) {
 func TestInitKubernetesNotice(t *testing.T) {
 	dir := t.TempDir()
 	sh := containerWorld()
-	sh.out["docker ps"] = `{"ID":"k1","Names":"k8s_postgres_postgres-0_attendy-dev_u_0","Image":"postgres:17","State":"running","Status":"Up"}` + "\n"
-	sh.out["docker inspect"] = `[{"Id":"k1","Name":"/k8s_postgres_postgres-0_attendy-dev_u_0","State":{"Running":true,"Status":"running"},"Config":{"Image":"postgres:17","Env":["POSTGRES_USER=attendy"]},"NetworkSettings":{"Ports":{},"Networks":{}}}]`
+	sh.out["docker ps"] = `{"ID":"k1","Names":"k8s_postgres_postgres-0_shop_u_0","Image":"postgres:17","State":"running","Status":"Up"}` + "\n"
+	sh.out["docker inspect"] = `[{"Id":"k1","Name":"/k8s_postgres_postgres-0_shop_u_0","State":{"Running":true,"Status":"running"},"Config":{"Image":"postgres:17","Env":["POSTGRES_USER=shop"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["postgres"]},"NetworkSettings":{"Ports":{},"Networks":{}}}]`
 	sh.out["docker top k1"] = "UID PID PPID C STIME TTY TIME CMD\n70 1 0 0 x ? 0 postgres\n"
 	sh.out["ss -ltnpH"] = ""
 	_, out, _ := runWorld(t, dir, &world{sh: sh}, answers(s3Answers, noEncryption)...)
@@ -1080,7 +1080,7 @@ func TestInitDrillFailAsks(t *testing.T) {
 			t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
 		}
 		cfg, err := config.Load(appYAML(dir))
-		if err != nil || !tc.check(cfg.Instances[0]) || !strings.Contains(out, "[i] enter a Docker image for this instance's drill  [n] no drill for this instance  [q] quit") {
+		if err != nil || !tc.check(cfg.Instances[0]) || !strings.Contains(out, "[r] retry  [i] enter a Docker image for this instance's drill  [n] no drill for this instance  [q] quit") {
 			t.Errorf("%v: %v %+v\n%s", tc.answers, err, cfg.Instances[0].Drill, out)
 		}
 		var runs []string

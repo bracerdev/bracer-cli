@@ -23,7 +23,7 @@ func runInstance(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 	ids := identitiesFor(cfg, run.Encrypted(), d, res)
 	runCfg, err := restore.ReadRunConfig(ctx, d.Store, run, ids)
 	if err != nil {
-		ir.Error = err.Error()
+		ir.fail(err)
 		return
 	}
 	dbs, known := restore.Expected(runCfg, in.Name)
@@ -32,25 +32,25 @@ func runInstance(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 		return
 	}
 	if missing := restore.RunMissing(ri, dbs); len(missing) > 0 {
-		ir.Error = fmt.Sprintf("the run is missing %s; nothing to test-restore", strings.Join(missing, ", "))
+		ir.fail(failf(causeBackup, "the run is missing %s; nothing to test-restore", strings.Join(missing, ", ")))
 		return
 	}
 	sort.Strings(dbs)
 	rp, err := restore.PickRun(ri, in.Name, run.TS, dbs)
 	if err != nil {
-		ir.Error = err.Error()
+		ir.fail(err)
 		return
 	}
 	env, err := restore.ReadEnv(ctx, d.Store, rp.Env, ids)
 	if err != nil {
-		ir.Error = err.Error()
+		ir.fail(err)
 		return
 	}
 
 	// Image: like the source, checked before anything runs.
 	image, err := chooseImage(ctx, rt, cfg, in, env, rp.DBs)
 	if err != nil {
-		ir.Error = err.Error()
+		ir.fail(orCause(causeImage, err))
 		return
 	}
 	ir.Image = image
@@ -58,17 +58,17 @@ func runInstance(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 		ir.ImageTag = ce.Image
 	}
 	if err := rt.checkOfficial(ctx, image); err != nil {
-		ir.Error = err.Error()
+		ir.fail(orCause(causeImage, err))
 		return
 	}
 	exts, libs, err := rt.imageFiles(ctx, image)
 	if err != nil {
-		ir.Error = err.Error()
+		ir.fail(orCause(causeImage, err))
 		return
 	}
 	preload, notes, err := checkImage(env, rp.DBs, image, exts, libs)
 	if err != nil {
-		ir.Error = err.Error() + "\nFix: " + backup.FixReinit(cfg.App)
+		ir.fail(orCause(causeImage, err))
 		return
 	}
 	ir.Notes = append(ir.Notes, notes...)
@@ -77,15 +77,15 @@ func runInstance(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 	if user == "" || env.SourceKind == "url" {
 		user = "postgres"
 	}
-	var need int64
+	var source int64
 	locks := 0
 	for _, dp := range rp.DBs {
-		need += dp.Bytes
+		source += dp.SourceBytes
 		locks = max(locks, dp.LockObjects.Locks())
 	}
-	t, err := rt.start(ctx, cfg, in, image, user, preload, drillLocksPer(locks), need*restore.DiskFactor, ir, res, d)
+	t, err := rt.start(ctx, cfg, in, image, user, preload, drillLocksPer(locks), NeedBytes(source), ir, res, d)
 	if err != nil {
-		ir.Error = err.Error()
+		ir.fail(err)
 		return
 	}
 	defer rt.remove(ctx, t, res, in.Name)
@@ -95,7 +95,11 @@ func runInstance(ctx context.Context, rt *dockerRuntime, cfg *config.App, in con
 // drillRun is the part inside the temporary Postgres; false on any failure.
 func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, rp *restore.RunPick, ids *restore.Identities, ir *InstanceResult, d Deps) bool {
 	fail := func(format string, args ...interface{}) bool {
-		ir.Error = fmt.Sprintf(format, args...)
+		ir.fail(failf(causeOther, format, args...))
+		return false
+	}
+	failImage := func(format string, args ...interface{}) bool {
+		ir.fail(failf(causeImage, format, args...))
 		return false
 	}
 	admin := t.client("postgres")
@@ -105,7 +109,7 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, rp *restore.Run
 			return fail("check pg_restore in %s: %v", t.image, err)
 		}
 		if have < need {
-			return fail("dumps were made with pg_dump %d; pg_restore %s in %s cannot read them; set drill.image to a newer image", need, v, t.image)
+			return failImage("dumps were made with pg_dump %d; pg_restore %s in %s cannot read them", need, v, t.image)
 		}
 	}
 	src, err := restore.LoadSource(ctx, d.Store, rp, ids, t.runner(), t.conn("postgres"))
@@ -150,19 +154,8 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, rp *restore.Run
 			again = plan
 			break
 		}
-		var manual []restore.Check
-		for _, c := range failed {
-			if c.Fix != restore.FixSQL {
-				manual = append(manual, c)
-			}
-		}
-		switch {
-		case len(manual) > 0 && round == 1:
-			ir.Checks = manual
-			return fail("the temporary Postgres (%s) cannot take this backup: %s", t.image, describe(manual))
-		case len(manual) > 0 || round > maxRounds || len(plan.Up) == 0:
-			ir.Checks = failed
-			return fail("env-up did not make the target match: %s", describe(failed))
+		if ir.failRound(t.image, round, failed, len(plan.Up) > 0) {
+			return false
 		}
 		if err := restore.ApplySQL(ctx, t.runner(), t.conn("postgres"), plan.Up); err != nil {
 			return fail("env-up failed: %v", err)
@@ -219,9 +212,7 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, rp *restore.Run
 			return fail("read the temporary Postgres after the load: %v", err)
 		}
 		check := restore.MakePlan(restore.PlanInput{Src: src, Tgt: after, Mode: mode, Loaded: loaded, Now: d.Now(), OwnUser: t.user})
-		if left := drillFailed(check, nil); len(left) > 0 {
-			ir.Checks = left
-			ir.Error = "after the load the target no longer matches the backup: " + describe(left)
+		if ir.failAfterLoad(drillFailed(check, nil)) {
 			ok = false
 		}
 	}
@@ -235,6 +226,7 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, rp *restore.Run
 		if err != nil {
 			dr.Error = fmt.Sprintf("compare tables: %v", err)
 		}
+		dr.checked = true
 		dr.OK = dr.Error == "" && cmp.OK()
 		ok = ok && dr.OK
 	}
@@ -265,6 +257,41 @@ func drillRun(ctx context.Context, rt *dockerRuntime, t *tempPG, rp *restore.Run
 		return fail("env-down did not restore the previous state: %s", listFirstN(diff, 5))
 	}
 	return ok
+}
+
+// failRound fails the instance when env-up cannot make the target match
+// after round (failed: the lines left, hasUp: env-up has SQL for them):
+// the first round's lines that need more than SQL say what the temporary
+// Postgres cannot take (checkCause); later, env-up did not do what it said.
+func (ir *InstanceResult) failRound(image string, round int, failed []restore.Check, hasUp bool) bool {
+	var manual []restore.Check
+	for _, c := range failed {
+		if c.Fix != restore.FixSQL {
+			manual = append(manual, c)
+		}
+	}
+	switch {
+	case len(manual) > 0 && round == 1:
+		ir.Checks = manual
+		ir.failImageChecks(image, manual)
+		return true
+	case len(manual) > 0 || round > maxRounds || !hasUp:
+		ir.Checks = failed
+		ir.fail(failf(causeOther, "env-up did not make the target match: %s", describe(failed)))
+		return true
+	}
+	return false
+}
+
+// failAfterLoad fails the instance when, with the databases loaded, the
+// target no longer matches the backup (left: the lines that differ).
+func (ir *InstanceResult) failAfterLoad(left []restore.Check) bool {
+	if len(left) == 0 {
+		return false
+	}
+	ir.Checks = left
+	ir.fail(failf(causeMismatch, "after the load the target no longer matches the backup: %s", describe(left)))
+	return true
 }
 
 // maxRounds is how many env-up files drill applies before giving up.

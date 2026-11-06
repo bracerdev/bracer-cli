@@ -214,12 +214,14 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 		return stopped(exitError, cfg, secrets, err)
 	}
 
+	// Who reads the drill's Fix lines: only init passes --init-draft.
+	aud := drillAudience(*initDraft, *dryRun)
 	if *dryRun {
-		return dryRunBackup(ctx, cfg, secrets, st, d, here, create, *asJSON, logger)
+		return dryRunBackup(ctx, cfg, secrets, st, d, here, create, aud, *asJSON, logger)
 	}
 
 	var dres *drill.Result
-	step := drill.Step(cfg, drillDeps(d, st, logger), func(r *drill.Result) { dres = r })
+	step := drill.Step(cfg, drillDeps(d, st, logger, aud), func(r *drill.Result) { dres = r })
 	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: st, Secrets: secrets, Tools: d.tools(), Log: logger, Here: here, Create: create, Drill: step})
 	if err != nil {
 		// backup.Backup returns no Result on error: the command's start stands in.
@@ -252,9 +254,22 @@ func runBackup(ctx context.Context, args []string, d backupDeps) (exit int) {
 	return exitOf(res.Status)
 }
 
+// drillAudience: init's preflight (--init-draft --dry-run) is read above
+// init's drill question, init's real run (--init-draft) before any app.yaml
+// or timer exists; every other run is of an app that exists.
+func drillAudience(initDraft, dryRun bool) drill.Audience {
+	switch {
+	case initDraft && dryRun:
+		return drill.InitPrompt
+	case initDraft:
+		return drill.InitRun
+	}
+	return drill.Elsewhere
+}
+
 // drillDeps is the drill step's view of the world.
-func drillDeps(d backupDeps, st storage.Store, logger *slog.Logger) drill.Deps {
-	return drill.Deps{Shell: d.shell, Tools: d.tools(), Store: st, Log: logger}
+func drillDeps(d backupDeps, st storage.Store, logger *slog.Logger, aud drill.Audience) drill.Deps {
+	return drill.Deps{Shell: d.shell, Tools: d.tools(), Store: st, Log: logger, Audience: aud}
 }
 
 // exitOf is the exit code of a run result (ADR-0022, ADR-0029).
@@ -364,8 +379,8 @@ func printPreflight(w io.Writer, p *preflightResult) {
 // It writes, reads and deletes the probe object, round-trips the age key,
 // makes a schema-only run into memory and drills it. Nothing else is written
 // to the bucket; nothing is pinged.
-func dryRunBackup(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create, asJSON bool, logger *slog.Logger) int {
-	p := runPreflight(ctx, cfg, secrets, st, d, here, create, logger)
+func dryRunBackup(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create bool, aud drill.Audience, asJSON bool, logger *slog.Logger) int {
+	p := runPreflight(ctx, cfg, secrets, st, d, here, create, aud, logger)
 	if asJSON {
 		printJSON(d.stdout, p)
 	} else {
@@ -377,7 +392,7 @@ func dryRunBackup(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 	return exitOK
 }
 
-func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create bool, logger *slog.Logger) *preflightResult {
+func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets, st storage.Store, d backupDeps, here backup.Writer, create bool, aud drill.Audience, logger *slog.Logger) *preflightResult {
 	p := &preflightResult{Kind: "backup-dry-run", App: cfg.App, OK: true}
 	// An error of a check can quote a credential; the run's own texts come
 	// redacted from backup.Backup (BR-014).
@@ -453,7 +468,7 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 				skip = append(skip, ir.Name)
 			}
 		}
-		dd := drill.Deps{Shell: d.shell, Tools: d.tools(), Store: mem, Log: quiet, SkipInstances: skip}
+		dd := drill.Deps{Shell: d.shell, Tools: d.tools(), Store: mem, Log: quiet, SkipInstances: skip, Audience: aud}
 		drill.Step(cfg, dd, func(r *drill.Result) { dres = r })(ctx, run, res)
 	}
 	res, err := backup.Backup(ctx, cfg, backup.Deps{Shell: d.shell, Store: mem, Secrets: secrets, Tools: d.tools(), Log: quiet, SchemaOnly: true, Drill: step})
@@ -511,7 +526,7 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 			add("drill", "-", "drill: not tried (the backup above fails)")
 		}
 	}
-	preflightDrill(cfg, res, dres, drillOn, p)
+	preflightDrill(res, dres, drillOn, p)
 	for _, msg := range res.Warnings {
 		p.add(preflightLine{Section: "warnings", Mark: "!", Text: msg})
 	}
@@ -519,8 +534,9 @@ func runPreflight(ctx context.Context, cfg *config.App, secrets *config.Secrets,
 }
 
 // preflightDrill adds the drill of the schema-only run, one line per
-// instance drilled (spec backup AC preflight).
-func preflightDrill(cfg *config.App, res *backup.Result, dres *drill.Result, names []string, p *preflightResult) {
+// instance drilled (spec backup AC preflight); the drill gave each
+// failure its Fix line.
+func preflightDrill(res *backup.Result, dres *drill.Result, names []string, p *preflightResult) {
 	const sec = "drill (the schema-only run, in a temporary Postgres)"
 	for _, name := range names {
 		ir := res.Instance(name)
@@ -535,8 +551,10 @@ func preflightDrill(cfg *config.App, res *backup.Result, dres *drill.Result, nam
 			if x != nil {
 				image = orDash(x.Image)
 			}
-			l.Mark, l.Text = "✗", fmt.Sprintf("%s (image %s): %s", name, image, strings.Join(ir.DrillFailed, "; "))
-			l.Fix = "choose an image that has it for instance " + name + ", or turn its drill off: " + backup.FixReinit(cfg.App)
+			// One Fix line per failure: the one the drill gave.
+			why, fix := splitFix(strings.Join(ir.DrillFailed, "; "))
+			l.Mark, l.Fix = "✗", fix
+			l.Text = fmt.Sprintf("%s (image %s): %s", name, image, why)
 		case x != nil:
 			l.Text = fmt.Sprintf("%s: image %s, %d database(s) loaded", name, x.Image, len(x.Databases))
 			for _, n := range x.Notes {
@@ -547,6 +565,21 @@ func preflightDrill(cfg *config.App, res *backup.Result, dres *drill.Result, nam
 		}
 		p.add(l)
 	}
+}
+
+// splitFix takes the "Fix: " lines out of text; fix is the first one.
+func splitFix(text string) (rest, fix string) {
+	var keep []string
+	for _, line := range strings.Split(text, "\n") {
+		if f, ok := strings.CutPrefix(strings.TrimSpace(line), "Fix: "); ok {
+			if fix == "" {
+				fix = f
+			}
+			continue
+		}
+		keep = append(keep, line)
+	}
+	return strings.Join(keep, "\n"), fix
 }
 
 func indentMore(s string) string { return strings.ReplaceAll(s, "\n", "\n    ") }

@@ -34,6 +34,7 @@ type fakeRunner struct {
 	payload    map[string]string   // db → pg_dump contents
 	failDump   string              // db whose pg_dump fails
 	dumpStderr string              // what that pg_dump says; empty: an RLS error
+	failSize   string              // db whose pg_database_size fails; every other is 7340032 bytes
 	notSuper   bool                // the connected user is not a superuser (default: it is)
 	cfuncs     string              // rows of the C functions query (probin, function)
 	colls      string              // rows of the collations query
@@ -125,6 +126,11 @@ func (f *fakeRunner) Run(_ context.Context, conn pg.Conn, tool string, args []st
 			io.WriteString(stdout, "backup\x1f"+su+"\x1f"+ra+"\x1ft\n")
 		case strings.HasPrefix(sql, "select n.nspname, c.relname"):
 			io.WriteString(stdout, "public\x1forders\x1f14302\npublic\x1fnew_table\x1f-1\n")
+		case strings.HasPrefix(sql, "select coalesce(sum(pg_database_size(datname)), 0)"):
+			if f.failSize != "" && strings.HasSuffix(sql, "in ('"+f.failSize+"')") {
+				return &pg.ExitError{Cmd: "psql", Code: 1, Stderr: []byte("ERROR:  permission denied for database " + f.failSize)}
+			}
+			io.WriteString(stdout, "7340032\n")
 		case strings.HasPrefix(sql, "select pg_encoding_to_char(encoding), datcollate, datctype"):
 			io.WriteString(stdout, "UTF8\x1fC.UTF-8\x1fC.UTF-8\x1fc\x1f\x1f\n")
 		case strings.HasPrefix(sql, "select extname, extversion"):
@@ -616,6 +622,33 @@ func TestBackupOneDatabaseFailsOthersContinue(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(res.Warnings, "\n"), "main: this run is missing bad; restore needs an older run") {
 		t.Errorf("warnings: %v", res.Warnings)
+	}
+}
+
+// BR-030: each dump records the size of its database at the source, read
+// just before it (the drill's disk need follows it); a size that cannot be
+// read fails that database, and the others go on.
+func TestBackupSourceBytes(t *testing.T) {
+	st := newMemStore()
+	r := &fakeRunner{dbs: []string{"bad", "good"}, payload: map[string]string{"bad": "PGDMP-bad", "good": "PGDMP-good"}, failSize: "bad"}
+	res, err := Backup(context.Background(), baseCfg(r.dbs...), deps(st, r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, good := res.Instances[0].Databases[0], res.Instances[0].Databases[1]
+	if bad.OK || !strings.HasPrefix(bad.Error, "read the size of bad: ") || !good.OK {
+		t.Errorf("bad: %+v good: %+v", bad, good)
+	}
+	ri := st.newest(t).Instances["main"]
+	if _, exists := ri.Databases["bad"]; exists || len(ri.Missing) != 1 || ri.Missing[0] != "bad" {
+		t.Errorf("a database whose size fails must not enter run.json: %+v", ri)
+	}
+	if d := ri.Databases["good"]; d == nil || d.SourceBytes != 7340032 {
+		t.Errorf("source_bytes of good: %+v", d)
+	}
+	raw := string(st.objects[RunKey(root, res.TS)])
+	if !strings.Contains(raw, `"source_bytes": 7340032`) && !strings.Contains(raw, `"source_bytes":7340032`) {
+		t.Errorf("run.json must carry source_bytes: %s", raw)
 	}
 }
 

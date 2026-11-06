@@ -40,14 +40,14 @@ func TestIntegrationContainer(t *testing.T) {
 		t.Errorf("container: %+v", ct)
 	}
 	hs := ScanHost(ctx, sh)
-	for _, c := range Discover(ctx, cs, hs, ProbeSSLRequest).Candidates {
+	for _, c := range Discover(ctx, cs, hs, ProbeGSSENCRequest).Candidates {
 		t.Log(c.Label())
 		if c.Container == nil && c.Port == ct.HostPorts[0] {
 			t.Error("a mapped port must merge into the container, not become its own instance")
 		}
 	}
-	if ok, err := ProbeSSLRequest(ctx, "127.0.0.1", ct.HostPorts[0]); !ok || err != nil {
-		t.Errorf("SSLRequest through the mapped port: %v %v", ok, err)
+	if ok, err := ProbeGSSENCRequest(ctx, "127.0.0.1", ct.HostPorts[0]); !ok || err != nil {
+		t.Errorf("GSSENCRequest through the mapped port: %v %v", ok, err)
 	}
 
 	// Runner 1: docker exec, trust over the socket, no password.

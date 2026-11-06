@@ -118,25 +118,21 @@ func checkDocker(ctx context.Context, d envDeps) (envItem, string, error) {
 	if abs, err := filepath.Abs(dockerPath); err == nil {
 		dockerPath = abs
 	}
-	if err := (pg.Docker{Shell: d.shell}).Info(ctx); err != nil {
-		return dockerInfoItem(err, who), dockerPath, nil
+	docker := pg.Docker{Shell: d.shell}
+	if err := docker.Info(ctx); err != nil {
+		endpoint, _ := docker.Endpoint(ctx, d.getenv("DOCKER_HOST"))
+		return dockerInfoItem(err, who, endpoint), dockerPath, nil
 	}
 	return envItem{Name: "docker", OK: true, Detail: "docker info answers as " + who + " (" + dockerPath + ")"}, dockerPath, nil
 }
 
-// dockerInfoItem explains why `docker info` failed and what to run.
-func dockerInfoItem(err error, who string) envItem {
-	msg := err.Error()
-	it := envItem{Name: "docker", Blocking: true, Detail: "docker info failed: " + firstLine(msg)}
-	switch {
-	case strings.Contains(msg, "permission denied"):
-		it.Detail = who + " may not use Docker (permission denied on the Docker socket)"
-		it.Fix = []string{
-			"sudo usermod -aG docker " + who + "   # the docker group is equivalent to root",
-			"log out and back in (or run: newgrp docker)",
-		}
-	default:
-		it.Fix = []string{"sudo systemctl enable --now docker"}
+// dockerInfoItem explains why `docker info` failed and what to run
+// (pg.WhyDockerDown, which the drill's Fix line uses too).
+func dockerInfoItem(err error, who, endpoint string) envItem {
+	down := pg.WhyDockerDown(err, who, endpoint)
+	it := envItem{Name: "docker", Blocking: true, Detail: down.Detail(), Fix: down.Steps()}
+	if it.Detail == "" {
+		it.Detail = "docker info failed: " + firstLine(err.Error())
 	}
 	return it
 }

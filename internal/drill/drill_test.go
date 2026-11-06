@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -24,13 +25,14 @@ import (
 // prints, sends with --json and reports, and leaves its names alone.
 func TestBR014InstanceResultRedact(t *testing.T) {
 	const secret = "fakepw-br014-drill"
-	x := &InstanceResult{Name: "main", Image: "postgres:17", Error: "env-up: " + secret, Notes: []string{"note " + secret},
+	x := &InstanceResult{Name: "main", Image: "postgres:17", Notes: []string{"note " + secret}, Fix: "fix " + secret,
 		Checks:    []restore.Check{{Area: "setting", Name: "TimeZone", Detail: "detail " + secret, Manual: "manual " + secret}},
 		Disk:      &restore.DiskCheck{Error: "df: " + secret},
 		Databases: []*DatabaseResult{{DB: "shop", RestoredAs: "shop_restored_1", Error: "pg_restore: " + secret, Warnings: []string{"warning " + secret}}}}
+	x.fail(errors.New("env-up: " + secret))
 	x.Redact(config.NewSecrets(map[string]string{"PW": secret}, "test").Redact)
 	data, _ := json.Marshal(x)
-	if strings.Contains(string(data), secret) || strings.Count(string(data), "***") != 7 {
+	if strings.Contains(string(data), secret) || strings.Count(string(data), "***") != 8 || strings.Contains(strings.Join(x.Failures(), "\n"), secret) {
 		t.Fatalf("redacted: %s", data)
 	}
 	if x.Name != "main" || x.Image != "postgres:17" || x.Databases[0].DB != "shop" || x.Checks[0].Name != "TimeZone" {
@@ -57,6 +59,7 @@ type fakeDocker struct {
 	isreadyCall int
 	checks      map[string]string // check sql → output ("" = no rows, "ERR:…" = error)
 	failRun     bool
+	runStderr   string // docker run of the temporary Postgres fails with this
 	calls       []string
 	removed     []string
 	volumes     map[string]bool
@@ -65,7 +68,11 @@ type fakeDocker struct {
 	dfAvailKB   int64             // -1: df fails (cannot measure)
 	createOpts  []string          // what follows TEMPLATE template0 in every CREATE DATABASE, all containers
 	available   map[string]string // pg_available_extensions in the temporary image
-	noDocker    bool              // `docker version` fails
+	noDocker    bool              // `docker version` and `docker info` fail
+	dockerErr   string            // what they say then; empty: the daemon is not running
+	pullErr     string            // docker pull fails with this
+	toolVersion string            // pg_dump --version in the temporary Postgres; empty: 17.2
+	inspectFail string            // docker image inspect fails when its arguments contain this
 	attrSQL     map[string]string // dump content → what pg_restore --create -n … prints
 	attrFail    string            // psql -f - reports an ERROR for statements containing it
 }
@@ -76,6 +83,13 @@ type fakeContainer struct {
 	createOpts []string // what follows TEMPLATE template0 in each CREATE DATABASE
 	owner      map[string]string
 	settings   map[string][]string // database → "role\x1fname=value"
+}
+
+func (f *fakeDocker) dockerSays() string {
+	if f.dockerErr != "" {
+		return f.dockerErr
+	}
+	return "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
 }
 
 func newFakeDocker() *fakeDocker {
@@ -118,10 +132,18 @@ func (f *fakeDocker) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 		return pg.Result{}, nil
 	case "info":
 		if f.noDocker {
-			return pg.Result{}, &pg.ExitError{Cmd: "docker info", Code: 1, Stderr: []byte("Cannot connect to the Docker daemon")}
+			return pg.Result{}, &pg.ExitError{Cmd: "docker info", Code: 1, Stderr: []byte(f.dockerSays())}
 		}
 		return pg.Result{Stdout: []byte("/var/lib/docker\n")}, nil
+	case "pull":
+		if f.pullErr != "" {
+			return pg.Result{}, &pg.ExitError{Cmd: "docker pull", Code: 1, Stderr: []byte(f.pullErr)}
+		}
+		return pg.Result{}, nil
 	case "image":
+		if f.inspectFail != "" && strings.Contains(strings.Join(a, " "), f.inspectFail) {
+			return pg.Result{}, &pg.ExitError{Cmd: "docker image inspect", Code: 1, Stderr: []byte("Error: No such image")}
+		}
 		return pg.Result{Stdout: []byte(`{"/var/lib/postgresql/data":{}}` + "\n")}, nil
 	case "volume":
 		switch a[1] {
@@ -157,6 +179,9 @@ func (f *fakeDocker) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 			}
 			return pg.Result{Stdout: []byte(fmt.Sprintf("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100 1 %d 1%% /mnt/bracer-disk\n", f.dfAvailKB))}, nil
 		}
+		if f.runStderr != "" {
+			return pg.Result{}, &pg.ExitError{Cmd: "docker run", Code: 125, Stderr: []byte(f.runStderr)}
+		}
 		if f.failRun {
 			return pg.Result{}, &pg.ExitError{Cmd: "docker run", Code: 125, Stderr: []byte("Unable to find image")}
 		}
@@ -173,7 +198,10 @@ func (f *fakeDocker) Run(_ context.Context, c pg.Cmd) (pg.Result, error) {
 			return pg.Result{}, fmt.Errorf("fake: run must mount the named volume %s: %v", name, a)
 		}
 		for i, x := range a {
-			if x == "-e" && strings.Contains(a[i+1], "=") {
+			// POSTGRES_USER and POSTGRES_DB name the bootstrap superuser and its
+			// database; any other value on the command line would be readable by
+			// every user of the machine.
+			if x == "-e" && strings.Contains(a[i+1], "=") && !strings.HasPrefix(a[i+1], "POSTGRES_USER=") && !strings.HasPrefix(a[i+1], "POSTGRES_DB=") {
 				return pg.Result{}, fmt.Errorf("fake: secret value in argv: %s", a[i+1])
 			}
 		}
@@ -234,6 +262,15 @@ func (f *fakeDocker) tool(ct *fakeContainer, tool string, args []string, db stri
 		}
 	}
 	switch tool {
+	case "pg_dump":
+		if hasArg(args, "--version") {
+			v := f.toolVersion
+			if v == "" {
+				v = "17.2"
+			}
+			write("pg_dump (PostgreSQL) " + v + "\n")
+			return pg.Result{}, nil
+		}
 	case "pg_isready":
 		f.isreadyCall++
 		if f.isreadyCall <= f.readyAfter {
@@ -604,21 +641,22 @@ func TestDrillNoDocker(t *testing.T) {
 	f.noDocker = true
 	cfg := withSide(baseCfg(), true)
 	res, err := Run(context.Background(), cfg, run, deps(f, st))
-	if err == nil || !strings.HasPrefix(err.Error(), "Docker is not available for the temporary Postgres: ") || !strings.Contains(err.Error(), "Cannot connect to the Docker daemon") || !strings.HasSuffix(err.Error(), "\nFix: bracer remove shop, then bracer init shop") {
+	if err == nil || !strings.HasPrefix(err.Error(), "Docker is not available for the temporary Postgres: ") || !strings.Contains(err.Error(), "Cannot connect to the Docker daemon") || strings.Contains(err.Error(), "Fix:") {
 		t.Fatalf("err = %v", err)
 	}
 	if res == nil || res.OK || len(res.Instances) != 0 || res.TS != testTS || res.App != "shop" {
 		t.Fatalf("res = %+v", res)
 	}
 
+	const dockerFix = "start Docker: sudo systemctl enable --now docker, or turn the drill of main off: bracer remove shop, then bracer init shop"
 	run.Instances["side"] = &backup.RunInstance{Kind: "container", Missing: []string{}, Databases: map[string]*backup.Dump{}}
 	bres := backupResult(cfg)
 	Step(cfg, deps(f, st), nil)(context.Background(), run, bres)
 	d := run.Instances["main"].Drill
-	if d == nil || d.Result != backup.DrillFailed || len(d.Reasons) != 1 || d.Reasons[0] != err.Error() || d.At.IsZero() {
+	if d == nil || d.Result != backup.DrillFailed || len(d.Reasons) != 1 || d.Reasons[0] != err.Error()+"\nFix: "+dockerFix || d.At.IsZero() {
 		t.Errorf("run.json drill: %+v", d)
 	}
-	if ir := bres.Instance("main"); len(ir.DrillFailed) != 1 || ir.DrillFailed[0] != err.Error() || ir.Drill != nil {
+	if ir := bres.Instance("main"); len(ir.DrillFailed) != 1 || ir.DrillFailed[0] != err.Error()+"\nFix: "+dockerFix || ir.Drill == nil {
 		t.Errorf("backup result: %+v", ir)
 	}
 	if d := run.Instances["side"].Drill; d == nil || d.Result != backup.DrillOff {

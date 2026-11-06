@@ -12,8 +12,8 @@ import (
 
 	"bracer.dev/bracer/internal/backup"
 	"bracer.dev/bracer/internal/config"
+	"bracer.dev/bracer/internal/drill"
 	"bracer.dev/bracer/internal/pg"
-	"bracer.dev/bracer/internal/restore"
 	"bracer.dev/bracer/internal/storage"
 )
 
@@ -115,8 +115,8 @@ func (r *initRun) childArgs(cmd ...string) []string {
 
 // preflight is step 15: backup --dry-run on the draft as the nightly job
 // will run it, with a drill of the schema-only run. A drill that fails for
-// one instance can take another image or be turned off for it; anything
-// else stops.
+// one instance can be retried as is (after freeing disk, say), take
+// another image or be turned off for it; anything else stops.
 func (r *initRun) preflight(draft string) error {
 	env, err := r.cleanEnv()
 	if err != nil {
@@ -144,8 +144,14 @@ func (r *initRun) preflight(draft string) error {
 			return r.checkFailed("the check", code)
 		}
 		for _, name := range failed {
-			if err := r.fixDrill(name); err != nil {
+			retry, err := r.fixDrill(name)
+			if err != nil {
 				return err
+			}
+			if retry {
+				// Run the same check again now; what was answered for
+				// the instances before this one is saved first.
+				break
 			}
 		}
 		if err := config.SaveDraft(draft, r.cfg); err != nil {
@@ -159,29 +165,32 @@ func (r *initRun) checkFailed(what string, code int) error {
 	return errSelfCheck
 }
 
-// fixDrill is step 15 for an instance whose drill failed in the preflight.
-func (r *initRun) fixDrill(name string) error {
+// fixDrill is step 15 for an instance whose drill failed in the preflight;
+// retry is true when the same check is to run again with nothing changed.
+func (r *initRun) fixDrill(name string) (retry bool, err error) {
 	in := r.cfg.FindInstance(name)
 	if in == nil {
-		return fmt.Errorf("instance %s is not in the draft", name)
+		return false, fmt.Errorf("instance %s is not in the draft", name)
 	}
 	r.p.printf("\nThe drill of %s fails (above). The nightly drill would fail the same way.\n", name)
 	for {
-		_, key, err := r.p.choose("[i] enter a Docker image for this instance's drill  [n] no drill for this instance  [q] quit", 0, "i", "n", "q")
+		_, key, err := r.p.choose("[r] retry  [i] enter a Docker image for this instance's drill  [n] no drill for this instance  [q] quit", 0, "r", "i", "n", "q")
 		if err != nil {
-			return err
+			return false, err
 		}
 		switch key {
 		case "q":
-			return errQuit
+			return false, errQuit
+		case "r":
+			return true, nil
 		case "n":
 			in.SetDrillOff(true)
 			r.p.printf("%s: drill.runtime: none; its backups will not be test-restored and every report will say so.\n", name)
-			return nil
+			return false, nil
 		}
 		image, err := r.p.askRequired("Docker image (built on the official postgres image, with the extensions and libraries the databases use)")
 		if err != nil {
-			return err
+			return false, err
 		}
 		image = strings.TrimSpace(image)
 		if config.IsBitnamiImage(image) {
@@ -189,7 +198,7 @@ func (r *initRun) fixDrill(name string) error {
 			continue
 		}
 		in.SetDrillImage(image)
-		return nil
+		return false, nil
 	}
 }
 
@@ -201,7 +210,9 @@ func (r *initRun) realRun(draft string) error {
 	if err != nil {
 		return err
 	}
-	var size int64
+	// Each instance is drilled in its own temporary Postgres, one after
+	// the other: the disk must hold the largest, by the drill's own rule.
+	var size, need int64
 	var sizeErr error
 	for _, in := range r.cfg.Instances {
 		n, err := r.databaseBytes(in, secrets)
@@ -210,6 +221,9 @@ func (r *initRun) realRun(draft string) error {
 			break
 		}
 		size += n
+		if !in.DrillOff() {
+			need = max(need, drill.NeedBytes(n))
+		}
 	}
 	drillOn := r.drillAny()
 	r.p.printf("\nA real backup now proves the data too:\n")
@@ -218,7 +232,6 @@ func (r *initRun) realRun(draft string) error {
 	}
 	r.p.printf("  - while pg_dump runs, ALTER TABLE and migrations on these databases wait; drill uses CPU and memory of this machine\n")
 	if drillOn {
-		need := size * restore.DiskFactor
 		free, freeErr := r.dockerFree()
 		switch {
 		case r.ctx.Err() != nil:
@@ -231,7 +244,7 @@ func (r *initRun) realRun(draft string) error {
 			r.p.printf("  ✗ cannot check free disk space for the drill: %s; answer n to test-restore on this machine to go on without a drill\n", firstLine(freeErr.Error()))
 			return r.checkFailed("the disk check", exitError)
 		case free < need:
-			r.p.printf("  ✗ free up %s for the drill (%s free, about %s needed: %d × the databases), or answer n to test-restore on this machine\n", humanBytes(need-free), humanBytes(free), humanBytes(need), restore.DiskFactor)
+			r.p.printf("  ✗ free up %s for the drill (%s free, about %s needed: %s for the temporary Postgres + %d × the databases), or answer n to test-restore on this machine\n", humanBytes(need-free), humanBytes(free), humanBytes(need), humanBytes(drill.TempPostgresBytes), drill.SourceFactor)
 			return r.checkFailed("the disk check", exitError)
 		}
 		r.p.printf("  - drill restores them into a temporary Postgres in Docker: %s free, about %s needed\n", humanBytes(free), humanBytes(need))
@@ -267,22 +280,7 @@ func (r *initRun) databaseBytes(in config.Instance, secrets *config.Secrets) (in
 		return 0, err
 	}
 	client := &pg.Client{Runner: runner, Conn: conn}
-	var quoted []string
-	for _, n := range in.Databases.Names() {
-		quoted = append(quoted, pg.QuoteLiteral(n))
-	}
-	rows, err := client.Query(r.ctx, "select coalesce(sum(pg_database_size(datname)), 0) from pg_database where datname in ("+strings.Join(quoted, ",")+")")
-	if err != nil {
-		return 0, err
-	}
-	if len(rows) != 1 || len(rows[0]) != 1 {
-		return 0, errors.New("unexpected answer")
-	}
-	var n int64
-	if _, err := fmt.Sscan(rows[0][0], &n); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return client.DatabasesSize(r.ctx, in.Databases.Names())
 }
 
 // dockerFree is the free space of the Docker root directory.

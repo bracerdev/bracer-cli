@@ -17,7 +17,7 @@ type Candidate struct {
 	Host      string     // for Postgres on this host, reached over TCP
 	Port      int
 	Process   string
-	Confirmed *bool // SSLRequest: nil not tried, true is Postgres, false did not answer correctly
+	Confirmed *bool // GSSENCRequest: nil not tried, true is Postgres, false did not answer correctly
 }
 
 // Label is a one-line display for the user to choose from.
@@ -125,7 +125,7 @@ type Discovery struct {
 // Discover merges Docker containers with the host scan: a host port matching a
 // container's HostPort is folded into that container (spec init step 1b), the
 // remaining ports of postgres processes, or of processes this user cannot see,
-// become host candidates confirmed with SSLRequest (unseen ones must answer). `k8s_` containers (cri-dockerd) are not listed.
+// become host candidates confirmed with GSSENCRequest (unseen ones must answer). `k8s_` containers (cri-dockerd) are not listed.
 func Discover(ctx context.Context, containers []*Container, hs HostScan, probe Prober) Discovery {
 	var out Discovery
 	mapped := map[int]bool{}
@@ -147,7 +147,7 @@ func Discover(ctx context.Context, containers []*Container, hs HostScan, probe P
 	var hosts []*Candidate
 	for _, l := range hs.Listeners {
 		// No process name: the port belongs to another user (Postgres from apt runs
-		// as postgres). Kept only if SSLRequest answers below.
+		// as postgres). Kept only if GSSENCRequest answers below.
 		if mapped[l.Port] || (l.Process != "" && !strings.Contains(strings.ToLower(l.Process), "postgres")) {
 			continue
 		}

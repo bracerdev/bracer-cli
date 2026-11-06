@@ -69,7 +69,7 @@ In order, `init`:
 3. creates an age key pair in `age.key`, or takes a public key whose private key you put in `age.key`;
 4. lists the Postgres containers and local clusters it can see, or takes an address you type (always used as a URL source), checks the user, and lets you pick databases;
 5. asks whether to test-restore on this machine every night, the test-restore's memory limit, the schedule (daily, weekly or monthly, at which times, on which days, and how many days, weeks or months to keep every backup of), and an optional heartbeat URL (see [Know when it stops](#know-when-it-stops));
-6. writes a draft, checks it the way the nightly job will run it (`backup --dry-run`), then runs a real backup, test-restored. With the test-restore on, it stops if Docker's disk has less than 5 × the size of the databases free;
+6. writes a draft, checks it the way the nightly job will run it (`backup --dry-run`), then runs a real backup, test-restored. If the check's test-restore fails, you can retry it as is (after freeing disk space, say), give it another Docker image, or turn it off for that instance. With the test-restore on, every test-restore (the check's, the real run's and the nightly one) first needs Docker's disk to have 400 MB free for the temporary Postgres plus 2 × the size of the databases at the source, read in the same run; less, and it stops before starting. This is an early check, not a promise: a disk that fills up during the restore is reported as a full disk;
 7. only then replaces `app.yaml`, installs the systemd timer (the unit files are written through `sudo`), and asks you to copy `age.key` off the machine.
 
 With a Bracer account, `bracer init shop --web` runs the same steps but lets you pick the Postgres and the databases in the browser: it prints a link and an 8-character code, you enter the code there, and the terminal keeps the bucket, the keys, the schedule and the final `y`. The app is added to your account only once the proving backup passes, and then reports every backup to your dashboard; nothing else changes.
@@ -141,7 +141,7 @@ bracer remove shop
 bracer init shop
 ```
 
-`remove` keeps `age.key`, so the new `init` encrypts with the same key and the old backups stay readable from this machine. The new app gets a new folder in the bucket; the old folder is left as it is, `bracer restore` still lists it, and you delete it at your provider when you no longer need it. Every message that asks you to change something says exactly this: `Fix: bracer remove shop, then bracer init shop`. With a Bracer account, `bracer init shop --web` after `remove` continues the same app on your dashboard, with its history and hostnames.
+`remove` keeps `age.key`, so the new `init` encrypts with the same key and the old backups stay readable from this machine. The new app gets a new folder in the bucket; the old folder is left as it is, `bracer restore` still lists it, and you delete it at your provider when you no longer need it. Every failure that needs the app set up again ends with `Fix: bracer remove shop, then bracer init shop`; a failed test-restore ends with one `Fix:` line for its cause instead (free disk space, start Docker, another image, or whether the backup can be relied on). With a Bracer account, `bracer init shop --web` after `remove` continues the same app on your dashboard, with its history and hostnames.
 
 ### 3. Every night
 

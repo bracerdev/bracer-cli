@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,41 +26,116 @@ type Container struct {
 	Networks   []string
 	Kubernetes bool // name prefixed k8s_: cri-dockerd; not listed, only counted for the Kubernetes notice (ADR-0013)
 	HasPgProc  bool // docker top saw a postgres process (evidence)
+	RunsServer bool // its command starts the Postgres server (runsPostgresServer)
 	Unverified bool // running but docker top failed: could not check
 }
 
-// IsPostgres: a running container must have a postgres process (image/env are
-// only hints, app pods carry POSTGRES_USER too); if it cannot be checked it is
-// still listed with Unverified. Stopped or k8s_ containers (only counted) go by image/env.
+// IsPostgres: a running container must have a postgres process (image, env and
+// command are only hints, app containers carry POSTGRES_USER too); if it cannot
+// be checked it is still listed with Unverified when its command runs the
+// server. Stopped or k8s_ containers (only counted) go by the command.
 func (c *Container) IsPostgres() bool {
 	if c.Running && !c.Kubernetes {
-		return c.HasPgProc || c.Unverified && looksLikePostgres(c.Image, c.Env)
+		return c.HasPgProc || c.Unverified && c.RunsServer
 	}
-	return looksLikePostgres(c.Image, c.Env)
+	return c.RunsServer
 }
 
-// looksLikePostgres: image or env hints at Postgres — only to pick which
-// containers are worth checking, not a verdict; shared by Docker and pods.
-func looksLikePostgres(image string, env map[string]string) bool {
-	return imageLooksLikePostgres(image) || envLooksLikePostgres(env)
+// runsPostgresServer: the container's command (Entrypoint then Cmd, after a
+// leading tini, dumb-init or docker-init) starts the Postgres server:
+//   - `postgres` itself, by name or path;
+//   - docker-entrypoint.sh followed by a command these rules accept (the
+//     official family execs what follows, e.g. a compose `command: sh -c …`).
+//     A leading flag also becomes `postgres …` there, but mysql, mongo, redis
+//     and node use a script of the same name, so that form needs PG_MAJOR,
+//     which the official image sets and every image built on it inherits;
+//   - Bitnami's postgresql (or postgresql-repmgr) entrypoint.sh only with its
+//     run.sh in the command: it execs anything else (a pg_dump sidecar);
+//   - sh / bash with -c (or -ec, -lc…): any command of the script, judged by
+//     these rules.
+//
+// A job that only connects to a database (a migration, psql, pg_dump) does
+// not, whatever its image or env. Images that start Postgres through a
+// supervisor (Patroni, pg_ctlcluster) are found only while running.
+func runsPostgresServer(args []string, env map[string]string) bool {
+	args = skipInit(args)
+	if len(args) == 0 {
+		return false
+	}
+	first := args[0]
+	switch {
+	case (path.Base(first) == "sh" || path.Base(first) == "bash") && len(args) >= 3 && isShellC(args[1]):
+		return shellRunsPostgres(args[2], env)
+	case isPostgresBinary(first):
+		return true
+	case path.Base(first) == "docker-entrypoint.sh":
+		if len(args) > 1 && strings.HasPrefix(args[1], "-") {
+			return env["PG_MAJOR"] != ""
+		}
+		return runsPostgresServer(args[1:], env)
+	case strings.HasSuffix(first, "/postgresql/entrypoint.sh"), strings.HasSuffix(first, "/postgresql-repmgr/entrypoint.sh"):
+		return slices.ContainsFunc(args[1:], isBitnamiRun)
+	}
+	return isBitnamiRun(first)
 }
 
-func imageLooksLikePostgres(image string) bool {
-	img := strings.ToLower(image)
-	for _, k := range []string{"postgres", "postgis", "timescale", "pgvector", "supabase/postgres", "bitnami/postgresql"} {
-		if strings.Contains(img, k) {
-			return true
+// isShellC: a shell's option word that ends in c (-c, -ec, -lc): the next
+// word is the script.
+func isShellC(w string) bool {
+	if len(w) < 2 || w[0] != '-' || w[len(w)-1] != 'c' {
+		return false
+	}
+	for _, r := range w[1:] {
+		if r < 'a' || r > 'z' {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
-// envLooksLikePostgres: only the Postgres/Bitnami image variables. The POSTGRES_
-// prefix is not used because Kubernetes injects POSTGRES_SERVICE_HOST… into every
-// pod in the namespace. App pods reaching the DB carry these too: the weakest hint.
-func envLooksLikePostgres(env map[string]string) bool {
-	for _, k := range []string{"POSTGRES_PASSWORD", "POSTGRES_USER", "POSTGRES_DB", "POSTGRESQL_PASSWORD", "POSTGRESQL_USERNAME", "POSTGRESQL_DATABASE", "PGDATA"} {
-		if _, ok := env[k]; ok {
+// isPostgresBinary: the word is `postgres` or a path to it, not a name that
+// merely contains it (postgres_exporter, /backups/postgres/).
+func isPostgresBinary(w string) bool {
+	return w == "postgres" || strings.HasSuffix(w, "/postgres")
+}
+
+func isBitnamiRun(w string) bool {
+	return strings.HasSuffix(w, "/postgresql/run.sh") || strings.HasSuffix(w, "/postgresql-repmgr/run.sh")
+}
+
+// skipInit drops leading init wrappers with their flags, up to `--` when present.
+func skipInit(args []string) []string {
+	for len(args) > 0 {
+		switch path.Base(args[0]) {
+		case "tini", "dumb-init", "docker-init":
+		default:
+			return args
+		}
+		args = args[1:]
+		if i := slices.Index(args, "--"); i >= 0 {
+			args = args[i+1:]
+			continue
+		}
+		for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+			args = args[1:]
+		}
+	}
+	return args
+}
+
+// shellRunsPostgres splits a `sh -c` script into commands (;, &&, ||, |, &,
+// newlines), drops a leading exec and variable assignments, and judges each.
+func shellRunsPostgres(script string, env map[string]string) bool {
+	sep := strings.NewReplacer("&&", ";", "||", ";", "|", ";", "&", ";", "\n", ";")
+	for _, part := range strings.Split(sep.Replace(script), ";") {
+		words := strings.Fields(part)
+		for i := range words {
+			words[i] = strings.Trim(words[i], `"'`)
+		}
+		for len(words) > 0 && (words[0] == "exec" || strings.Contains(words[0], "=") && !strings.HasPrefix(words[0], "-")) {
+			words = words[1:]
+		}
+		if runsPostgresServer(words, env) {
 			return true
 		}
 	}
@@ -148,8 +225,10 @@ type inspectEntry struct {
 		Status  string `json:"Status"`
 	} `json:"State"`
 	Config struct {
-		Image string   `json:"Image"`
-		Env   []string `json:"Env"`
+		Image      string   `json:"Image"`
+		Env        []string `json:"Env"`
+		Entrypoint []string `json:"Entrypoint"`
+		Cmd        []string `json:"Cmd"`
 	} `json:"Config"`
 	NetworkSettings struct {
 		Ports    map[string][]struct{ HostIP, HostPort string } `json:"Ports"`
@@ -157,8 +236,8 @@ type inspectEntry struct {
 	} `json:"NetworkSettings"`
 }
 
-// ListPostgresContainers lists every container (stopped ones too) that looks like
-// Postgres: docker ps -a → docker inspect → docker top for running containers.
+// ListPostgresContainers lists every container (stopped ones too) that is a
+// Postgres server: docker ps -a → docker inspect → docker top for running containers.
 func (d Docker) ListPostgresContainers(ctx context.Context) ([]*Container, error) {
 	res, err := d.Shell.Run(ctx, Cmd{Name: "docker", Args: []string{"ps", "-a", "--no-trunc", "--format", "{{json .}}"}})
 	if err != nil {
@@ -215,6 +294,7 @@ func containerFromInspect(e inspectEntry) *Container {
 		k, v, _ := strings.Cut(kv, "=")
 		c.Env[k] = v
 	}
+	c.RunsServer = runsPostgresServer(append(slices.Clone(e.Config.Entrypoint), e.Config.Cmd...), c.Env)
 	if p := c.Env["PGPORT"]; p != "" {
 		if n, err := strconv.Atoi(p); err == nil {
 			c.Port = n
@@ -250,17 +330,31 @@ func (d Docker) hasPostgresProcess(ctx context.Context, id string) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	for _, line := range strings.Split(string(res.Stdout), "\n")[1:] {
+	return topHasPostgres(string(res.Stdout)), nil
+}
+
+// topHasPostgres reads `docker top` (ps -ef: UID PID PPID C STIME TTY TIME
+// CMD, only CMD holds spaces): a process whose command is the postgres binary
+// (`postgres`, or a path to it with -D …) or one of its children (`postgres:
+// checkpointer`). A process that only names postgres in its arguments
+// (`pg_isready -h postgres`) is not.
+func topHasPostgres(out string) bool {
+	lines := strings.Split(out, "\n")
+	cols := strings.Fields(lines[0])
+	if len(cols) == 0 || cols[len(cols)-1] != "CMD" {
+		return false
+	}
+	for _, line := range lines[1:] {
 		f := strings.Fields(line)
-		if len(f) > 0 && strings.HasPrefix(f[len(f)-1], "postgres") {
-			return true, nil
+		if len(f) < len(cols) {
+			continue
 		}
-		// `postgres: checkpointer` splits into two fields; also search the whole line.
-		if strings.Contains(line, " postgres") {
-			return true, nil
+		cmd := f[len(cols)-1:]
+		if isPostgresBinary(cmd[0]) || cmd[0] == "postgres:" {
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // HasTool checks that the container has a command (pg_dump…) to pick the docker exec runner.

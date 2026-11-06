@@ -95,6 +95,9 @@ type Dump struct {
 	Recipient *string `json:"-"`
 	Bytes     int64   `json:"bytes"`
 	SHA256    string  `json:"sha256"`
+	// SourceBytes is pg_database_size of the database at the source, read
+	// just before the dump: the drill sizes its disk from it.
+	SourceBytes int64 `json:"source_bytes,omitempty"`
 	// HasPasswords: the globals dump carries password hashes.
 	HasPasswords bool `json:"has_passwords,omitempty"`
 	// Locale is the database's encoding/locale at dump time; restore and drill
